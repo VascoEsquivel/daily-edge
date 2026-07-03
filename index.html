@@ -343,6 +343,25 @@
   .bo-row .bo-ev.neg { color: var(--hot); }
   .bo-fair { font-size: 10.5px; color: var(--muted); font-family: 'JetBrains Mono', monospace; margin-top: 7px; }
 
+  /* form sparklines + prop angles (inside expanded panel) */
+  .form-row { display: flex; align-items: center; gap: 10px; font-family: 'JetBrains Mono', monospace; font-size: 11px; margin: 7px 0; }
+  .form-abbr { width: 40px; font-weight: 700; }
+  .form-elo { color: var(--gold); font-weight: 700; }
+  .form-rec { color: var(--muted); font-size: 10px; }
+  .spark line { stroke: rgba(132,148,184,.35); stroke-width: 1; }
+  .spark rect.w { fill: var(--accent); filter: drop-shadow(0 0 3px rgba(0,255,136,.55)); }
+  .spark rect.l { fill: var(--hot); filter: drop-shadow(0 0 3px rgba(255,77,109,.45)); }
+  .spark rect.d { fill: rgba(132,148,184,.6); }
+  .spark-none { color: var(--muted); font-size: 10px; }
+  .prop-row { margin: 5px 0; font-size: 10.5px; }
+  .prop-row b { font-family: 'JetBrains Mono', monospace; margin-right: 6px; }
+  .prop-chip {
+    background: rgba(0,200,255,.08); border: 1px solid rgba(0,200,255,.25); color: var(--text);
+    border-radius: 6px; padding: 2px 8px; font-size: 10.5px; font-family: 'JetBrains Mono', monospace;
+    margin: 2px 4px 2px 0; display: inline-block;
+  }
+  .injchip { font-size: 10px; color: var(--hot); margin-left: 6px; cursor: help; font-family: 'JetBrains Mono', monospace; }
+
   /* ── History panel ── */
   .brain .b-btn {
     background: rgba(167,139,250,.12); border: 1px solid rgba(167,139,250,.4); color: #c4b5fd;
@@ -473,7 +492,7 @@
   <div id="slipbox"></div>
 
   <footer>
-    Model: regressed win% → log5 matchup probability + sport-specific home advantage (logit space). Soccer uses points-per-game strength with a closeness-weighted draw share; tournament play (World Cup knockouts) falls back to a market-based prior. Tennis uses ATP/WTA ranking-points share.<br>
+    Model: regressed win% → log5 matchup probability + sport-specific home advantage (logit space). Soccer uses points-per-game strength with a closeness-weighted draw share; tournament play (World Cup knockouts) falls back to a market-based prior. Tennis uses ATP/WTA ranking-points share. MLB factors the probable starters' ERA gap; team sports factor the live injury report (🏥 — hover for names; day-to-day weighs less than out).<br>
     Vegas comparison uses ESPN's published line; "VALUE" flags games where the model disagrees with the market by ≥4%.<br>
     ⭐ BEST PICK is the highest expected-value wager at the listed price (vig included; the unlisted dog price is estimated from a 4.5% book margin). Stake sizes are ¼-Kelly, in units of 1% of bankroll. ✋ NO BET means no side clears +2% EV — passing is a position.<br>
     🧠 The model learns: every final updates per-team Elo ratings (margin-of-victory weighted, faster for barely-seen teams) and a per-sport calibration layer (stored locally in your browser). On launch it studies the last 45 days of results in chronological order, then stays current. Predictions blend the record/ranking prior with learned Elo, and the Elo weight grows as the brain sees more of each team. ⭐ picks are logged at the pregame price and settled against the final score. 📜 History keeps a match-by-match record. ⬆⬇ Export/import moves a trained brain between devices.<br>
@@ -692,7 +711,7 @@ const ymd = d => d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate(
 // Predictions blend the record/ranking prior with learned Elo — the Elo
 // weight grows with how many games the brain has seen for those teams.
 const Brain = (() => {
-  const KEY = 'de-brain-v1';
+  const KEY = 'de-brain-v2';   // v2: margin-weighted Elo + per-team form history
   const ELO_K = { mlb: 6, wnba: 24, nba: 20, nfl: 24, nhl: 10, mls: 24, wc: 28, tennis: 32 };
   const LR = 0.04;                 // calibration learning rate
   let db;
@@ -737,6 +756,10 @@ const Brain = (() => {
     const k = (ELO_K[sport] || 20) * movM * boost;
     eH.r += k * (scoreH - pElo); eA.r -= k * (scoreH - pElo);
     eH.n++; eA.n++;
+    // rolling last-10 signed margins, fuel for the form sparklines
+    const hMargin = scoreH === 1 ? mov : scoreH === 0 ? -mov : 0;
+    (eH.hist = eH.hist || []).push(hMargin); if (eH.hist.length > 10) eH.hist.shift();
+    (eA.hist = eA.hist || []).push(-hMargin); if (eA.hist.length > 10) eA.hist.shift();
     if (scoreH !== 0.5) {
       const c = getCalib(sport);
       const x = logit(clamp(pElo));
@@ -812,6 +835,7 @@ const Brain = (() => {
   }
 
   return { adjust, processResults, recordPending, stats, history: () => db.log,
+    rating: (sportId, t) => db.elo[sportId]?.[t.flagLogo ? t.name : t.abbr] || null,
     through: () => db.through,
     setThrough: y => { db.through = y; save(); },
     exportDb: () => JSON.stringify(db),
@@ -865,6 +889,30 @@ function getRankings() {
   return rankingsPromise;
 }
 
+// ── Injuries: per-sport Elo penalty per weighted player out ─────────────
+// Long-term absences are already baked into a team's record; this mostly
+// catches the fresh news the record can't see yet. Day-to-day counts less.
+const INJ_PENALTY = { mlb: 3.5, wnba: 12, nba: 12, nfl: 2.5, nhl: 5 };
+const injCache = new Map();
+function getInjuries(sport) {
+  if (!INJ_PENALTY[sport.id]) return Promise.resolve(null);
+  if (!injCache.has(sport.id)) {
+    injCache.set(sport.id, fetch(`${API}/${sport.path}/injuries`).then(r => r.json()).then(json => {
+      const map = new Map();
+      (json.injuries || []).forEach(t => {
+        let w = 0; const names = [];
+        (t.injuries || []).forEach(x => {
+          w += /day-to-day|questionable|probable/i.test(x.status || '') ? 0.4 : 1;
+          if (names.length < 6) names.push(`${x.athlete?.displayName || '?'}${x.athlete?.position?.abbreviation ? ' (' + x.athlete.position.abbreviation + ')' : ''} — ${x.status}`);
+        });
+        map.set(String(t.id), { w, n: (t.injuries || []).length, names });
+      });
+      return map;
+    }).catch(() => null));
+  }
+  return injCache.get(sport.id);
+}
+
 async function fetchSport(sport, date, force = false) {
   const key = sport.id + '|' + ymd(date);
   const hit = state.cache.get(key);
@@ -881,9 +929,12 @@ async function fetchSport(sport, date, force = false) {
     ]);
     events = parseTennis(jsons, ranks, date);
   } else {
-    const res = await fetch(`${API}/${sport.path}/scoreboard?dates=${ymd(date)}`);
+    const [res, injuries] = await Promise.all([
+      fetch(`${API}/${sport.path}/scoreboard?dates=${ymd(date)}`),
+      getInjuries(sport),
+    ]);
     if (!res.ok) throw new Error('ESPN API responded ' + res.status);
-    events = parseEvents(await res.json(), sport);
+    events = parseEvents(await res.json(), sport, injuries);
   }
   events.forEach(g => { g.sportId = sport.id; });
   const entry = { events, fetchedAt: Date.now() };
@@ -978,7 +1029,7 @@ function computeBestPick(g, sport) {
     sub: `model ${pct(best.p)} vs implied ${pct(best.imp)}` };
 }
 
-function parseEvents(json, sport) {
+function parseEvents(json, sport, injuries) {
   const games = (json.events || []).map(ev => {
     const comp = ev.competitions?.[0];
     if (!comp) return null;
@@ -986,14 +1037,27 @@ function parseEvents(json, sport) {
       const c = comp.competitors.find(x => x.homeAway === ha) || {};
       const recSummary = (c.records || []).find(r => r.type === 'total' || r.name === 'overall')?.summary
                          || c.records?.[0]?.summary || '';
+      const prob = c.probables?.[0];
+      const probable = prob ? {
+        name: prob.athlete?.shortName || prob.athlete?.displayName || '',
+        era: (() => { const e = (prob.statistics || []).find(s => s.abbreviation === 'ERA'); const v = e ? Number(e.displayValue) : NaN; return isNaN(v) ? null : v; })(),
+      } : null;
+      const leaders = (c.leaders || []).slice(0, 3).map(L => ({
+        cat: L.shortDisplayName || L.abbreviation || L.name || '',
+        name: L.leaders?.[0]?.athlete?.shortName || '',
+        val: L.leaders?.[0]?.displayValue || '',
+      })).filter(x => x.name);
       return {
         name: c.team?.shortDisplayName || c.team?.displayName || '?',
         abbr: c.team?.abbreviation || '?',
+        id: c.team?.id,
         logo: c.team?.logo || '',
         recSummary: recSummary || c.form || '',
         rec: parseRecord(recSummary, sport.soccer),
         score: c.score,
         winner: c.winner === true,
+        probable, leaders,
+        inj: injuries?.get(String(c.team?.id)) || null,
       };
     };
     const home = side('home'), away = side('away');
@@ -1022,6 +1086,19 @@ function parseEvents(json, sport) {
     } else {
       const p = Brain.adjust(sport.id, home, away, model.home, hfaL, 0.65, true);
       model = { home: p, away: 1 - p, draw: 0 };
+      // pregame intel the record can't see: starting pitchers (MLB) + injury report
+      let shift = 0;
+      if (sport.id === 'mlb' && home.probable?.era != null && away.probable?.era != null) {
+        shift += Math.max(-0.5, Math.min(0.5, (away.probable.era - home.probable.era) * 0.13));
+      }
+      if (injuries) {
+        const pen = t => Math.min(45, (t.inj?.w || 0) * (INJ_PENALTY[sport.id] || 0));
+        shift += (pen(away) - pen(home)) * Math.LN10 / 400;
+      }
+      if (shift) {
+        const p2 = clamp(invlogit(logit(clamp(model.home)) + shift));
+        model = { home: p2, away: 1 - p2, draw: 0 };
+      }
     }
 
     // pick = highest-probability outcome
@@ -1190,9 +1267,43 @@ function bestPickStrip(g) {
   </div>`;
 }
 
+// ── Expanded panel pieces: form sparklines, prop angles, bet board ──────
+function sparkline(hist) {
+  if (!hist || !hist.length) return '<span class="spark-none">no games seen yet</span>';
+  const max = Math.max(1, ...hist.map(Math.abs));
+  const w = 11, gap = 3, H = 30, mid = H / 2;
+  const bars = hist.map((m, i) => {
+    const h = Math.max(2, Math.abs(m) / max * (mid - 2));
+    return `<rect class="${m > 0 ? 'w' : m < 0 ? 'l' : 'd'}" x="${i * (w + gap)}" y="${m >= 0 ? mid - h : mid}" width="${w}" height="${h}" rx="2"/>`;
+  }).join('');
+  const W = hist.length * (w + gap) - gap;
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}"><line x1="0" y1="${mid}" x2="${W}" y2="${mid}"/>${bars}</svg>`;
+}
+
+function formSection(g) {
+  const eA = Brain.rating(g.sportId, g.away), eH = Brain.rating(g.sportId, g.home);
+  if (!eA?.hist?.length && !eH?.hist?.length) return '';
+  const row = (t, e) => {
+    const wl = e?.hist ? `${e.hist.filter(m => m > 0).length}-${e.hist.filter(m => m < 0).length} last ${e.hist.length}` : '';
+    return `<div class="form-row"><span class="form-abbr">${esc(t.abbr)}</span>${sparkline(e?.hist)}
+      <span class="form-elo">⚡${e ? Math.round(e.r) : '—'}</span><span class="form-rec">${wl}</span></div>`;
+  };
+  return `<div class="bo-h" style="margin-top:13px">RECENT FORM · margin per game</div>${row(g.away, eA)}${row(g.home, eH)}`;
+}
+
+function propsSection(g) {
+  const row = t => {
+    const chips = (t.leaders || []).map(l => `<span class="prop-chip">${esc(l.name)} · ${esc(l.cat)} ${esc(l.val)}</span>`).join('');
+    return chips ? `<div class="prop-row"><b>${esc(t.abbr)}</b>${chips}</div>` : '';
+  };
+  const html = row(g.away) + row(g.home);
+  return html ? `<div class="bo-h" style="margin-top:13px">PROP ANGLES · team leaders</div>${html}` : '';
+}
+
 // Full bet board: every priced side with model %, market %, EV, and stake — plus fair prices
 function betBoard(g) {
-  if (g.state !== 'pre') return '';
+  const extras = formSection(g) + propsSection(g);
+  if (g.state !== 'pre') return extras ? `<div class="betboard">${extras}</div>` : '';
   const rows = (g.bp?.board || []).map(c => {
     const star = g.bp.kind === 'ev' && c.text === g.bp.text ? '⭐ ' : '';
     return `<div class="bo-row ${c.ev >= MIN_EV ? 'bet' : 'skip'}">
@@ -1210,6 +1321,7 @@ function betBoard(g) {
     ${rows || '<div class="bo-row skip"><span class="bo-bet">no priced markets listed for this match</span></div>'}
     <div class="bo-fair">model's fair prices: ${esc(g.home.abbr)} ${fh} / ${esc(g.away.abbr)} ${fa}${fd} — only take better numbers than these</div>
     ${g.vegas?.ou ? `<div class="bo-fair">total: O/U ${g.vegas.ou} — no totals model yet</div>` : ''}
+    ${extras}
   </div>`;
 }
 
@@ -1217,9 +1329,14 @@ function teamRow(t, g, side) {
   const isWinner = g.state === 'post' && t.winner;
   const isPicked = g.pick === side && g.state !== 'post';
   const score = g.state !== 'pre' ? `<span class="tscore${g.tennis ? ' sets' : ''}">${esc(t.score ?? '')}</span>` : '';
+  const e = Brain.rating(g.sportId, t);
+  const eloStr = e && e.n >= 3 ? ` · ⚡${Math.round(e.r)}` : '';
+  const pit = t.probable?.name
+    ? ` · P: ${t.probable.name}${t.probable.era != null ? ` (${t.probable.era.toFixed(2)})` : ''}` : '';
+  const injChip = t.inj?.n ? `<span class="injchip" title="${esc(t.inj.names.join('\n'))}">🏥${t.inj.n}</span>` : '';
   return `<div class="teamrow ${isWinner ? 'winner' : ''} ${isPicked ? 'picked' : ''}">
     ${teamLogo(t)}
-    <div><div class="tname">${esc(t.name)}</div><div class="trec">${esc(t.recSummary)}</div></div>
+    <div><div class="tname">${esc(t.name)}${injChip}</div><div class="trec">${esc(t.recSummary)}${eloStr}${esc(pit)}</div></div>
     ${score}
   </div>`;
 }
@@ -1256,8 +1373,9 @@ function gameCard(g, i, sport) {
       <span class="open-ref">${open?.d ? 'opened ' + esc(open.d) : 'model preline'}</span></div>`;
   }
 
-  const hint = g.state === 'pre'
-    ? '<div class="expand-hint"><span class="c1">▾ FULL BET BOARD</span><span class="c2">▴ HIDE BET BOARD</span></div>' : '';
+  const panel = betBoard(g);
+  const hint = panel
+    ? '<div class="expand-hint"><span class="c1">▾ BOARD · FORM · PROPS</span><span class="c2">▴ COLLAPSE</span></div>' : '';
 
   return `<div class="game ${live ? 'live' : ''} ${state.openCards.has(g.id) ? 'open' : ''}" data-id="${esc(g.id)}"
     data-names="${esc((g.away.name + ' ' + g.home.name + ' ' + g.away.abbr + ' ' + g.home.abbr).toLowerCase())}"
@@ -1274,7 +1392,7 @@ function gameCard(g, i, sport) {
     <div class="g-verdict">${verdict}${vegasStr}</div>
     ${bestPickStrip(g)}
     ${hint}
-    ${betBoard(g)}
+    ${panel}
   </div>`;
 }
 
