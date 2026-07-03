@@ -492,7 +492,7 @@
   <div id="slipbox"></div>
 
   <footer>
-    Model: regressed win% → log5 matchup probability + sport-specific home advantage (logit space). Soccer uses points-per-game strength with a closeness-weighted draw share; tournament play (World Cup knockouts) falls back to a market-based prior. Tennis uses ATP/WTA ranking-points share. MLB factors the probable starters' ERA gap; team sports factor the live injury report (🏥 — hover for names; day-to-day weighs less than out).<br>
+    Model: regressed win% → log5 matchup probability + sport-specific home advantage (logit space). Soccer uses points-per-game strength with a closeness-weighted draw share; tournament play (World Cup knockouts) falls back to a market-based prior. Tennis uses ATP/WTA ranking-points share. MLB factors the probable starters' ERA gap; team sports factor the live injury report weighted by player skill — an injured stat leader (⭐ in the 🏥 tooltip) counts 2-3x a rotation player, biggest impact in basketball. Day-to-day weighs less than out.<br>
     Vegas comparison uses ESPN's published line; "VALUE" flags games where the model disagrees with the market by ≥4%.<br>
     ⭐ BEST PICK is the highest expected-value wager at the listed price (vig included; the unlisted dog price is estimated from a 4.5% book margin). Stake sizes are ¼-Kelly, in units of 1% of bankroll. ✋ NO BET means no side clears +2% EV — passing is a position.<br>
     🧠 The model learns: every final updates per-team Elo ratings (margin-of-victory weighted, faster for barely-seen teams) and a per-sport calibration layer (stored locally in your browser). On launch it studies the last 45 days of results in chronological order, then stays current. Predictions blend the record/ranking prior with learned Elo, and the Elo weight grows as the brain sees more of each team. ⭐ picks are logged at the pregame price and settled against the final score. 📜 History keeps a match-by-match record. ⬆⬇ Export/import moves a trained brain between devices.<br>
@@ -900,17 +900,32 @@ function getInjuries(sport) {
     injCache.set(sport.id, fetch(`${API}/${sport.path}/injuries`).then(r => r.json()).then(json => {
       const map = new Map();
       (json.injuries || []).forEach(t => {
-        let w = 0; const names = [];
-        (t.injuries || []).forEach(x => {
-          w += /day-to-day|questionable|probable/i.test(x.status || '') ? 0.4 : 1;
-          if (names.length < 6) names.push(`${x.athlete?.displayName || '?'}${x.athlete?.position?.abbreviation ? ' (' + x.athlete.position.abbreviation + ')' : ''} — ${x.status}`);
-        });
-        map.set(String(t.id), { w, n: (t.injuries || []).length, names });
+        const list = (t.injuries || []).map(x => ({
+          name: x.athlete?.displayName || '',
+          dtd: /day-to-day|questionable|probable/i.test(x.status || ''),
+          display: `${x.athlete?.displayName || '?'}${x.athlete?.position?.abbreviation ? ' (' + x.athlete.position.abbreviation + ')' : ''} — ${x.status}`,
+        }));
+        map.set(String(t.id), { n: list.length, list });
       });
       return map;
     }).catch(() => null));
   }
   return injCache.get(sport.id);
+}
+
+// Star detection: match an injured player against the team's stat leaders.
+// Scoring leader out hurts ~3x a rotation player; other category leaders ~2x.
+const leaderKey = name => {
+  const p = String(name).trim().split(/\s+/);
+  return ((p[0]?.[0] || '') + '|' + (p[p.length - 1] || '')).toLowerCase();
+};
+function leaderMult(leaders, fullName) {
+  if (!leaders?.length || !fullName) return 1;
+  const k = leaderKey(fullName);
+  for (const l of leaders) {
+    if (leaderKey(l.name) === k) return /ppg|pts|points/i.test(l.cat) ? 3 : 2;
+  }
+  return 1;
 }
 
 async function fetchSport(sport, date, force = false) {
@@ -1061,6 +1076,14 @@ function parseEvents(json, sport, injuries) {
       };
     };
     const home = side('home'), away = side('away');
+    // star-weighted injury effect: leaders count 2-3x a rotation body
+    [home, away].forEach(t => {
+      if (!t.inj) return;
+      const mult = x => leaderMult(t.leaders, x.name);
+      t.injEff = t.inj.list.reduce((s, x) => s + (x.dtd ? 0.4 : 1) * mult(x), 0);
+      t.injStar = t.inj.list.some(x => mult(x) > 1);
+      t.injTitle = t.inj.list.slice(0, 8).map(x => (mult(x) > 1 ? '⭐ ' : '') + x.display).join('\n');
+    });
     const vegas = parseVegas(comp, sport, home);
 
     // model — soccer without season records (World Cup knockouts) leans on the market
@@ -1092,7 +1115,7 @@ function parseEvents(json, sport, injuries) {
         shift += Math.max(-0.5, Math.min(0.5, (away.probable.era - home.probable.era) * 0.13));
       }
       if (injuries) {
-        const pen = t => Math.min(45, (t.inj?.w || 0) * (INJ_PENALTY[sport.id] || 0));
+        const pen = t => Math.min(60, (t.injEff || 0) * (INJ_PENALTY[sport.id] || 0));
         shift += (pen(away) - pen(home)) * Math.LN10 / 400;
       }
       if (shift) {
@@ -1333,7 +1356,7 @@ function teamRow(t, g, side) {
   const eloStr = e && e.n >= 3 ? ` · ⚡${Math.round(e.r)}` : '';
   const pit = t.probable?.name
     ? ` · P: ${t.probable.name}${t.probable.era != null ? ` (${t.probable.era.toFixed(2)})` : ''}` : '';
-  const injChip = t.inj?.n ? `<span class="injchip" title="${esc(t.inj.names.join('\n'))}">🏥${t.inj.n}</span>` : '';
+  const injChip = t.inj?.n ? `<span class="injchip" title="${esc(t.injTitle || '')}">🏥${t.inj.n}${t.injStar ? '⭐' : ''}</span>` : '';
   return `<div class="teamrow ${isWinner ? 'winner' : ''} ${isPicked ? 'picked' : ''}">
     ${teamLogo(t)}
     <div><div class="tname">${esc(t.name)}${injChip}</div><div class="trec">${esc(t.recSummary)}${eloStr}${esc(pit)}</div></div>
