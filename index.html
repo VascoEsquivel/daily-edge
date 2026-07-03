@@ -476,7 +476,7 @@
     Model: regressed win% → log5 matchup probability + sport-specific home advantage (logit space). Soccer uses points-per-game strength with a closeness-weighted draw share; tournament play (World Cup knockouts) falls back to a market-based prior. Tennis uses ATP/WTA ranking-points share.<br>
     Vegas comparison uses ESPN's published line; "VALUE" flags games where the model disagrees with the market by ≥4%.<br>
     ⭐ BEST PICK is the highest expected-value wager at the listed price (vig included; the unlisted dog price is estimated from a 4.5% book margin). Stake sizes are ¼-Kelly, in units of 1% of bankroll. ✋ NO BET means no side clears +2% EV — passing is a position.<br>
-    🧠 The model learns: every final updates per-team Elo ratings and a per-sport calibration layer (stored locally in your browser). Predictions blend the record/ranking prior with learned Elo, and the Elo weight grows as the brain sees more of each team. ⭐ picks are logged at the pregame price and settled against the final score. 📜 History keeps a match-by-match record.<br>
+    🧠 The model learns: every final updates per-team Elo ratings (margin-of-victory weighted, faster for barely-seen teams) and a per-sport calibration layer (stored locally in your browser). On launch it studies the last 45 days of results in chronological order, then stays current. Predictions blend the record/ranking prior with learned Elo, and the Elo weight grows as the brain sees more of each team. ⭐ picks are logged at the pregame price and settled against the final score. 📜 History keeps a match-by-match record. ⬆⬇ Export/import moves a trained brain between devices.<br>
     ⚡ Live win probability uses the Stern model — current margin + time remaining vs the pregame expectation — and updates each poll; the ▲▼ shows movement vs the opening number. Click any upcoming match for its full bet board with model vs market prices on every side.<br>
     🎟️ The slip combines legs assuming independence; parlays stack the book's vig, so most are −EV — the slip will tell you. 💵 Set a bankroll to see stakes in dollars. Keys: ← → dates · t today · r refresh · 1–9 tabs.<br>
     ⚠️ Predictions are statistical estimates for entertainment and research — no model prints money. If you bet, bet what you can afford to lose.
@@ -647,15 +647,22 @@ function sternLive(margin, f, pPre, sigma) {
   return clamp(normalCdf((margin + mu * rem) / (sigma * Math.sqrt(rem))));
 }
 
-// Tennis: completed-set lead plus a nudge for the current-set game lead
-function liveTennisProb(g) {
-  const hs = g.home.sets || [], as = g.away.sets || [];
+// count sets won from linescores (excludeLast = skip the in-progress set)
+function setsTally(hs = [], as = [], excludeLast = false) {
   let h = 0, a = 0;
-  const n = Math.max(hs.length, as.length);
-  for (let i = 0; i < n - 1; i++) {
+  const n = Math.max(hs.length, as.length) - (excludeLast ? 1 : 0);
+  for (let i = 0; i < n; i++) {
     if ((hs[i] ?? 0) > (as[i] ?? 0)) h++;
     else if ((as[i] ?? 0) > (hs[i] ?? 0)) a++;
   }
+  return [h, a];
+}
+
+// Tennis: completed-set lead plus a nudge for the current-set game lead
+function liveTennisProb(g) {
+  const hs = g.home.sets || [], as = g.away.sets || [];
+  const [h, a] = setsTally(hs, as, true);
+  const n = Math.max(hs.length, as.length);
   const gameLead = (hs[n - 1] ?? 0) - (as[n - 1] ?? 0);
   return clamp(invlogit(logit(clamp(g.model.home)) + 1.15 * (h - a) + 0.12 * gameLead));
 }
@@ -721,9 +728,13 @@ const Brain = (() => {
     return clamp(invlogit(x));
   }
 
-  function learn(sport, kH, kA, hfaLogit, scoreH) {
+  function learn(sport, kH, kA, hfaLogit, scoreH, mov = 1) {
     const { p: pElo, eH, eA } = eloProb(sport, kH, kA, hfaLogit);
-    const k = ELO_K[sport] || 20;
+    // margin-of-victory multiplier (538-style: blowouts teach more, garbage-time
+    // wins by heavy favorites teach less) + faster learning for barely-seen teams
+    const movM = mov > 0 ? Math.log(mov + 1) * 2.2 / (Math.abs(eH.r - eA.r) * 0.001 + 2.2) : 1;
+    const boost = (eH.n < 10 || eA.n < 10) ? 1.5 : 1;
+    const k = (ELO_K[sport] || 20) * movM * boost;
     eH.r += k * (scoreH - pElo); eA.r -= k * (scoreH - pElo);
     eH.n++; eA.n++;
     if (scoreH !== 0.5) {
@@ -763,14 +774,17 @@ const Brain = (() => {
       if (db.processed[key]) return;
       const scoreH = g.home.winner ? 1 : g.away.winner ? 0 : 0.5;
       const hfaLogit = g.tennis || sport.hfaWin == null ? 0 : logit(sport.hfaWin);
-      learn(sport.id, teamKey(g.home), teamKey(g.away), hfaLogit, scoreH);
+      let mov;
+      if (g.tennis) { const [th, ta] = setsTally(g.home.sets, g.away.sets); mov = Math.abs(th - ta); }
+      else mov = Math.abs((Number(g.home.score) || 0) - (Number(g.away.score) || 0));
+      learn(sport.id, teamKey(g.home), teamKey(g.away), hfaLogit, scoreH, mov);
       g.correct ? db.stats.hits++ : db.stats.misses++;
       db.stats.absorbed++;
       settle(key, g, scoreH);
       db.log.unshift({ d: ymd(g.start), s: sport.id,
         a: g.away.abbr, h: g.home.abbr, sa: g.away.score ?? '', sh: g.home.score ?? '',
         pk: g.pick === 'draw' ? 'Draw' : g[g.pick].abbr, p: Math.round(g.pickProb * 100), ok: !!g.correct });
-      if (db.log.length > 400) db.log.length = 400;
+      if (db.log.length > 600) { db.log.sort((x, y) => y.d - x.d); db.log.length = 600; }
       db.processed[key] = ymd(new Date());
       changed = true;
     });
@@ -797,7 +811,16 @@ const Brain = (() => {
     return { ...db.stats, tracked, pendingN: Object.keys(db.pending).length };
   }
 
-  return { adjust, processResults, recordPending, stats, history: () => db.log };
+  return { adjust, processResults, recordPending, stats, history: () => db.log,
+    through: () => db.through,
+    setThrough: y => { db.through = y; save(); },
+    exportDb: () => JSON.stringify(db),
+    importDb: json => {
+      const d = JSON.parse(json);
+      if (!d || !d.stats || !d.elo) return false;
+      db = d; db.log = db.log || []; db.pending = db.pending || {}; db.calib = db.calib || {};
+      save(); return true;
+    } };
 })();
 
 // ── Opening snapshot: remember each game's pregame model % and line ─────
@@ -1356,8 +1379,11 @@ function renderBrain() {
   $('#brainbar').innerHTML = `<div class="brain">
     <span class="b-title">🧠 MODEL BRAIN</span><span class="lvl">LVL ${lvl}</span>
     ${items}
+    <span class="b-item" id="brainprog"></span>
     <button class="b-btn" id="histbtn">📜 ${state.showHistory ? 'hide' : 'history'}</button>
-    <span class="b-note">learns from every final · browse past dates to feed it faster</span>
+    <button class="b-btn" id="exportbtn" title="Copy this trained brain to the clipboard">⬆ export</button>
+    <button class="b-btn" id="importbtn" title="Paste a brain export from another device">⬇ import</button>
+    <span class="b-note">studies the last ${BACKFILL_DAYS} days automatically · margin-weighted Elo</span>
   </div>`;
   renderHistory();
 }
@@ -1366,7 +1392,7 @@ const SPORT_ICON = Object.fromEntries(SPORTS.map(s => [s.id, s.label.split(' ')[
 function renderHistory() {
   const el = $('#histpanel');
   if (!state.showHistory) { el.innerHTML = ''; return; }
-  const log = Brain.history() || [];
+  const log = [...(Brain.history() || [])].sort((a, b) => b.d - a.d);
   if (!log.length) {
     el.innerHTML = '<div class="hist"><div class="h-empty">No finished matches on record yet — history fills in as finals land (and as you browse past dates).</div></div>';
     return;
@@ -1487,18 +1513,34 @@ async function refresh(force = false) {
   absorbYesterday();
 }
 
-// once per session, quietly study the last few days of finals so nothing is missed
+// Deep backfill: study up to BACKFILL_DAYS of past finals, oldest first so Elo
+// evolves in true chronological order. Progress is tracked in the brain db, so
+// each launch only studies days it hasn't seen — a fresh brain arrives
+// season-smart after one load, then stays current forever.
+const BACKFILL_DAYS = 45;
 let absorbed = false;
-function absorbYesterday() {
+async function absorbYesterday() {
   if (absorbed) return;
   absorbed = true;
-  const jobs = [];
-  for (let d = 1; d <= 3; d++) {
-    const y = new Date(state.date);
-    y.setDate(y.getDate() - d);
-    SPORTS.forEach(s => jobs.push(fetchSport(s, y)));
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  let cur = new Date(today); cur.setDate(cur.getDate() - BACKFILL_DAYS);
+  const thr = Brain.through();
+  if (thr) {
+    const t = String(thr);
+    const after = new Date(Number(t.slice(0, 4)), Number(t.slice(4, 6)) - 1, Number(t.slice(6)));
+    after.setDate(after.getDate() + 1);
+    if (after > cur) cur = after;
   }
-  Promise.allSettled(jobs).then(renderBrain);
+  const days = [];
+  for (let x = new Date(cur); x < today; x.setDate(x.getDate() + 1)) days.push(new Date(x));
+  for (let i = 0; i < days.length; i++) {
+    const el = $('#brainprog');
+    if (el) el.textContent = `📚 studying the season… day ${i + 1}/${days.length}`;
+    await Promise.allSettled(SPORTS.map(s => fetchSport(s, days[i])));
+    Brain.setThrough(ymd(days[i]));
+  }
+  if (days.length) renderBrain();
+  else { const el = $('#brainprog'); if (el) el.textContent = ''; }
 }
 
 function scheduleLivePoll(events) {
@@ -1600,7 +1642,21 @@ $('#content').addEventListener('input', e => {
   if (e.target.id === 'gamesearch') { state.query = e.target.value; applySearch(); }
 });
 $('#brainbar').addEventListener('click', e => {
-  if (e.target.closest('#histbtn')) { state.showHistory = !state.showHistory; renderBrain(); }
+  if (e.target.closest('#histbtn')) { state.showHistory = !state.showHistory; renderBrain(); return; }
+  if (e.target.closest('#exportbtn')) {
+    navigator.clipboard?.writeText(Brain.exportDb());
+    const b = e.target.closest('#exportbtn');
+    b.textContent = '✓ copied'; setTimeout(renderBrain, 1200);
+    return;
+  }
+  if (e.target.closest('#importbtn')) {
+    const v = prompt('Paste a brain export (JSON). This REPLACES the brain on this device:');
+    if (!v) return;
+    try {
+      if (Brain.importDb(v)) { renderBrain(); refresh(true); }
+      else alert('That does not look like a brain export.');
+    } catch { alert('Invalid JSON.'); }
+  }
 });
 $('#slipbox').addEventListener('click', e => {
   if (e.target.closest('#slipopen')) { state.slipOpen = true; renderSlip(); return; }
