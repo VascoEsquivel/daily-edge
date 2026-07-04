@@ -455,6 +455,10 @@
   .pr-select:focus { border-color: var(--accent2); }
   .pr-ctx { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-top: 10px; }
   .pr-ctx-l { font-size: 10px; color: var(--muted); letter-spacing: 2px; width: 62px; }
+  .prload { background: rgba(167,139,250,.12); border: 1px solid rgba(167,139,250,.35); color: #c4b5fd;
+    padding: 2px 9px; border-radius: 7px; cursor: pointer; font-family: inherit; font-size: 10px; font-weight: 800; white-space: nowrap; }
+  .prload:hover { background: rgba(167,139,250,.25); }
+  #liveprops .bo-row { grid-template-columns: 1.5fr 1fr 1fr .7fr auto; }
   .elab-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 6px; }
   .elab-grid label { display: flex; flex-direction: column; gap: 5px; font-size: 10.5px; color: var(--muted); letter-spacing: .5px; }
   .elab-grid input {
@@ -552,6 +556,7 @@
     📐 Team strength blends the actual record with Pythagorean expectation from points scored/allowed (ESPN standings, all team sports). MLB additionally factors Baseball Savant Statcast expected-wOBA for hitting and pitching — contact-quality stats that lead results. See both in the expanded panel's form rows.<br>
     🎯 Totals: expected combined score from each team's scoring/allowing rates vs the posted O/U — Over/Under sides compete with moneyline/spread for the ⭐ best pick. MLB totals factor starters, bullpen relief ERA (MLB StatsAPI), game-time temperature/rain, and 💨 wind (Open-Meteo, computed as blowing-out/in relative to each park's center-field orientation — the Wrigley effect). Venue splits, 😴 back-to-back fatigue, and line movement vs the opener are all factored; "drivers" in the expanded panel says what's pushing each pick.<br>
     🎮 Esports EV Lab: live Valorant/League feeds require paid keys and are CORS-locked from a static site, so the tab is a manual EV engine — your odds and your read in, the +EV side, ¼-Kelly stake, and slip integration out. No fake data, real math.<br>
+    ⚡ Live Props (Props tab): pulls real milestone prop lines from ESPN's odds feed for any game, resolves player names + current-season averages, and shows each line's implied % beside the model's projection. Player names autocomplete from the day's stat leaders. Honest limit: a season-rate model can't reliably out-sharp a prop market, so gaps are flagged to <b>investigate</b> (verify in the lab), not as locks; props join parlays through the slip once you've vetted them.<br>
     🎯 Player Prop Lab: a contextual projection engine — starts from the season rate, blends recent form (with a role/usage-change detector when recent diverges ≥20% from season), then scales by matchup and pace. Projects the over/under curve (Poisson for counting stats, Normal for high-count) and prints an alternate-line ladder with fair Kalshi prices in cents, built for spotting mispriced alt lines. Enter a price to grade the bet and add it to your slip. Matchup/pace are your read (or a defense-vs-stat rank); still a shortlist tool, not gospel.<br>
     🔥🥶 Hot/cold: recent margin form gives a small, capped model shift (streaks are mostly noise — never more than ~3%) and chips flag teams 4-1 or better / 1-4 or worse in their last five. Player-level streaks aren't in free data feeds; prop angles show season rates.<br>
     Vegas comparison uses ESPN's published line; "VALUE" flags games where the model disagrees with the market by ≥4%.<br>
@@ -598,7 +603,9 @@ const state = {
   lastEntries: new Map(), activeEntry: null,
   esports: { a: '', b: '', pa: '', oa: '', ob: '' },
   parlay: { n: 3, style: 'value', out: null },
-  props: { player: '', stat: 'pts', avg: '', recent: '', matchup: 'neutral', pace: 'neutral', line: '', price: '' },
+  props: { player: '', stat: 'pts', avg: '', recent: '', matchup: 'neutral', pace: 'neutral', line: '', price: '', game: '' },
+  liveProps: { key: null, items: null, loading: false },
+  propLegs: [],
 };
 try { state.slip = JSON.parse(localStorage.getItem('de-slip-v1')) || []; } catch {}
 try { Object.assign(state.esports, JSON.parse(localStorage.getItem('de-elab-v1')) || {}); } catch {}
@@ -1173,6 +1180,73 @@ async function getWinds(json) {
   });
   await Promise.allSettled(jobs);
   return map;
+}
+
+// ── Live player props (ESPN core API — real milestone lines, Kalshi-mappable) ──
+const CORE_API = 'https://sports.core.api.espn.com/v2/sports';
+const V3_API = 'https://site.web.api.espn.com/apis/common/v3/sports';
+// ESPN milestone prop type -> our PROP_STATS id + the v3 average label to read
+const PROP_TYPE_MAP = {
+  'Points Milestones': { stat: 'pts', label: 'PTS' },
+  'Rebounds Milestones': { stat: 'reb', label: 'REB' },
+  'Assists Milestones': { stat: 'ast', label: 'AST' },
+  'Made Threes Milestones': { stat: 'threes', label: '3PT' },
+  'Strikeouts Milestones': { stat: 'ks', label: 'K' },
+  'Hits Milestones': { stat: 'hits', label: 'H' },
+  'Total Bases Milestones': { stat: 'tb', label: 'TB' },
+  'RBIs Milestones': { stat: 'rbi', label: 'RBI' },
+};
+function coreBase(sport) { const [grp, lg] = sport.path.split('/'); return `${grp}/leagues/${lg}`; }
+
+// current-season per-game average for a stat label from a v3 athlete-stats payload
+function seasonAvg(v3, label) {
+  const cat = (v3?.categories || []).find(c => c.name === 'averages');
+  if (!cat) return null;
+  const i = cat.labels?.indexOf(label);
+  if (i == null || i < 0) return null;
+  let best = null, bestYr = -1;                 // prefer the latest-season row
+  (cat.statistics || []).forEach(s => {
+    const yr = Number(s.season?.year) || 0;
+    const v = parseFloat(s.stats?.[i]);
+    if (!isNaN(v) && yr > bestYr) { bestYr = yr; best = v; }
+  });
+  if (best == null && cat.totals) best = parseFloat(cat.totals[i]);
+  return (best != null && !isNaN(best)) ? best : null;
+}
+
+const gamePropsCache = new Map();
+function fetchGameProps(sport, ev) {
+  if (sport.soccer || sport.tennis) return Promise.resolve([]);
+  const key = sport.id + '|' + ev.id;
+  if (gamePropsCache.has(key)) return gamePropsCache.get(key);
+  const cb = coreBase(sport);
+  const p = (async () => {
+    const odds = await fetch(`${CORE_API}/${cb}/events/${ev.id}/competitions/${ev.id}/odds`).then(r => r.json());
+    const ref = odds.items?.map(o => o.propBets?.$ref).find(Boolean);
+    if (!ref) return [];
+    const list = await fetch(ref.replace('http://', 'https://') + '&limit=100').then(r => r.json());
+    const items = (list.items || []).filter(it => PROP_TYPE_MAP[it.type?.name] && it.athlete?.$ref && it.current?.target);
+    const refs = [...new Set(items.map(it => it.athlete.$ref))];
+    const info = new Map();
+    await Promise.all(refs.map(async r => {
+      try {
+        const a = await fetch(r.replace('http://', 'https://')).then(x => x.json());
+        const v3 = await fetch(`${V3_API}/${sport.path}/athletes/${a.id}/stats`).then(x => x.json()).catch(() => null);
+        info.set(r, { name: a.displayName || a.shortName || '?', v3 });
+      } catch { info.set(r, { name: '?', v3: null }); }
+    }));
+    return items.map(it => {
+      const m = PROP_TYPE_MAP[it.type.name];
+      const meta = info.get(it.athlete.$ref) || {};
+      const american = Number(it.odds?.american?.value);
+      const threshold = parseFloat(it.current.target.displayValue);
+      if (isNaN(american) || isNaN(threshold)) return null;
+      return { player: meta.name, statId: m.stat, threshold, american,
+               imp: mlToProb(american), avg: meta.v3 ? seasonAvg(meta.v3, m.label) : null };
+    }).filter(Boolean);
+  })().catch(() => []);
+  gamePropsCache.set(key, p);
+  return p;
 }
 
 // totals: stdev of combined final score, for Over/Under probability
@@ -1966,8 +2040,12 @@ function renderContent(sport, entry) {
 function filterBar() {
   const F = [['all', 'All'], ['pre', 'Upcoming'], ['in', '● Live'], ['ev', '⭐ +EV'], ['post', 'Finals']];
   const S = [['time', 'time'], ['ev', 'EV'], ['conf', 'confidence']];
+  const teams = new Set();
+  (state.activeEntry?.events || []).forEach(g => { teams.add(g.away.name); teams.add(g.home.name); });
+  const sugg = [...teams].map(t => `<option value="${esc(t)}">`).join('');
   return `<div class="fbar">
-    <input id="gamesearch" placeholder="🔍 team or player" value="${esc(state.query)}">
+    <input id="gamesearch" list="team-sugg" placeholder="🔍 team or player" value="${esc(state.query)}">
+    <datalist id="team-sugg">${sugg}</datalist>
     ${F.map(([v, l]) => `<button class="f-btn ${state.filter === v ? 'on' : ''}" data-f="${v}">${l}</button>`).join('')}
     <span class="f-sep">SORT</span>
     ${S.map(([v, l]) => `<button class="f-btn ${state.sort === v ? 'on' : ''}" data-s="${v}">${l}</button>`).join('')}
@@ -1985,13 +2063,14 @@ function applySearch() {
 // One priced side per pregame game (the model's favored side), assembled into
 // a parlay by style. EV assumes independence — the card says so honestly.
 function parlayCandidates(allEvents) {
-  return allEvents.filter(g => g.state === 'pre' && g.bp?.board?.length).map(g => {
+  const games = allEvents.filter(g => g.state === 'pre' && g.bp?.board?.length).map(g => {
     const sides = g.bp.board.filter(c => c.type === 'ml' || c.type === 'spread');
     if (!sides.length) return null;
     const best = sides.reduce((a, b) => b.p > a.p ? b : a);   // side the model favors
     return { gid: g.id, t: best.text, p: best.p, b: best.b, ev: best.ev,
              m: `${g.away.abbr} @ ${g.home.abbr}`, k: g.sportId, tm: timeOf(g.start) };
   }).filter(Boolean);
+  return games;   // props join parlays via the slip (user-vetted), not auto-injected here
 }
 
 function generateParlay() {
@@ -2344,7 +2423,7 @@ function renderProps() {
     </div>
     <div class="elab">
       <div class="elab-teams">
-        <input id="pr-player" placeholder="Player (e.g. A'ja Wilson)" value="${esc(p.player)}">
+        <input id="pr-player" list="pr-players" placeholder="Player (type or pick)" value="${esc(p.player)}">
         <select id="pr-stat" class="pr-select">${opts}</select>
       </div>
       <div class="elab-grid">
@@ -2356,8 +2435,128 @@ function renderProps() {
       <div class="pr-ctx"><span class="pr-ctx-l">MATCHUP</span>${matchBtns}</div>
       <div class="pr-ctx"><span class="pr-ctx-l">PACE</span>${paceBtns}</div>
       <div id="pr-out"></div>
+    </div>
+    <datalist id="pr-players">${playerSuggestions().map(s => `<option value="${esc(s.name)}">${esc(s.cat)} ${esc(s.val)}</option>`).join('')}</datalist>
+    <div class="section-h" style="margin-top:24px">⚡ Live Props — real lines &amp; +EV edges</div>
+    <div class="elab">
+      <div class="elab-teams">
+        <select id="pr-game" class="pr-select" style="min-width:100%">
+          <option value="">— pick a game to pull its real player props —</option>
+          ${propGames().map(g => `<option value="${esc(g.key)}" ${state.props.game === g.key ? 'selected' : ''}>${esc(g.label)}</option>`).join('')}
+        </select>
+      </div>
+      <div id="liveprops"></div>
     </div>`;
   renderPropsOut();
+  renderLiveProps();
+}
+
+const PROP_MIN_EV = 0.03;    // slightly above game MIN_EV — milestone odds carry one-sided vig
+const OVERROUND_PROP = 1.06; // assumed two-way hold: the unlisted side costs (106¢ − listed side),
+                             // so betting the "under" pays a realistic spread, not a free 100−yes
+
+// distinct high-value players from the day's stat leaders (autocomplete + suggestions)
+function playerSuggestions() {
+  const seen = new Set(), out = [];
+  state.lastEntries.forEach(entry => (entry.events || []).forEach(g => {
+    [g.away, g.home].forEach(t => (t.leaders || []).forEach(l => {
+      if (l.name && !seen.has(l.name)) { seen.add(l.name); out.push({ name: l.name, cat: l.cat, val: l.val }); }
+    }));
+  }));
+  return out;
+}
+
+// today's pregame games whose sport supports props
+function propGames() {
+  const out = [];
+  ['wnba', 'nba', 'mlb', 'nhl', 'nfl'].forEach(sid => {
+    const sport = SPORTS.find(s => s.id === sid);
+    (state.lastEntries.get(sid)?.events || []).forEach(g => {
+      if (g.state === 'pre') out.push({ sport, ev: { id: g.id }, key: sid + '|' + g.id,
+        label: `${SPORT_ICON[sid]} ${g.away.abbr} @ ${g.home.abbr}` });
+    });
+  });
+  return out;
+}
+
+function propToLeg(pg, x) {
+  const label = (PROP_STATS.find(s => s.id === x.statId)?.label || '').replace(/^\S+\s/, '');
+  const under = x.side === 'under';
+  const prob = under ? 1 - x.over : x.over;
+  const yes = x.imp * 100, cents = under ? OVERROUND_PROP * 100 - yes : yes;
+  const b = (100 - cents) / cents;
+  return { gid: `prop|${pg.key}|${x.player}|${x.statId}|${x.threshold}|${x.side || 'over'}`,
+    t: under ? `${x.player} u${x.threshold} ${label}` : `${x.player} ${x.threshold}+ ${label}`,
+    p: +prob.toFixed(3), b: +b.toFixed(3), m: pg.label.replace(/^\S+\s/, ''), k: 'props', tm: '', ev: x.ev };
+}
+
+function loadLiveProps(key) {
+  state.props.game = key;
+  const pg = propGames().find(g => g.key === key);
+  if (!key || !pg) { state.liveProps = { key: null, items: null, loading: false }; state.propLegs = []; renderLiveProps(); return; }
+  state.liveProps = { key, items: null, loading: true };
+  renderLiveProps();
+  fetchGameProps(pg.sport, pg.ev).then(items => {
+    const graded = items.map(x => {
+      const stat = PROP_STATS.find(s => s.id === x.statId);
+      let over = null, side = null, ev = null;
+      if (stat && x.avg != null && x.avg > 0) {
+        over = propOver(stat, x.avg, x.threshold - 0.5);   // "15+" = P(X ≥ 15)
+        // only grade near-median lines: a season-rate model is informative around the middle,
+        // but unreliable deep in the tails (where milestone juice is also highest)
+        if (over >= 0.28 && over <= 0.72) {
+          const yes = x.imp * 100;                          // listed over(yes) implied cents
+          const best = [{ side: 'over', prob: over, cents: yes }, { side: 'under', prob: 1 - over, cents: OVERROUND_PROP * 100 - yes }]
+            .map(s => ({ ...s, ev: s.prob * ((100 - s.cents) / s.cents) - (1 - s.prob) }))
+            .sort((a, b) => b.ev - a.ev)[0];
+          side = best.side; ev = best.ev;
+        }
+      }
+      return { ...x, stat, over, side, ev, pg };
+    });
+    if (state.liveProps.key !== key) return;   // user switched games mid-fetch
+    state.liveProps = { key, items: graded, loading: false };
+    state.propLegs = graded.filter(x => x.ev != null && x.ev >= PROP_MIN_EV).map(x => propToLeg(pg, x));
+    renderLiveProps();
+  }).catch(() => { state.liveProps = { key, items: [], loading: false }; renderLiveProps(); });
+}
+
+function renderLiveProps() {
+  const el = $('#liveprops'); if (!el) return;
+  const lp = state.liveProps;
+  if (lp.loading) { el.innerHTML = '<div class="loading"><div class="spinner"></div>pulling real prop lines…</div>'; return; }
+  if (!lp.items) { el.innerHTML = '<div class="bo-fair">pick a game above to pull its real player props, grade them against the model, and surface the +EV edges.</div>'; return; }
+  if (!lp.items.length) { el.innerHTML = '<div class="bo-fair">no player-prop markets posted for this game yet — check back closer to tip/first pitch.</div>'; return; }
+  const pg = lp.items[0].pg;
+  // group by player, order players by their best EV
+  const byPlayer = new Map();
+  lp.items.forEach(x => { (byPlayer.get(x.player) || byPlayer.set(x.player, []).get(x.player)).push(x); });
+  const players = [...byPlayer.entries()].map(([name, arr]) => ({ name, arr,
+    best: Math.max(...arr.map(x => x.ev ?? -9)) })).sort((a, b) => b.best - a.best);
+  // rank by how far the model's projection sits from the line (central lines only) — a
+  // shortlist to INVESTIGATE, not auto-bets. A season-rate model can't out-sharp a prop market.
+  const gaps = lp.items.filter(x => x.ev != null).map(x => ({ ...x, gap: Math.abs(x.over - x.imp) }))
+    .filter(x => x.gap >= 0.06).sort((a, b) => b.gap - a.gap);
+  const sideTxt = x => x.side === 'under' ? `under ${x.threshold}` : `${x.threshold}+`;
+  const top = gaps.length
+    ? `<div class="bo-h" style="margin-top:8px">📊 MODEL vs MARKET — biggest gaps to investigate</div>` + gaps.slice(0, 6).map(x =>
+        `<div class="bo-row bet"><span class="bo-bet">${esc(x.player)} lean ${sideTxt(x)} ${esc(x.statId)}</span>
+         <span>mkt ${pct(x.imp)}</span><span>model ${pct(x.over)}</span><span class="bo-ev ${x.side === 'under' ? 'neg' : 'pos'}">${x.side === 'under' ? '↓' : '↑'} ${Math.round(x.gap * 100)}pt</span>
+         <button class="addleg" data-leg="${esc(JSON.stringify(propToLeg(pg, x)))}">+ slip</button></div>`).join('')
+    : `<div class="bo-fair">the model lines up with the market on this game's central lines — no notable disagreements.</div>`;
+  const rows = players.map(pl => `<div class="bo-h" style="margin-top:11px;color:var(--text)">${esc(pl.name)}${pl.arr[0].avg != null ? ` · ${pl.arr[0].avg.toFixed(1)} ${esc(pl.arr[0].statId)}/g` : ''}</div>` +
+    pl.arr.sort((a, b) => a.threshold - b.threshold).map(x => {
+      const evStr = x.ev == null ? '<span>—</span>'
+        : `<span class="bo-ev ${x.ev >= 0 ? 'pos' : 'neg'}">${x.side === 'under' ? 'U' : 'O'} ${(x.ev * 100).toFixed(1)}%</span>`;
+      return `<div class="bo-row ${x.ev != null && x.ev >= PROP_MIN_EV ? 'bet' : 'skip'}">
+        <span class="bo-bet">${x.threshold}+ ${esc(x.statId)} ${fmtML(x.american)}</span>
+        <span>mkt ${pct(x.imp)}</span><span>${x.over != null ? 'model ' + pct(x.over) : 'no rate'}</span>${evStr}
+        <button class="prload" data-load="${esc(JSON.stringify({ player: x.player, stat: x.statId, avg: x.avg ?? '', line: x.threshold - 0.5, price: Math.round(x.imp * 100) }))}">grade ↑</button>
+      </div>`;
+    }).join('')).join('');
+  el.innerHTML = `<div class="betboard" style="display:block">${top}
+    <div class="bo-h" style="margin-top:14px">ALL PROPS · ${esc(pg.label)} — real lines, model second-opinion</div>${rows}
+    <div class="bo-fair">These are <b>real milestone lines</b> ("X+" = reach X). "mkt" is the line's implied %, "model" is my season-rate projection. Honest caveat: sharp prop markets are hard to beat and my model tends to read unders on high milestone lines — treat gaps as spots to <b>investigate</b> (check recent form &amp; matchup in the lab up top via "grade ↑"), not locks. "+ slip" adds a leg you've vetted; props combine into parlays in the slip.</div></div>`;
 }
 
 function renderPropsOut() {
@@ -2441,6 +2640,19 @@ $('#bankbtn').addEventListener('click', () => {
 $('#content').addEventListener('click', e => {
   const leg = e.target.closest('.addleg');
   if (leg) { try { addLeg(JSON.parse(leg.dataset.leg)); } catch {} return; }
+  const prl = e.target.closest('.prload');
+  if (prl) {   // "grade ↑" — load a real prop into the manual lab up top
+    try {
+      const d = JSON.parse(prl.dataset.load);
+      // reset manual context so a freshly-loaded real prop starts clean at its season rate
+      Object.assign(state.props, { player: d.player, stat: d.stat, avg: String(d.avg),
+        line: String(d.line), price: String(d.price), recent: '', matchup: 'neutral', pace: 'neutral' });
+      localStorage.setItem('de-props-v1', JSON.stringify(state.props));
+      renderProps();
+      document.querySelector('#content .section-h')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch {}
+    return;
+  }
   const pg = e.target.closest('[data-pn],[data-ps],[data-pgen],[data-pload],[data-pcopy]');
   if (pg) { handleParlay(pg); return; }
   const pctx = e.target.closest('[data-pmatch],[data-ppace]');
@@ -2472,6 +2684,7 @@ $('#content').addEventListener('input', e => {
     renderElabOut();   // update math without re-rendering inputs (keeps focus)
     return;
   }
+  if (e.target.id === 'pr-game') { loadLiveProps(e.target.value); return; }
   const pmap = { 'pr-player': 'player', 'pr-stat': 'stat', 'pr-avg': 'avg', 'pr-recent': 'recent', 'pr-line': 'line', 'pr-price': 'price' };
   if (pmap[e.target.id]) {
     state.props[pmap[e.target.id]] = e.target.value;
