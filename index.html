@@ -494,6 +494,7 @@
   <footer>
     Model: regressed win% → log5 matchup probability + sport-specific home advantage (logit space). Soccer uses points-per-game strength with a closeness-weighted draw share; tournament play (World Cup knockouts) falls back to a market-based prior. Tennis uses ATP/WTA ranking-points share. MLB factors the probable starters' ERA gap; team sports factor the live injury report weighted by player skill — an injured stat leader (⭐ in the 🏥 tooltip) counts 2-3x a rotation player, biggest impact in basketball. Day-to-day weighs less than out.<br>
     📐 Team strength blends the actual record with Pythagorean expectation from points scored/allowed (ESPN standings, all team sports). MLB additionally factors Baseball Savant Statcast expected-wOBA for hitting and pitching — contact-quality stats that lead results. See both in the expanded panel's form rows.<br>
+    🎯 Totals: expected combined score from each team's scoring/allowing rates (pitcher-adjusted for MLB) vs the posted O/U — Over/Under sides compete with moneyline/spread for the ⭐ best pick. Venue splits (home/road personality), 😴 back-to-back fatigue, and line movement vs the opener are all factored; "drivers" in the expanded panel says what's pushing each pick.<br>
     Vegas comparison uses ESPN's published line; "VALUE" flags games where the model disagrees with the market by ≥4%.<br>
     ⭐ BEST PICK is the highest expected-value wager at the listed price (vig included; the unlisted dog price is estimated from a 4.5% book margin). Stake sizes are ¼-Kelly, in units of 1% of bankroll. ✋ NO BET means no side clears +2% EV — passing is a position.<br>
     🧠 The model learns: every final updates per-team Elo ratings (margin-of-victory weighted, faster for barely-seen teams) and a per-sport calibration layer (stored locally in your browser). On launch it studies the last 45 days of results in chronological order, then stays current. Predictions blend the record/ranking prior with learned Elo, and the Elo weight grows as the brain sees more of each team. ⭐ picks are logged at the pregame price and settled against the final score. 📜 History keeps a match-by-match record. ⬆⬇ Export/import moves a trained brain between devices.<br>
@@ -755,7 +756,7 @@ const Brain = (() => {
     return clamp(invlogit(x));
   }
 
-  function learn(sport, kH, kA, hfaLogit, scoreH, mov = 1) {
+  function learn(sport, kH, kA, hfaLogit, scoreH, mov = 1, day = null) {
     const { p: pElo, eH, eA } = eloProb(sport, kH, kA, hfaLogit);
     // margin-of-victory multiplier (538-style: blowouts teach more, garbage-time
     // wins by heavy favorites teach less) + faster learning for barely-seen teams
@@ -768,6 +769,7 @@ const Brain = (() => {
     const hMargin = scoreH === 1 ? mov : scoreH === 0 ? -mov : 0;
     (eH.hist = eH.hist || []).push(hMargin); if (eH.hist.length > 10) eH.hist.shift();
     (eA.hist = eA.hist || []).push(-hMargin); if (eA.hist.length > 10) eA.hist.shift();
+    if (day) { eH.last = Math.max(eH.last || 0, day); eA.last = Math.max(eA.last || 0, day); }
     if (scoreH !== 0.5) {
       const c = getCalib(sport);
       const x = logit(clamp(pElo));
@@ -787,6 +789,10 @@ const Brain = (() => {
       const diff = (Number(g.home.score) || 0) - (Number(g.away.score) || 0) + bet.homeSpread;
       if (diff === 0) return;                       // push — stake refunded
       won = bet.side === 'home' ? diff > 0 : diff < 0;
+    } else if (bet.type === 'total') {
+      const tot = (Number(g.home.score) || 0) + (Number(g.away.score) || 0);
+      if (tot === bet.line) return;                 // push
+      won = bet.side === 'over' ? tot > bet.line : tot < bet.line;
     } else {
       if (scoreH === 0.5) return;
       won = bet.side === 'home' ? scoreH === 1 : scoreH === 0;
@@ -808,7 +814,8 @@ const Brain = (() => {
       let mov;
       if (g.tennis) { const [th, ta] = setsTally(g.home.sets, g.away.sets); mov = Math.abs(th - ta); }
       else mov = Math.abs((Number(g.home.score) || 0) - (Number(g.away.score) || 0));
-      learn(sport.id, teamKey(g.home), teamKey(g.away), hfaLogit, scoreH, mov);
+      learn(sport.id, teamKey(g.home), teamKey(g.away), hfaLogit, scoreH, mov,
+        Math.floor(g.start.getTime() / 864e5));
       g.correct ? db.stats.hits++ : db.stats.misses++;
       db.stats.absorbed++;
       settle(key, g, scoreH);
@@ -830,7 +837,8 @@ const Brain = (() => {
       const key = sport.id + '|' + g.id;
       if (db.pending[key]) return;                  // first listed price stands
       db.pending[key] = { side: g.bp.side, b: g.bp.b, units: g.bp.units,
-                          type: g.bp.betType, homeSpread: g.bp.homeSpread ?? null };
+                          type: g.bp.betType, homeSpread: g.bp.homeSpread ?? null,
+                          line: g.bp.line ?? null };
       changed = true;
     });
     if (changed) save();
@@ -940,8 +948,11 @@ function getQuality(sport) {
           if (pf == null || pa == null || !(pf + pa)) return;
           const ex = PYTH_EXP[sport.id];
           const pyth = Math.pow(pf, ex) / (Math.pow(pf, ex) + Math.pow(pa, ex));
-          const g = s.gamesPlayed || (s.wins || 0) + (s.losses || 0) + (s.ties || 0);
-          map.set(String(e.team?.id), { pyth, g: g || 1 });
+          const g = s.gamesPlayed || (s.wins || 0) + (s.losses || 0) + (s.ties || 0) || 1;
+          map.set(String(e.team?.id), { pyth, g,
+            pfg: pf / g, pag: pa / g,
+            hw: s.homeWins ?? null, hl: s.homeLosses ?? null,
+            rw: s.roadWins ?? s.awayWins ?? null, rl: s.roadLosses ?? s.awayLosses ?? null });
         }));
         return map.size ? map : null;
       }).catch(() => null));
@@ -974,6 +985,11 @@ function getSavant() {
   }
   return savantPromise;
 }
+
+// totals: stdev of combined final score, for Over/Under probability
+const TOTAL_SIGMA = { mlb: 4.6, wnba: 17, nba: 19, nfl: 13.5, nhl: 2.2 };
+// back-to-back fatigue (logit penalty) — biggest in basketball, real in hockey
+const B2B_PEN = { wnba: 0.10, nba: 0.10, nhl: 0.08 };
 
 // Star detection: match an injured player against the team's stat leaders.
 // Scoring leader out hurts ~3x a rotation player; other category leaders ~2x.
@@ -1092,6 +1108,11 @@ function computeBestPick(g, sport) {
     cands.push({ side: 'home', type: 'spread', homeSpread, p: pHome, b, imp, text: `${g.home.abbr} ${s(homeSpread)}` });
     cands.push({ side: 'away', type: 'spread', homeSpread, p: 1 - pHome, b, imp, text: `${g.away.abbr} ${s(-homeSpread)}` });
   }
+  if (g.total) {
+    const b = 100 / 110, imp = 0.524;                       // totals priced -110
+    cands.push({ side: 'over', type: 'total', line: g.total.line, p: g.total.pOver, b, imp, text: `Over ${g.total.line}` });
+    cands.push({ side: 'under', type: 'total', line: g.total.line, p: 1 - g.total.pOver, b, imp, text: `Under ${g.total.line}` });
+  }
   if (!cands.length) return { kind: 'model', text: `${pickName} to win`, sub: 'model lean · line not parseable' };
   cands.forEach(c => {
     c.ev = c.p * c.b - (1 - c.p);
@@ -1103,7 +1124,8 @@ function computeBestPick(g, sport) {
   if (best.ev < MIN_EV) return { kind: 'pass', text: 'PASS', ev: best.ev, board: cands,
     sub: `best side ${best.text} · EV ${(best.ev * 100).toFixed(1)}% — not worth the vig` };
   return { kind: 'ev', text: best.text, ev: best.ev, board: cands,
-    side: best.side, b: best.b, p: best.p, betType: best.type, homeSpread: best.homeSpread ?? null,
+    side: best.side, b: best.b, p: best.p, betType: best.type,
+    homeSpread: best.homeSpread ?? null, line: best.line ?? null,
     units: best.units,
     sub: `model ${pct(best.p)} vs implied ${pct(best.imp)}` };
 }
@@ -1140,6 +1162,8 @@ function parseEvents(json, sport, injuries, quality, savant) {
         winner: c.winner === true,
         probable, leaders,
         pyth: q?.pyth ?? null, pythG: q?.g || 0,
+        pfg: q?.pfg ?? null, pag: q?.pag ?? null,
+        hw: q?.hw ?? null, hl: q?.hl ?? null, rw: q?.rw ?? null, rl: q?.rl ?? null,
         xw: (xwBat != null && xwPit != null) ? { bat: xwBat, pit: xwPit } : null,
         inj: injuries?.get(String(c.team?.id)) || null,
       };
@@ -1187,22 +1211,47 @@ function parseEvents(json, sport, injuries, quality, savant) {
       model = { home: p, away: 1 - p, draw: 0 };
       // pregame intel the record can't see: starting pitchers (MLB) + injury report
       let shift = 0;
+      const why = [];
       if (sport.id === 'mlb' && home.probable?.era != null && away.probable?.era != null) {
-        shift += Math.max(-0.5, Math.min(0.5, (away.probable.era - home.probable.era) * 0.13));
+        const d = away.probable.era - home.probable.era;
+        shift += Math.max(-0.5, Math.min(0.5, d * 0.13));
+        if (Math.abs(d) >= 0.8) why.push(`SP edge ${d > 0 ? home.abbr : away.abbr}`);
       }
       // Statcast: expected-wOBA quality gap (own hitting minus own pitching allowed)
       if (sport.id === 'mlb' && home.xw && away.xw) {
         const sc = t => t.xw.bat - t.xw.pit;
-        shift += Math.max(-0.4, Math.min(0.4, (sc(home) - sc(away)) * 6));
+        const d = sc(home) - sc(away);
+        shift += Math.max(-0.4, Math.min(0.4, d * 6));
+        if (Math.abs(d) >= 0.02) why.push(`statcast edge ${d > 0 ? home.abbr : away.abbr}`);
       }
       if (injuries) {
         const pen = t => Math.min(60, (t.injEff || 0) * (INJ_PENALTY[sport.id] || 0));
-        shift += (pen(away) - pen(home)) * Math.LN10 / 400;
+        const d = pen(away) - pen(home);
+        shift += d * Math.LN10 / 400;
+        if (Math.abs(d) >= 10) why.push(`injuries hit ${d > 0 ? away.abbr : home.abbr}`);
+      }
+      // venue personality: deviation from the expected home/road performance
+      const meanBoost = sport.hfaWin - 0.5;
+      const venueDev = (t, isHome) => {
+        const w = isHome ? t.hw : t.rw, l = isHome ? t.hl : t.rl;
+        if (w == null || l == null || w + l < 8) return 0;
+        const expected = clamp(regressedWinPct(t.rec.w, t.rec.l) + (isHome ? meanBoost : -meanBoost), 0.05, 0.95);
+        return (w + 5 * expected) / (w + l + 5) - expected;
+      };
+      const vd = venueDev(home, true) - venueDev(away, false);
+      shift += Math.max(-0.25, Math.min(0.25, vd * 1.2));
+      // back-to-back fatigue, from the brain's last-played tracker
+      if (B2B_PEN[sport.id]) {
+        const day = Math.floor(new Date(ev.date).getTime() / 864e5);
+        [home, away].forEach(t => { t.b2b = Brain.rating(sport.id, t)?.last === day - 1; });
+        shift += (t => (away.b2b ? t : 0) - (home.b2b ? t : 0))(B2B_PEN[sport.id]);
+        if (home.b2b !== away.b2b) why.push(`${home.b2b ? home.abbr : away.abbr} on back-to-back`);
       }
       if (shift) {
         const p2 = clamp(invlogit(logit(clamp(model.home)) + shift));
         model = { home: p2, away: 1 - p2, draw: 0 };
       }
+      var whyDrivers = why;   // hoisted to the game object below
     }
 
     // pick = highest-probability outcome
@@ -1214,9 +1263,21 @@ function parseEvents(json, sport, injuries, quality, savant) {
     const edge = (vegas && vegas.homeProb != null && !sport.soccer)
       ? model.home - vegas.homeProb : null;
 
+    // totals model: expected combined score from scoring/allowing rates,
+    // pitcher-adjusted for MLB, vs the posted O/U line
+    let total = null;
+    if (vegas?.ou && TOTAL_SIGMA[sport.id] && home.pfg != null && away.pfg != null) {
+      let exp = (home.pfg + away.pag) / 2 + (away.pfg + home.pag) / 2;
+      if (sport.id === 'mlb' && home.probable?.era != null && away.probable?.era != null) {
+        exp += ((home.probable.era + away.probable.era) / 2 - 4.2) * 0.8;
+      }
+      total = { exp, line: vegas.ou, pOver: clamp(normalCdf((exp - vegas.ou) / TOTAL_SIGMA[sport.id])) };
+    }
+
     const st = ev.status?.type || {};
     return {
       id: ev.id, home, away, model, pick, pickProb, vegas, edge, marketPrior,
+      total, why: typeof whyDrivers !== 'undefined' ? whyDrivers : [],
       state: st.state || 'pre',                       // pre | in | post
       statusText: st.shortDetail || st.detail || '',
       period: ev.status?.period, clock: ev.status?.displayClock || '',
@@ -1426,7 +1487,9 @@ function betBoard(g) {
   return `<div class="betboard"><div class="bo-h">FULL BET BOARD</div>
     ${rows || '<div class="bo-row skip"><span class="bo-bet">no priced markets listed for this match</span></div>'}
     <div class="bo-fair">model's fair prices: ${esc(g.home.abbr)} ${fh} / ${esc(g.away.abbr)} ${fa}${fd} — only take better numbers than these</div>
-    ${g.vegas?.ou ? `<div class="bo-fair">total: O/U ${g.vegas.ou} — no totals model yet</div>` : ''}
+    ${g.total ? `<div class="bo-fair">model total: ${g.total.exp.toFixed(1)} vs line ${g.total.line} → ${g.total.pOver >= 0.5 ? 'Over' : 'Under'} ${pct(Math.max(g.total.pOver, 1 - g.total.pOver))}</div>`
+      : g.vegas?.ou ? `<div class="bo-fair">total: O/U ${g.vegas.ou}</div>` : ''}
+    ${g.why?.length ? `<div class="bo-fair">drivers: ${esc(g.why.join(' · '))}</div>` : ''}
     ${extras}
   </div>`;
 }
@@ -1440,9 +1503,10 @@ function teamRow(t, g, side) {
   const pit = t.probable?.name
     ? ` · P: ${t.probable.name}${t.probable.era != null ? ` (${t.probable.era.toFixed(2)})` : ''}` : '';
   const injChip = t.inj?.n ? `<span class="injchip" title="${esc(t.injTitle || '')}">🏥${t.inj.n}${t.injStar ? '⭐' : ''}</span>` : '';
+  const b2bChip = t.b2b ? '<span class="injchip" title="played yesterday — fatigue penalty applied">😴B2B</span>' : '';
   return `<div class="teamrow ${isWinner ? 'winner' : ''} ${isPicked ? 'picked' : ''}">
     ${teamLogo(t)}
-    <div><div class="tname">${esc(t.name)}${injChip}</div><div class="trec">${esc(t.recSummary)}${eloStr}${esc(pit)}</div></div>
+    <div><div class="tname">${esc(t.name)}${injChip}${b2bChip}</div><div class="trec">${esc(t.recSummary)}${eloStr}${esc(pit)}</div></div>
     ${score}
   </div>`;
 }
@@ -1463,8 +1527,11 @@ function gameCard(g, i, sport) {
     const mkt = g.marketPrior ? '<span class="chip mkt">MARKET PRIOR</span>' : '';
     verdict = `<b>${esc(pickName)}</b>&nbsp;${pct(g.pickProb)} ${tierChip(g.pickProb)} ${valueChip(g)} ${mkt}`;
   }
+  const opened = g.state === 'pre' ? Open.get(sport, g) : null;
+  const moved = opened?.d && g.vegas?.detail && opened.d !== g.vegas.detail
+    ? ` (opened ${esc(opened.d)})` : '';
   const vegasStr = g.vegas?.detail
-    ? `<span class="vegas">Vegas: ${esc(g.vegas.detail)}${g.vegas.ou ? ' · O/U ' + g.vegas.ou : ''}</span>` : '';
+    ? `<span class="vegas">Vegas: ${esc(g.vegas.detail)}${moved}${g.vegas.ou ? ' · O/U ' + g.vegas.ou : ''}</span>` : '';
 
   // live cards show the in-game probability and movement vs the opening number
   const lp = live ? liveProbs(g, sport) : null;
