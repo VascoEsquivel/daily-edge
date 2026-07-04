@@ -408,6 +408,33 @@
   .f-btn.on { background: rgba(0,255,136,.12); border-color: var(--border-hi); color: var(--accent); }
   .f-sep { color: var(--muted); font-size: 10px; letter-spacing: 2px; margin-left: 6px; }
 
+  /* ── Parlay generator ── */
+  .pgen { background: var(--card); backdrop-filter: blur(12px); border: 1px solid rgba(255,209,102,.28);
+    border-radius: 16px; padding: 16px 18px; margin-bottom: 24px; }
+  .pg-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-bottom: 12px; }
+  .pg-btn { background: transparent; border: 1px solid var(--border); color: var(--muted);
+    padding: 6px 12px; border-radius: 999px; cursor: pointer; font-family: inherit; font-size: 11.5px; font-weight: 700; transition: all .12s; }
+  .pg-btn:hover { color: var(--text); }
+  .pg-btn.on { background: rgba(255,209,102,.14); border-color: rgba(255,209,102,.5); color: var(--gold); }
+  .pg-go { background: linear-gradient(135deg, rgba(255,209,102,.9), rgba(244,169,66,.9)); color: #1a1206;
+    border: none; padding: 7px 16px; border-radius: 999px; cursor: pointer; font-family: inherit; font-size: 12px; font-weight: 800; margin-left: auto; }
+  .pg-go:hover { box-shadow: 0 0 18px rgba(255,209,102,.4); }
+  .pgen-card { border-top: 1px dashed var(--border); padding-top: 12px; animation: fadeUp .3s ease both; }
+  .pg-leg { display: grid; grid-template-columns: auto 1.4fr 1.6fr auto; gap: 9px; align-items: center;
+    font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 7px 9px; border-radius: 8px; margin-bottom: 5px; background: rgba(0,0,0,.22); }
+  .pg-leg .pg-bet { font-weight: 700; }
+  .pg-leg .pg-m { color: var(--muted); font-size: 10.5px; }
+  .pg-leg .pg-p { color: var(--home); font-weight: 700; text-align: right; }
+  .pg-summary { margin-top: 10px; font-size: 12.5px; line-height: 1.9; }
+  .pg-summary b { font-family: 'JetBrains Mono', monospace; color: var(--text); }
+  .pg-summary .pg-k { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: 1px; }
+  .pg-verdict { margin-top: 4px; font-size: 11.5px; color: var(--muted); }
+  .pg-note { color: var(--muted); font-size: 10px; font-style: italic; margin-top: 3px; }
+  .pg-actions { display: flex; gap: 8px; margin-top: 11px; flex-wrap: wrap; }
+  .pg-actions button { background: rgba(255,209,102,.1); border: 1px solid rgba(255,209,102,.35); color: var(--gold);
+    padding: 7px 14px; border-radius: 9px; cursor: pointer; font-family: inherit; font-size: 11.5px; font-weight: 700; }
+  .pg-actions .pg-go { margin-left: 0; }
+
   /* ── Esports EV Lab ── */
   .elab {
     background: var(--card); backdrop-filter: blur(12px); border: 1px solid var(--border);
@@ -522,7 +549,7 @@
     ⭐ BEST PICK is the highest expected-value wager at the listed price (vig included; the unlisted dog price is estimated from a 4.5% book margin). Stake sizes are ¼-Kelly, in units of 1% of bankroll. ✋ NO BET means no side clears +2% EV — passing is a position.<br>
     🧠 The model learns: every final updates per-team Elo ratings (margin-of-victory weighted, faster for barely-seen teams) and a per-sport calibration layer (stored locally in your browser). On launch it studies the last 45 days of results in chronological order, then stays current. Predictions blend the record/ranking prior with learned Elo, and the Elo weight grows as the brain sees more of each team. ⭐ picks are logged at the pregame price and settled against the final score. 📜 History keeps a match-by-match record. ⬆⬇ Export/import moves a trained brain between devices.<br>
     ⚡ Live win probability uses the Stern model — current margin + time remaining vs the pregame expectation — and updates each poll; the ▲▼ shows movement vs the opening number. Click any upcoming match for its full bet board with model vs market prices on every side.<br>
-    🎟️ The slip combines legs assuming independence; parlays stack the book's vig, so most are −EV — the slip will tell you. 💵 Set a bankroll to see stakes in dollars. Keys: ← → dates · t today · r refresh · 1–9 tabs.<br>
+    🎟️ The slip combines legs assuming independence; parlays stack the book's vig, so most are −EV — the slip will tell you. 🎰 The Parlay Generator (top of The Card) auto-builds Safe / Value / Longshot parlays from the day's priced picks and labels each +EV or −EV honestly. 💵 Set a bankroll to see stakes in dollars. Keys: ← → dates · t today · r refresh · 1–9 tabs.<br>
     ⚠️ Predictions are statistical estimates for entertainment and research — no model prints money. If you bet, bet what you can afford to lose.
   </footer>
 </div>
@@ -561,6 +588,7 @@ const state = {
   slip: [], slipOpen: false,
   lastEntries: new Map(), activeEntry: null,
   esports: { a: '', b: '', pa: '', oa: '', ob: '' },
+  parlay: { n: 3, style: 'value', out: null },
 };
 try { state.slip = JSON.parse(localStorage.getItem('de-slip-v1')) || []; } catch {}
 try { Object.assign(state.esports, JSON.parse(localStorage.getItem('de-elab-v1')) || {}); } catch {}
@@ -1910,6 +1938,81 @@ function applySearch() {
   });
 }
 
+// ── 🎰 Parlay generator ─────────────────────────────────────────────────
+// One priced side per pregame game (the model's favored side), assembled into
+// a parlay by style. EV assumes independence — the card says so honestly.
+function parlayCandidates(allEvents) {
+  return allEvents.filter(g => g.state === 'pre' && g.bp?.board?.length).map(g => {
+    const sides = g.bp.board.filter(c => c.type === 'ml' || c.type === 'spread');
+    if (!sides.length) return null;
+    const best = sides.reduce((a, b) => b.p > a.p ? b : a);   // side the model favors
+    return { gid: g.id, t: best.text, p: best.p, b: best.b, ev: best.ev,
+             m: `${g.away.abbr} @ ${g.home.abbr}`, k: g.sportId, tm: timeOf(g.start) };
+  }).filter(Boolean);
+}
+
+function generateParlay() {
+  const all = [...state.lastEntries.values()].flatMap(e => e.events);
+  const { n, style } = state.parlay;
+  let pool = parlayCandidates(all);
+  if (pool.length < 2) { state.parlay.out = { error: 'Need at least 2 upcoming games with priced markets — check back closer to game time.' }; return; }
+  if (style === 'safe') pool.sort((a, b) => b.p - a.p);
+  else if (style === 'value') {
+    const ev = pool.filter(c => c.ev >= MIN_EV).sort((a, b) => b.ev - a.ev);
+    pool = ev.length >= n ? ev : pool.sort((a, b) => b.ev - a.ev);
+  } else {   // longshot: plus-money sides, biggest payout, still model-plausible
+    const dogs = pool.filter(c => c.b >= 1 && c.p >= 0.4).sort((a, b) => b.b - a.b);
+    pool = dogs.length >= 2 ? dogs : pool.sort((a, b) => b.b - a.b);
+  }
+  // sample n from the top of the pool so "reshuffle" gives variety near the best
+  const top = pool.slice(0, Math.min(pool.length, n + 3));
+  for (let i = top.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [top[i], top[j]] = [top[j], top[i]]; }
+  const legs = top.slice(0, Math.min(n, top.length));
+  const D = legs.reduce((d, l) => d * (1 + l.b), 1);
+  const P = legs.reduce((p, l) => p * l.p, 1);
+  state.parlay.out = { legs, D, P, ev: P * D - 1 };
+}
+
+function parlaySection() {
+  const p = state.parlay;
+  const legBtns = [2, 3, 4, 5].map(n => `<button class="pg-btn ${p.n === n ? 'on' : ''}" data-pn="${n}">${n} legs</button>`).join('');
+  const styles = [['safe', '🛡️ Safe'], ['value', '💎 Value'], ['longshot', '🚀 Longshot']];
+  const styleBtns = styles.map(([v, l]) => `<button class="pg-btn ${p.style === v ? 'on' : ''}" data-ps="${v}">${l}</button>`).join('');
+  return `<div class="section-h">🎰 Parlay Generator</div>
+    <div class="pgen">
+      <div class="pg-controls">${legBtns}<span class="f-sep">STYLE</span>${styleBtns}
+        <button class="pg-go" data-pgen>🎲 Generate</button></div>
+      ${parlayResult()}
+    </div>`;
+}
+
+function parlayResult() {
+  const o = state.parlay.out;
+  if (!o) return '<div class="bo-fair">pick your legs &amp; a style, then hit Generate — the model assembles the parlay and tells you straight whether it beats the vig.</div>';
+  if (o.error) return `<div class="bo-fair">${esc(o.error)}</div>`;
+  const bank = Number(localStorage.getItem('de-bank')) || 0;
+  const payStr = bank ? `$${Math.round(bank / 100)} → $${Math.round(o.D * bank / 100)}` : `1u → ${o.D.toFixed(2)}u`;
+  const american = fmtML(probToAmerican(clamp(1 / o.D)));
+  const legRows = o.legs.map(l => `<div class="pg-leg"><span>${SPORT_ICON[l.k] || '🎯'}</span>
+    <span class="pg-bet">${esc(l.t)}</span><span class="pg-m">${esc(l.m)} · ${esc(l.tm)}</span><span class="pg-p">${pct(l.p)}</span></div>`).join('');
+  const evPct = (o.ev * 100).toFixed(1);
+  const verdict = o.ev >= 0.02
+    ? `<span class="chip hit">✅ +EV PARLAY · +${evPct}%</span> every leg beats its price`
+    : o.ev >= -0.06
+      ? `<span class="chip lean">≈ NEAR EVEN · ${evPct}%</span> thin vig tax on this one`
+      : `<span class="chip miss">⚠️ −EV · ${evPct}%</span> the parlay tax — fun, not +money`;
+  return `<div class="pgen-card">${legRows}
+    <div class="pg-summary">
+      <div><span class="pg-k">combined</span> <b>${american}</b> · <span class="pg-k">model hits</span> <b>${pct(o.P)}</b> · <span class="pg-k">payout</span> <b>${payStr}</b></div>
+      <div class="pg-verdict">${verdict}</div>
+      <div class="pg-note">EV assumes the legs are independent — don't stack correlated bets (same game, same team's total).</div>
+    </div>
+    <div class="pg-actions"><button class="pg-load" data-pload>📥 load into slip</button><button data-pcopy>📋 copy</button><button class="pg-go" data-pgen>🎲 reshuffle</button></div>
+  </div>`;
+}
+
+function updateParlay() { const w = $('#pgen-wrap'); if (w) w.innerHTML = parlaySection(); }
+
 // 💰 The Card: the whole day's best plays across every sport in one view
 function renderCard(allEvents) {
   const bySport = Object.fromEntries(SPORTS.map(s => [s.id, s]));
@@ -1924,6 +2027,7 @@ function renderCard(allEvents) {
     + sec('● Live right now', live)
     + sec('🔒 Confidence board — big favorites, no priced edge', locks);
   $('#content').innerHTML = summaryBar(allEvents)
+    + `<div id="pgen-wrap">${parlaySection()}</div>`
     + (body || '<div class="empty"><div class="big">😴</div>Nothing on the card yet — check back closer to game time.</div>');
   applySearch();
 }
@@ -2037,6 +2141,28 @@ function slipMath() {
   const D = state.slip.reduce((d, l) => d * (1 + l.b), 1);  // combined decimal odds
   const P = state.slip.reduce((p, l) => p * l.p, 1);        // model prob (assumes independence)
   return { D, P, ev: P * D - 1 };
+}
+
+function handleParlay(btn) {
+  if (btn.dataset.pn) { state.parlay.n = Number(btn.dataset.pn); updateParlay(); return; }
+  if (btn.dataset.ps) { state.parlay.style = btn.dataset.ps; updateParlay(); return; }
+  if (btn.hasAttribute('data-pgen')) { generateParlay(); updateParlay(); return; }
+  const o = state.parlay.out;
+  if (btn.hasAttribute('data-pload')) {
+    if (!o?.legs) return;
+    state.slip = o.legs.map(l => ({ gid: l.gid, t: l.t, p: l.p, b: l.b, m: l.m, k: l.k, tm: l.tm }));
+    state.slipOpen = true; saveSlip(); renderSlip();
+    btn.textContent = '✓ loaded'; setTimeout(updateParlay, 1200);
+    return;
+  }
+  if (btn.hasAttribute('data-pcopy')) {
+    if (!o?.legs) return;
+    const txt = `🎰 DAILY EDGE parlay (${o.legs.length} legs)\n`
+      + o.legs.map(l => `• ${l.t} — ${l.m}`).join('\n')
+      + `\ncombined ${fmtML(probToAmerican(clamp(1 / o.D)))} · model ${pct(o.P)} to hit`;
+    navigator.clipboard?.writeText(txt);
+    btn.textContent = '✓ copied'; setTimeout(updateParlay, 1200);
+  }
 }
 
 function renderSlip() {
@@ -2153,6 +2279,8 @@ $('#bankbtn').addEventListener('click', () => {
 $('#content').addEventListener('click', e => {
   const leg = e.target.closest('.addleg');
   if (leg) { try { addLeg(JSON.parse(leg.dataset.leg)); } catch {} return; }
+  const pg = e.target.closest('[data-pn],[data-ps],[data-pgen],[data-pload],[data-pcopy]');
+  if (pg) { handleParlay(pg); return; }
   const fb = e.target.closest('.f-btn');
   if (fb) {
     if (fb.dataset.f) state.filter = fb.dataset.f;
