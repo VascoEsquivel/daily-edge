@@ -408,6 +408,27 @@
   .f-btn.on { background: rgba(0,255,136,.12); border-color: var(--border-hi); color: var(--accent); }
   .f-sep { color: var(--muted); font-size: 10px; letter-spacing: 2px; margin-left: 6px; }
 
+  /* ── Esports EV Lab ── */
+  .elab {
+    background: var(--card); backdrop-filter: blur(12px); border: 1px solid var(--border);
+    border-radius: 16px; padding: 18px; max-width: 620px;
+  }
+  .elab-teams { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+  .elab-teams input {
+    flex: 1; background: rgba(0,0,0,.35); border: 1px solid var(--border); color: var(--text);
+    padding: 11px 13px; border-radius: 10px; font-family: inherit; font-size: 15px; font-weight: 700; outline: none;
+  }
+  .elab-teams input:focus { border-color: var(--accent2); }
+  .elab-vs { font-family: 'Unbounded', sans-serif; color: var(--muted); font-size: 14px; }
+  .elab-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 6px; }
+  .elab-grid label { display: flex; flex-direction: column; gap: 5px; font-size: 10.5px; color: var(--muted); letter-spacing: .5px; }
+  .elab-grid input {
+    background: rgba(0,0,0,.35); border: 1px solid var(--border); color: var(--text);
+    padding: 9px 11px; border-radius: 9px; font-family: 'JetBrains Mono', monospace; font-size: 14px; outline: none;
+  }
+  .elab-grid input:focus { border-color: var(--accent2); }
+  @media (max-width: 560px) { .elab-grid { grid-template-columns: 1fr; } }
+
   /* ── Bet slip ── */
   .addleg {
     background: rgba(0,200,255,.1); border: 1px solid rgba(0,200,255,.35); color: var(--accent2);
@@ -494,7 +515,8 @@
   <footer>
     Model: regressed win% → log5 matchup probability + sport-specific home advantage (logit space). Soccer uses points-per-game strength with a closeness-weighted draw share; tournament play (World Cup knockouts) falls back to a market-based prior. Tennis uses ATP/WTA ranking-points share. MLB factors the probable starters' ERA gap; team sports factor the live injury report weighted by player skill — an injured stat leader (⭐ in the 🏥 tooltip) counts 2-3x a rotation player, biggest impact in basketball. Day-to-day weighs less than out.<br>
     📐 Team strength blends the actual record with Pythagorean expectation from points scored/allowed (ESPN standings, all team sports). MLB additionally factors Baseball Savant Statcast expected-wOBA for hitting and pitching — contact-quality stats that lead results. See both in the expanded panel's form rows.<br>
-    🎯 Totals: expected combined score from each team's scoring/allowing rates vs the posted O/U — Over/Under sides compete with moneyline/spread for the ⭐ best pick. MLB totals factor starters, bullpen relief ERA (MLB StatsAPI), and game-time weather (temperature and rain, outdoor parks only). Venue splits, 😴 back-to-back fatigue, and line movement vs the opener are all factored; "drivers" in the expanded panel says what's pushing each pick.<br>
+    🎯 Totals: expected combined score from each team's scoring/allowing rates vs the posted O/U — Over/Under sides compete with moneyline/spread for the ⭐ best pick. MLB totals factor starters, bullpen relief ERA (MLB StatsAPI), game-time temperature/rain, and 💨 wind (Open-Meteo, computed as blowing-out/in relative to each park's center-field orientation — the Wrigley effect). Venue splits, 😴 back-to-back fatigue, and line movement vs the opener are all factored; "drivers" in the expanded panel says what's pushing each pick.<br>
+    🎮 Esports EV Lab: live Valorant/League feeds require paid keys and are CORS-locked from a static site, so the tab is a manual EV engine — your odds and your read in, the +EV side, ¼-Kelly stake, and slip integration out. No fake data, real math.<br>
     🔥🥶 Hot/cold: recent margin form gives a small, capped model shift (streaks are mostly noise — never more than ~3%) and chips flag teams 4-1 or better / 1-4 or worse in their last five. Player-level streaks aren't in free data feeds; prop angles show season rates.<br>
     Vegas comparison uses ESPN's published line; "VALUE" flags games where the model disagrees with the market by ≥4%.<br>
     ⭐ BEST PICK is the highest expected-value wager at the listed price (vig included; the unlisted dog price is estimated from a 4.5% book margin). Stake sizes are ¼-Kelly, in units of 1% of bankroll. ✋ NO BET means no side clears +2% EV — passing is a position.<br>
@@ -538,8 +560,10 @@ const state = {
   filter: 'all', sort: 'time', query: '',
   slip: [], slipOpen: false,
   lastEntries: new Map(), activeEntry: null,
+  esports: { a: '', b: '', pa: '', oa: '', ob: '' },
 };
 try { state.slip = JSON.parse(localStorage.getItem('de-slip-v1')) || []; } catch {}
+try { Object.assign(state.esports, JSON.parse(localStorage.getItem('de-elab-v1')) || {}); } catch {}
 
 // ── Model ──────────────────────────────────────────────────────────────
 const logit = p => Math.log(p / (1 - p));
@@ -1004,6 +1028,83 @@ function getBullpen() {
   return bullpenPromise;
 }
 
+// ── Wind (Open-Meteo, free + no key) ────────────────────────────────────
+// cf = compass bearing home plate → center field, i.e. the direction a
+// "blowing out" wind travels toward. Wind blowing out carries fly balls
+// (boosts totals); blowing in kills them. Bearings are best-effort.
+const MLB_PARKS = {
+  CHC: { lat: 41.9484, lon: -87.6553, cf: 32 },   // Wrigley — the classic
+  BOS: { lat: 42.3467, lon: -71.0972, cf: 52 },
+  NYY: { lat: 40.8296, lon: -73.9262, cf: 24 },
+  BAL: { lat: 39.2839, lon: -76.6217, cf: 65 },
+  CLE: { lat: 41.4962, lon: -81.6852, cf: 2 },
+  DET: { lat: 42.3390, lon: -83.0485, cf: 28 },
+  KC:  { lat: 39.0517, lon: -94.4803, cf: 58 },
+  CHW: { lat: 41.8299, lon: -87.6338, cf: 128 }, CWS: { lat: 41.8299, lon: -87.6338, cf: 128 },
+  LAA: { lat: 33.8003, lon: -117.8827, cf: 40 },
+  ATH: { lat: 38.5806, lon: -121.5137, cf: 45 }, OAK: { lat: 38.5806, lon: -121.5137, cf: 45 },
+  ATL: { lat: 33.8907, lon: -84.4677, cf: 20 },
+  NYM: { lat: 40.7571, lon: -73.8458, cf: 24 },
+  PHI: { lat: 39.9061, lon: -75.1665, cf: 2 },
+  WSH: { lat: 38.8730, lon: -77.0074, cf: 32 },
+  CIN: { lat: 39.0975, lon: -84.5069, cf: 100 },
+  PIT: { lat: 40.4469, lon: -80.0057, cf: 60 },
+  STL: { lat: 38.6226, lon: -90.1928, cf: 20 },
+  COL: { lat: 39.7559, lon: -104.9942, cf: 2 },
+  LAD: { lat: 34.0739, lon: -118.2400, cf: 30 },
+  SD:  { lat: 32.7073, lon: -117.1566, cf: 30 },
+  SF:  { lat: 37.7786, lon: -122.3893, cf: 30 },   // Oracle — famous bay wind
+};
+const windCache = new Map();
+function getWind(park, gameDate) {
+  const key = park.lat.toFixed(2) + ',' + park.lon.toFixed(2) + '|' + gameDate.toISOString().slice(0, 13);
+  if (windCache.has(key)) return windCache.get(key);
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${park.lat}&longitude=${park.lon}`
+    + `&hourly=wind_speed_10m,wind_direction_10m&wind_speed_unit=mph&timezone=GMT&forecast_days=3&past_days=1`;
+  const p = fetch(url).then(r => r.json()).then(j => {
+    const times = j.hourly?.time || [];
+    if (!times.length) return null;
+    const target = gameDate.getTime();
+    let bi = -1, bd = Infinity;
+    times.forEach((t, i) => {
+      const d = Math.abs(new Date(t.length === 16 ? t + ':00Z' : t).getTime() - target);
+      if (d < bd) { bd = d; bi = i; }
+    });
+    if (bi < 0) return null;
+    return { speed: j.hourly.wind_speed_10m[bi], dirFrom: j.hourly.wind_direction_10m[bi] };
+  }).catch(() => null);
+  windCache.set(key, p);
+  return p;
+}
+
+// mph component blowing out toward center (+) or in from center (-)
+function windOutComponent(w, cf) {
+  if (!w || w.speed == null || cf == null) return null;
+  const windTo = (w.dirFrom + 180) % 360;   // direction the wind travels toward
+  let diff = Math.abs(windTo - cf) % 360;
+  if (diff > 180) diff = 360 - diff;
+  return w.speed * Math.cos(diff * Math.PI / 180);
+}
+
+// fetch winds for the pregame outdoor MLB games on a scoreboard → Map(eventId → {out, speed, cf})
+async function getWinds(json) {
+  const map = new Map(), jobs = [];
+  (json.events || []).forEach(ev => {
+    if (ev.status?.type?.state !== 'pre') return;
+    const comp = ev.competitions?.[0];
+    if (!comp || comp.venue?.indoor) return;
+    const homeAbbr = comp.competitors?.find(c => c.homeAway === 'home')?.team?.abbreviation;
+    const park = MLB_PARKS[homeAbbr];
+    if (!park) return;
+    jobs.push(getWind(park, new Date(ev.date)).then(w => {
+      const out = windOutComponent(w, park.cf);
+      if (out != null) map.set(ev.id, { out, speed: w.speed });
+    }));
+  });
+  await Promise.allSettled(jobs);
+  return map;
+}
+
 // totals: stdev of combined final score, for Over/Under probability
 const TOTAL_SIGMA = { mlb: 4.6, wnba: 17, nba: 19, nfl: 13.5, nhl: 2.2 };
 // back-to-back fatigue (logit penalty) — biggest in basketball, real in hockey
@@ -1048,7 +1149,9 @@ async function fetchSport(sport, date, force = false) {
       sport.id === 'mlb' ? getBullpen() : Promise.resolve(null),
     ]);
     if (!res.ok) throw new Error('ESPN API responded ' + res.status);
-    events = parseEvents(await res.json(), sport, injuries, quality, savant, bullpen);
+    const json = await res.json();
+    const winds = sport.id === 'mlb' ? await getWinds(json) : null;
+    events = parseEvents(json, sport, injuries, quality, savant, bullpen, winds);
   }
   events.forEach(g => { g.sportId = sport.id; });
   const entry = { events, fetchedAt: Date.now() };
@@ -1149,7 +1252,7 @@ function computeBestPick(g, sport) {
     sub: `model ${pct(best.p)} vs implied ${pct(best.imp)}` };
 }
 
-function parseEvents(json, sport, injuries, quality, savant, bullpen) {
+function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
   const games = (json.events || []).map(ev => {
     const comp = ev.competitions?.[0];
     if (!comp) return null;
@@ -1306,8 +1409,9 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen) {
 
     // totals model: expected combined score from scoring/allowing rates,
     // pitcher/bullpen/weather-adjusted for MLB, vs the posted O/U line
-    const wx = ev.weather && !comp.venue?.indoor
-      ? { t: ev.weather.temperature ?? null, txt: ev.weather.displayValue || '' } : null;
+    const wind = winds?.get(ev.id) || null;
+    const wx = (ev.weather && !comp.venue?.indoor)
+      ? { t: ev.weather.temperature ?? null, txt: ev.weather.displayValue || '', wind } : null;
     let total = null;
     if (vegas?.ou && TOTAL_SIGMA[sport.id] && home.pfg != null && away.pfg != null) {
       let exp = (home.pfg + away.pag) / 2 + (away.pfg + home.pag) / 2;
@@ -1323,6 +1427,11 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen) {
           exp += (wx.t - 70) * 0.018;   // hot air carries — roughly +0.4 runs on a 92° day
           if (wx.t >= 85) notes.push(`${wx.t}° heat → over`);
           else if (wx.t <= 55) notes.push(`${wx.t}° cold → under`);
+        }
+        // wind blowing out to center carries fly balls; blowing in kills them
+        if (wind && Math.abs(wind.out) >= 5) {
+          exp += Math.max(-0.7, Math.min(0.7, wind.out * 0.03));
+          notes.push(`${Math.round(wind.speed)}mph ${wind.out > 0 ? 'blowing out → over' : 'blowing in → under'}`);
         }
         if (wx && /rain|shower|storm|drizzle/i.test(wx.txt)) { exp -= 0.25; notes.push('rain → under'); }
       }
@@ -1615,7 +1724,7 @@ function gameCard(g, i, sport) {
     style="animation-delay:${Math.min(i * 45, 450)}ms">
     <div class="g-top">
       ${badge}
-      <span class="where">${esc(g.state === 'pre' ? (g.tv || g.venue) : g.statusText)}${g.wx?.t != null && g.state !== 'post' ? esc(` · ${g.wx.t}°`) : ''}</span>
+      <span class="where">${esc(g.state === 'pre' ? (g.tv || g.venue) : g.statusText)}${g.wx?.t != null && g.state !== 'post' ? esc(` · ${g.wx.t}°`) : ''}${g.wx?.wind && Math.abs(g.wx.wind.out) >= 5 && g.state === 'pre' ? esc(` · 💨${Math.round(g.wx.wind.speed)}mph ${g.wx.wind.out > 0 ? 'out' : 'in'}`) : ''}</span>
     </div>
     ${teamRow(g.away, g, 'away')}
     ${teamRow(g.home, g, 'home')}
@@ -1701,11 +1810,12 @@ function summaryBar(events) {
 
 function renderTabs(counts, evTotal = 0) {
   const cardTab = `<button class="tab ${state.tab === 'card' ? 'active' : ''}" data-sport="card">💰 The Card${evTotal ? `<span class="cnt">⭐ ${evTotal}</span>` : ''}</button>`;
+  const esportsTab = `<button class="tab ${state.tab === 'esports' ? 'active' : ''}" data-sport="esports">🎮 Esports</button>`;
   $('#tabs').innerHTML = cardTab + SPORTS.map(s => {
     const c = counts.get(s.id);
     const cnt = c == null ? '' : `<span class="cnt ${c.live ? 'live' : ''}">${c.live ? '● ' : ''}${c.n}</span>`;
     return `<button class="tab ${s.id === state.tab ? 'active' : ''}" data-sport="${s.id}">${s.label}${cnt}</button>`;
-  }).join('');
+  }).join('') + esportsTab;
   const totalLive = [...counts.values()].reduce((n, c) => n + c.liveN, 0);
   $('#livechip').classList.toggle('on', totalLive > 0);
   $('#livecount').textContent = totalLive + ' LIVE';
@@ -1739,7 +1849,7 @@ function renderBrain() {
   renderHistory();
 }
 
-const SPORT_ICON = Object.fromEntries(SPORTS.map(s => [s.id, s.label.split(' ')[0]]));
+const SPORT_ICON = { esports: '🎮', ...Object.fromEntries(SPORTS.map(s => [s.id, s.label.split(' ')[0]])) };
 function renderHistory() {
   const el = $('#histpanel');
   if (!state.showHistory) { el.innerHTML = ''; return; }
@@ -1846,7 +1956,10 @@ async function refresh(force = false) {
   renderTabs(counts, evTotal);
   renderBrain();
 
-  if (state.tab === 'card') {
+  if (state.tab === 'esports') {
+    renderEsports();
+    clearTimeout(state.liveTimer);
+  } else if (state.tab === 'card') {
     renderCard(allEvents);
     scheduleLivePoll(allEvents);
   } else {
@@ -1949,8 +2062,69 @@ function renderSlip() {
 }
 
 function renderActive() {
-  if (state.tab === 'card') renderCard([...state.lastEntries.values()].flatMap(e => e.events));
+  if (state.tab === 'esports') renderEsports();
+  else if (state.tab === 'card') renderCard([...state.lastEntries.values()].flatMap(e => e.events));
   else if (state.activeEntry) renderContent(SPORTS.find(s => s.id === state.tab), state.activeEntry);
+}
+
+// 🎮 Esports EV Lab — honest tool: no free live V/LoL data exists for a static
+// site, so this is the ⭐-pick engine you drive by hand from your own book.
+function renderEsports() {
+  const e = state.esports;
+  $('#content').innerHTML = `
+    <div class="section-h">🎮 Esports EV Lab</div>
+    <div class="brain" style="border-color:rgba(0,200,255,.3);box-shadow:0 0 26px rgba(0,200,255,.06)">
+      <span class="b-item">Live Valorant &amp; League feeds sit behind paid keys and CORS walls, so a static site can't pull them honestly. Instead this is the exact EV engine behind the ⭐ picks — enter a matchup, drop in your book's odds and your read, and it finds the +EV side, the ¼-Kelly stake, and pipes it to your slip.</span>
+    </div>
+    <div class="elab">
+      <div class="elab-teams">
+        <input id="e-a" placeholder="Team A (e.g. Sentinels)" value="${esc(e.a)}">
+        <span class="elab-vs">VS</span>
+        <input id="e-b" placeholder="Team B (e.g. NRG)" value="${esc(e.b)}">
+      </div>
+      <div class="elab-grid">
+        <label>Your win% for A<input id="e-pa" type="number" min="1" max="99" placeholder="55" value="${esc(e.pa)}"></label>
+        <label>${esc(e.a || 'Team A')} odds<input id="e-oa" type="text" inputmode="text" placeholder="-120" value="${esc(e.oa)}"></label>
+        <label>${esc(e.b || 'Team B')} odds<input id="e-ob" type="text" inputmode="text" placeholder="+100" value="${esc(e.ob)}"></label>
+      </div>
+      <div id="elab-out"></div>
+    </div>`;
+  renderElabOut();
+}
+
+function renderElabOut() {
+  const el = $('#elab-out'); if (!el) return;
+  const e = state.esports;
+  const pa = Number(e.pa) / 100, oa = Number(e.oa), ob = Number(e.ob);
+  if (!(pa > 0 && pa < 1) || !oa || !ob || Math.abs(oa) < 100 || Math.abs(ob) < 100) {
+    el.innerHTML = '<div class="bo-fair">enter your win% for A and both American odds (e.g. −120 / +100) to see the EV math</div>';
+    return;
+  }
+  const A = e.a || 'Team A', B = e.b || 'Team B';
+  const impA = mlToProb(oa), impB = mlToProb(ob), vig = impA + impB;
+  const sides = [{ n: A, p: pa, o: oa, imp: impA }, { n: B, p: 1 - pa, o: ob, imp: impB }].map(s => {
+    const b = s.o > 0 ? s.o / 100 : 100 / -s.o;
+    const ev = s.p * b - (1 - s.p);
+    const kelly = ev > 0 ? Math.min(5, Math.max(0.5, Math.round(KELLY_FRACTION * (b * s.p - (1 - s.p)) / b * 1000) / 10)) : 0;
+    return { ...s, b, ev, kelly };
+  }).sort((x, y) => y.ev - x.ev);
+  const best = sides[0];
+  const rows = sides.map(s => {
+    const leg = { gid: 'e|' + A + '|' + B + '|' + s.n, t: `${s.n} ${fmtML(s.o)}`, p: +s.p.toFixed(3), b: +s.b.toFixed(3), m: `${A} vs ${B}`, k: 'esports', tm: '' };
+    return `<div class="bo-row ${s.ev >= MIN_EV ? 'bet' : 'skip'}">
+      <span class="bo-bet">${esc(s.n)} ${fmtML(s.o)}</span>
+      <span>you ${pct(s.p)}</span><span>mkt ${pct(s.imp / vig)}</span>
+      <span class="bo-ev ${s.ev >= 0 ? 'pos' : 'neg'}">${(s.ev * 100).toFixed(1)}%</span>
+      <span>${s.kelly ? fmtStake(s.kelly) : 'pass'}</span>
+      ${s.ev >= MIN_EV ? `<button class="addleg" data-leg="${esc(JSON.stringify(leg))}">+ slip</button>` : '<span></span>'}
+    </div>`;
+  }).join('');
+  const verdict = best.ev >= MIN_EV
+    ? `<div class="bestpick ev"><span class="bp-tag">⭐ BEST BET</span><span class="bp-main">${esc(best.n)} ${fmtML(best.o)}</span><span class="bp-ev">+${(best.ev * 100).toFixed(1)}% EV</span><span class="bp-units">${fmtStake(best.kelly)}</span></div>`
+    : `<div class="bestpick pass"><span class="bp-tag">✋ NO BET</span><span class="bp-main">no +EV side at these odds — your read doesn't beat the vig</span></div>`;
+  el.innerHTML = `<div class="betboard" style="display:block">${verdict}
+    <div class="bo-h" style="margin-top:12px">BREAKDOWN</div>${rows}
+    <div class="bo-fair">book hold: ${((vig - 1) * 100).toFixed(1)}% · de-vigged market has ${esc(A)} at ${pct(impA / vig)} — bet only when your read clears that plus the juice</div></div>`;
 }
 
 // ── Events ─────────────────────────────────────────────────────────────
@@ -1992,7 +2166,13 @@ $('#content').addEventListener('click', e => {
   state.openCards.has(id) ? state.openCards.delete(id) : state.openCards.add(id);
 });
 $('#content').addEventListener('input', e => {
-  if (e.target.id === 'gamesearch') { state.query = e.target.value; applySearch(); }
+  if (e.target.id === 'gamesearch') { state.query = e.target.value; applySearch(); return; }
+  const map = { 'e-a': 'a', 'e-b': 'b', 'e-pa': 'pa', 'e-oa': 'oa', 'e-ob': 'ob' };
+  if (map[e.target.id]) {
+    state.esports[map[e.target.id]] = e.target.value;
+    localStorage.setItem('de-elab-v1', JSON.stringify(state.esports));
+    renderElabOut();   // update math without re-rendering inputs (keeps focus)
+  }
 });
 $('#brainbar').addEventListener('click', e => {
   if (e.target.closest('#histbtn')) { state.showHistory = !state.showHistory; renderBrain(); return; }
@@ -2034,7 +2214,7 @@ $('#slipbox').addEventListener('click', e => {
 // keyboard: ←/→ dates · t today · r refresh · 1-9 tabs (1 = The Card)
 document.addEventListener('keydown', e => {
   if (e.target.matches('input,textarea') || e.ctrlKey || e.metaKey || e.altKey) return;
-  const ids = ['card', ...SPORTS.map(s => s.id)];
+  const ids = ['card', ...SPORTS.map(s => s.id), 'esports'];
   if (e.key === 'ArrowLeft') shiftDate(-1);
   else if (e.key === 'ArrowRight') shiftDate(1);
   else if (e.key === 't') { state.date = new Date(); refresh(); }
