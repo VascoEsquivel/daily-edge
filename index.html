@@ -447,6 +447,12 @@
   }
   .elab-teams input:focus { border-color: var(--accent2); }
   .elab-vs { font-family: 'Unbounded', sans-serif; color: var(--muted); font-size: 14px; }
+  .pr-select {
+    background: rgba(0,0,0,.35); border: 1px solid var(--border); color: var(--text);
+    padding: 11px 13px; border-radius: 10px; font-family: inherit; font-size: 14px; font-weight: 700;
+    outline: none; cursor: pointer; min-width: 170px;
+  }
+  .pr-select:focus { border-color: var(--accent2); }
   .elab-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 6px; }
   .elab-grid label { display: flex; flex-direction: column; gap: 5px; font-size: 10.5px; color: var(--muted); letter-spacing: .5px; }
   .elab-grid input {
@@ -544,6 +550,7 @@
     📐 Team strength blends the actual record with Pythagorean expectation from points scored/allowed (ESPN standings, all team sports). MLB additionally factors Baseball Savant Statcast expected-wOBA for hitting and pitching — contact-quality stats that lead results. See both in the expanded panel's form rows.<br>
     🎯 Totals: expected combined score from each team's scoring/allowing rates vs the posted O/U — Over/Under sides compete with moneyline/spread for the ⭐ best pick. MLB totals factor starters, bullpen relief ERA (MLB StatsAPI), game-time temperature/rain, and 💨 wind (Open-Meteo, computed as blowing-out/in relative to each park's center-field orientation — the Wrigley effect). Venue splits, 😴 back-to-back fatigue, and line movement vs the opener are all factored; "drivers" in the expanded panel says what's pushing each pick.<br>
     🎮 Esports EV Lab: live Valorant/League feeds require paid keys and are CORS-locked from a static site, so the tab is a manual EV engine — your odds and your read in, the +EV side, ¼-Kelly stake, and slip integration out. No fake data, real math.<br>
+    🎯 Player Prop Lab: projects a per-game average into an over/under probability (Poisson for counting stats, Normal for high-count stats) and prints an alternate-line ladder with fair Kalshi prices in cents — built for spotting mispriced alt lines on Kalshi. Enter a price to grade the bet and add it to your slip. It's a season-rate model; it doesn't yet weigh matchup/pace/role, so treat edges as a shortlist.<br>
     🔥🥶 Hot/cold: recent margin form gives a small, capped model shift (streaks are mostly noise — never more than ~3%) and chips flag teams 4-1 or better / 1-4 or worse in their last five. Player-level streaks aren't in free data feeds; prop angles show season rates.<br>
     Vegas comparison uses ESPN's published line; "VALUE" flags games where the model disagrees with the market by ≥4%.<br>
     ⭐ BEST PICK is the highest expected-value wager at the listed price (vig included; the unlisted dog price is estimated from a 4.5% book margin). Stake sizes are ¼-Kelly, in units of 1% of bankroll. ✋ NO BET means no side clears +2% EV — passing is a position.<br>
@@ -589,9 +596,11 @@ const state = {
   lastEntries: new Map(), activeEntry: null,
   esports: { a: '', b: '', pa: '', oa: '', ob: '' },
   parlay: { n: 3, style: 'value', out: null },
+  props: { player: '', stat: 'pts', avg: '', line: '', price: '' },
 };
 try { state.slip = JSON.parse(localStorage.getItem('de-slip-v1')) || []; } catch {}
 try { Object.assign(state.esports, JSON.parse(localStorage.getItem('de-elab-v1')) || {}); } catch {}
+try { Object.assign(state.props, JSON.parse(localStorage.getItem('de-props-v1')) || {}); } catch {}
 
 // ── Model ──────────────────────────────────────────────────────────────
 const logit = p => Math.log(p / (1 - p));
@@ -673,6 +682,37 @@ function normalCdf(x) {
 }
 function spreadToProb(spread, sigma) {
   return normalCdf(Math.abs(spread) / sigma);
+}
+
+// ── Player-prop projection ──────────────────────────────────────────────
+// P(X > line) for a per-game average. Discrete counting stats use Poisson;
+// higher-count continuous stats use a Normal with a stat-specific spread.
+function poissonOver(line, lambda) {
+  if (lambda <= 0) return 0;
+  const k = Math.floor(line);
+  let cdf = 0, term = Math.exp(-lambda);
+  for (let i = 0; i <= k; i++) { cdf += term; term *= lambda / (i + 1); }
+  return Math.max(0, Math.min(1, 1 - cdf));
+}
+const PROP_STATS = [
+  { id: 'pts', label: '🏀 Points', dist: 'normal', sd: m => 0.30 * m + 2.5, step: 1 },
+  { id: 'reb', label: '🏀 Rebounds', dist: 'poisson', step: 1 },
+  { id: 'ast', label: '🏀 Assists', dist: 'poisson', step: 1 },
+  { id: 'pra', label: '🏀 Pts+Reb+Ast', dist: 'normal', sd: m => 0.26 * m + 3, step: 1 },
+  { id: 'threes', label: '🏀 3PT Made', dist: 'poisson', step: 1 },
+  { id: 'ks', label: '⚾ Pitcher Ks', dist: 'poisson', step: 1 },
+  { id: 'hits', label: '⚾ Batter Hits', dist: 'poisson', step: 1 },
+  { id: 'tb', label: '⚾ Total Bases', dist: 'normal', sd: m => Math.sqrt(m * 1.9) + 0.4, step: 1 },
+  { id: 'rbi', label: '⚾ RBIs', dist: 'poisson', step: 1 },
+  { id: 'passyd', label: '🏈 Passing Yds', dist: 'normal', sd: m => 0.21 * m + 16, step: 5 },
+  { id: 'rushyd', label: '🏈 Rushing Yds', dist: 'normal', sd: m => 0.55 * m + 12, step: 5 },
+  { id: 'rec', label: '🏈 Receptions', dist: 'poisson', step: 1 },
+  { id: 'sog', label: '🏒 Shots on Goal', dist: 'poisson', step: 1 },
+  { id: 'goals', label: '⚽/🏒 Goals', dist: 'poisson', step: 1 },
+];
+function propOver(stat, mean, line) {
+  if (stat.dist === 'poisson') return poissonOver(line, mean);
+  return 1 - normalCdf((line - mean) / Math.max(0.5, stat.sd(mean)));
 }
 
 // Inverse normal CDF (Acklam's approximation) — turns a win probability into an expected margin
@@ -1838,12 +1878,13 @@ function summaryBar(events) {
 
 function renderTabs(counts, evTotal = 0) {
   const cardTab = `<button class="tab ${state.tab === 'card' ? 'active' : ''}" data-sport="card">💰 The Card${evTotal ? `<span class="cnt">⭐ ${evTotal}</span>` : ''}</button>`;
-  const esportsTab = `<button class="tab ${state.tab === 'esports' ? 'active' : ''}" data-sport="esports">🎮 Esports</button>`;
+  const extraTabs = `<button class="tab ${state.tab === 'props' ? 'active' : ''}" data-sport="props">🎯 Props</button>`
+    + `<button class="tab ${state.tab === 'esports' ? 'active' : ''}" data-sport="esports">🎮 Esports</button>`;
   $('#tabs').innerHTML = cardTab + SPORTS.map(s => {
     const c = counts.get(s.id);
     const cnt = c == null ? '' : `<span class="cnt ${c.live ? 'live' : ''}">${c.live ? '● ' : ''}${c.n}</span>`;
     return `<button class="tab ${s.id === state.tab ? 'active' : ''}" data-sport="${s.id}">${s.label}${cnt}</button>`;
-  }).join('') + esportsTab;
+  }).join('') + extraTabs;
   const totalLive = [...counts.values()].reduce((n, c) => n + c.liveN, 0);
   $('#livechip').classList.toggle('on', totalLive > 0);
   $('#livecount').textContent = totalLive + ' LIVE';
@@ -1877,7 +1918,7 @@ function renderBrain() {
   renderHistory();
 }
 
-const SPORT_ICON = { esports: '🎮', ...Object.fromEntries(SPORTS.map(s => [s.id, s.label.split(' ')[0]])) };
+const SPORT_ICON = { esports: '🎮', props: '🎯', ...Object.fromEntries(SPORTS.map(s => [s.id, s.label.split(' ')[0]])) };
 function renderHistory() {
   const el = $('#histpanel');
   if (!state.showHistory) { el.innerHTML = ''; return; }
@@ -1954,23 +1995,25 @@ function parlayCandidates(allEvents) {
 function generateParlay() {
   const all = [...state.lastEntries.values()].flatMap(e => e.events);
   const { n, style } = state.parlay;
-  let pool = parlayCandidates(all);
-  if (pool.length < 2) { state.parlay.out = { error: 'Need at least 2 upcoming games with priced markets — check back closer to game time.' }; return; }
-  if (style === 'safe') pool.sort((a, b) => b.p - a.p);
-  else if (style === 'value') {
-    const ev = pool.filter(c => c.ev >= MIN_EV).sort((a, b) => b.ev - a.ev);
-    pool = ev.length >= n ? ev : pool.sort((a, b) => b.ev - a.ev);
-  } else {   // longshot: plus-money sides, biggest payout, still model-plausible
-    const dogs = pool.filter(c => c.b >= 1 && c.p >= 0.4).sort((a, b) => b.b - a.b);
-    pool = dogs.length >= 2 ? dogs : pool.sort((a, b) => b.b - a.b);
-  }
-  // sample n from the top of the pool so "reshuffle" gives variety near the best
-  const top = pool.slice(0, Math.min(pool.length, n + 3));
-  for (let i = top.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [top[i], top[j]] = [top[j], top[i]]; }
-  const legs = top.slice(0, Math.min(n, top.length));
+  const cands = parlayCandidates(all);
+  if (cands.length < 2) { state.parlay.out = { error: 'Need at least 2 upcoming games with priced markets — check back closer to game time.' }; return; }
+  const want = Math.min(n, cands.length);   // can't build more legs than there are games
+  // rank the FULL pool by the style's priority so top-ups still match the flavor
+  const ranked = style === 'safe' ? [...cands].sort((a, b) => b.p - a.p)
+    : style === 'value' ? [...cands].sort((a, b) => b.ev - a.ev)
+    : [...cands].sort((a, b) => b.b - a.b);   // longshot: biggest payout first
+  // preferred subset for the style, then everything else — concatenated so we
+  // always reach `want` legs even if the preferred subset is small (the bug fix)
+  const pref = style === 'value' ? ranked.filter(c => c.ev >= MIN_EV)
+    : style === 'longshot' ? ranked.filter(c => c.b >= 1 && c.p >= 0.4) : ranked;
+  const ordered = [...pref, ...ranked.filter(c => !pref.includes(c))];
+  // shuffle a window near the top for variety, then take exactly `want`
+  const window = ordered.slice(0, Math.min(ordered.length, want + 3));
+  for (let i = window.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [window[i], window[j]] = [window[j], window[i]]; }
+  const legs = window.slice(0, want);
   const D = legs.reduce((d, l) => d * (1 + l.b), 1);
   const P = legs.reduce((p, l) => p * l.p, 1);
-  state.parlay.out = { legs, D, P, ev: P * D - 1 };
+  state.parlay.out = { legs, D, P, ev: P * D - 1, short: n - want };
 }
 
 function parlaySection() {
@@ -2005,6 +2048,7 @@ function parlayResult() {
     <div class="pg-summary">
       <div><span class="pg-k">combined</span> <b>${american}</b> · <span class="pg-k">model hits</span> <b>${pct(o.P)}</b> · <span class="pg-k">payout</span> <b>${payStr}</b></div>
       <div class="pg-verdict">${verdict}</div>
+      ${o.short ? `<div class="pg-note" style="color:var(--gold)">only ${o.legs.length} games have priced markets right now — couldn't fill all ${o.legs.length + o.short} legs.</div>` : ''}
       <div class="pg-note">EV assumes the legs are independent — don't stack correlated bets (same game, same team's total).</div>
     </div>
     <div class="pg-actions"><button class="pg-load" data-pload>📥 load into slip</button><button data-pcopy>📋 copy</button><button class="pg-go" data-pgen>🎲 reshuffle</button></div>
@@ -2062,6 +2106,9 @@ async function refresh(force = false) {
 
   if (state.tab === 'esports') {
     renderEsports();
+    clearTimeout(state.liveTimer);
+  } else if (state.tab === 'props') {
+    renderProps();
     clearTimeout(state.liveTimer);
   } else if (state.tab === 'card') {
     renderCard(allEvents);
@@ -2189,6 +2236,7 @@ function renderSlip() {
 
 function renderActive() {
   if (state.tab === 'esports') renderEsports();
+  else if (state.tab === 'props') renderProps();
   else if (state.tab === 'card') renderCard([...state.lastEntries.values()].flatMap(e => e.events));
   else if (state.activeEntry) renderContent(SPORTS.find(s => s.id === state.tab), state.activeEntry);
 }
@@ -2253,6 +2301,80 @@ function renderElabOut() {
     <div class="bo-fair">book hold: ${((vig - 1) * 100).toFixed(1)}% · de-vigged market has ${esc(A)} at ${pct(impA / vig)} — bet only when your read clears that plus the juice</div></div>`;
 }
 
+// 🎯 Player Props — projects a per-game average into an over/under probability,
+// builds an alternate-line ladder (where Kalshi edges hide), and prices your
+// Kalshi contract in cents. Kalshi price = implied probability directly.
+function renderProps() {
+  const p = state.props;
+  const opts = PROP_STATS.map(s => `<option value="${s.id}" ${p.stat === s.id ? 'selected' : ''}>${s.label}</option>`).join('');
+  $('#content').innerHTML = `
+    <div class="section-h">🎯 Player Prop Lab</div>
+    <div class="brain" style="border-color:rgba(0,200,255,.3);box-shadow:0 0 26px rgba(0,200,255,.06)">
+      <span class="b-item">Drop in a player's per-game average and the tool projects the full over/under curve, then prints an <b>alternate-line ladder</b> — the fair price at every line, so on Kalshi you can spot which alt line is mispriced. Enter a Kalshi price (in cents = probability) and it grades the bet and pipes it to your slip.</span>
+    </div>
+    <div class="elab">
+      <div class="elab-teams">
+        <input id="pr-player" placeholder="Player (e.g. A'ja Wilson)" value="${esc(p.player)}">
+        <select id="pr-stat" class="pr-select">${opts}</select>
+      </div>
+      <div class="elab-grid">
+        <label>Season per-game avg<input id="pr-avg" type="number" step="0.1" placeholder="24.5" value="${esc(p.avg)}"></label>
+        <label>Prop line<input id="pr-line" type="number" step="0.5" placeholder="23.5" value="${esc(p.line)}"></label>
+        <label>Kalshi Yes/Over price ¢<input id="pr-price" type="number" min="1" max="99" placeholder="55" value="${esc(p.price)}"></label>
+      </div>
+      <div id="pr-out"></div>
+    </div>`;
+  renderPropsOut();
+}
+
+function renderPropsOut() {
+  const el = $('#pr-out'); if (!el) return;
+  const p = state.props;
+  const stat = PROP_STATS.find(s => s.id === p.stat) || PROP_STATS[0];
+  const avg = Number(p.avg);
+  if (!(avg > 0)) { el.innerHTML = '<div class="bo-fair">enter the player\'s season per-game average to project the line</div>'; return; }
+  const fair = c => Math.round(c * 100);                 // prob → Kalshi cents
+  // alternate-line ladder centred on the entered line (so it's always visible) or the projection
+  const center = Number(p.line) > 0 ? Number(p.line) : avg;
+  const base = stat.step >= 5 ? Math.round(center / stat.step) * stat.step : Math.round(center);
+  const ladder = [-3, -2, -1, 0, 1, 2, 3].map(k => {
+    const line = base + k * stat.step + 0.5;
+    if (line <= 0) return null;
+    const over = propOver(stat, avg, line);
+    const near = Number(p.line) === line;
+    return `<div class="bo-row ${near ? 'bet' : 'skip'}">
+      <span class="bo-bet">o/u ${line}</span>
+      <span>over ${pct(over)}</span><span>Yes ${fair(over)}¢</span>
+      <span>under ${pct(1 - over)}</span><span>No ${fair(1 - over)}¢</span>
+    </div>`;
+  }).filter(Boolean).join('');
+
+  // if a specific line + Kalshi price is entered, grade the bet
+  let verdict = '', slip = '';
+  const line = Number(p.line), price = Number(p.price);
+  if (line > 0 && price >= 1 && price <= 99) {
+    const over = propOver(stat, avg, line);
+    const sides = [
+      { name: `${p.player || 'Player'} OVER ${line} ${stat.label.replace(/^\S+\s/, '')}`, prob: over, cents: price, side: 'over' },
+      { name: `${p.player || 'Player'} UNDER ${line} ${stat.label.replace(/^\S+\s/, '')}`, prob: 1 - over, cents: 100 - price, side: 'under' },
+    ].map(s => {
+      const b = (100 - s.cents) / s.cents;               // profit multiple on a Kalshi contract
+      const ev = s.prob * b - (1 - s.prob);
+      const kelly = ev > 0 ? Math.min(5, Math.max(0.5, Math.round(KELLY_FRACTION * (b * s.prob - (1 - s.prob)) / b * 1000) / 10)) : 0;
+      return { ...s, b, ev, kelly };
+    }).sort((a, b) => b.ev - a.ev);
+    const best = sides[0];
+    const leg = { gid: `prop|${p.player}|${stat.id}|${line}|${best.side}`, t: best.name, p: +best.prob.toFixed(3), b: +best.b.toFixed(3), m: `Kalshi ${best.cents}¢`, k: 'props', tm: '' };
+    verdict = best.ev >= MIN_EV
+      ? `<div class="bestpick ev"><span class="bp-tag">⭐ +EV</span><span class="bp-main">${esc(best.side.toUpperCase())} @ ${best.cents}¢</span><span class="bp-ev">+${(best.ev * 100).toFixed(1)}% EV</span><span class="bp-units">${fmtStake(best.kelly)}</span><button class="addleg" data-leg="${esc(JSON.stringify(leg))}">🎟️ + slip</button></div>`
+      : `<div class="bestpick pass"><span class="bp-tag">✋ NO BET</span><span class="bp-main">neither side clears the price — model over ${pct(over)} vs Yes ${price}¢</span></div>`;
+  }
+  el.innerHTML = `${verdict}
+    <div class="bo-h" style="margin-top:12px">PROJECTION ${avg.toFixed(1)} · ALTERNATE-LINE LADDER</div>
+    <div class="betboard" style="display:block">${ladder}
+    <div class="bo-fair">${stat.dist === 'poisson' ? 'Poisson' : 'Normal'} model off the season rate — a real projection also weighs matchup, pace, and role, so treat the edges as a shortlist, not gospel. Kalshi price in ¢ = implied probability.</div></div>`;
+}
+
 // ── Events ─────────────────────────────────────────────────────────────
 $('#tabs').addEventListener('click', e => {
   const btn = e.target.closest('.tab');
@@ -2300,6 +2422,13 @@ $('#content').addEventListener('input', e => {
     state.esports[map[e.target.id]] = e.target.value;
     localStorage.setItem('de-elab-v1', JSON.stringify(state.esports));
     renderElabOut();   // update math without re-rendering inputs (keeps focus)
+    return;
+  }
+  const pmap = { 'pr-player': 'player', 'pr-stat': 'stat', 'pr-avg': 'avg', 'pr-line': 'line', 'pr-price': 'price' };
+  if (pmap[e.target.id]) {
+    state.props[pmap[e.target.id]] = e.target.value;
+    localStorage.setItem('de-props-v1', JSON.stringify(state.props));
+    renderPropsOut();
   }
 });
 $('#brainbar').addEventListener('click', e => {
@@ -2342,7 +2471,7 @@ $('#slipbox').addEventListener('click', e => {
 // keyboard: ←/→ dates · t today · r refresh · 1-9 tabs (1 = The Card)
 document.addEventListener('keydown', e => {
   if (e.target.matches('input,textarea') || e.ctrlKey || e.metaKey || e.altKey) return;
-  const ids = ['card', ...SPORTS.map(s => s.id), 'esports'];
+  const ids = ['card', ...SPORTS.map(s => s.id), 'props', 'esports'];
   if (e.key === 'ArrowLeft') shiftDate(-1);
   else if (e.key === 'ArrowRight') shiftDate(1);
   else if (e.key === 't') { state.date = new Date(); refresh(); }
