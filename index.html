@@ -493,6 +493,7 @@
 
   <footer>
     Model: regressed win% → log5 matchup probability + sport-specific home advantage (logit space). Soccer uses points-per-game strength with a closeness-weighted draw share; tournament play (World Cup knockouts) falls back to a market-based prior. Tennis uses ATP/WTA ranking-points share. MLB factors the probable starters' ERA gap; team sports factor the live injury report weighted by player skill — an injured stat leader (⭐ in the 🏥 tooltip) counts 2-3x a rotation player, biggest impact in basketball. Day-to-day weighs less than out.<br>
+    📐 Team strength blends the actual record with Pythagorean expectation from points scored/allowed (ESPN standings, all team sports). MLB additionally factors Baseball Savant Statcast expected-wOBA for hitting and pitching — contact-quality stats that lead results. See both in the expanded panel's form rows.<br>
     Vegas comparison uses ESPN's published line; "VALUE" flags games where the model disagrees with the market by ≥4%.<br>
     ⭐ BEST PICK is the highest expected-value wager at the listed price (vig included; the unlisted dog price is estimated from a 4.5% book margin). Stake sizes are ¼-Kelly, in units of 1% of bankroll. ✋ NO BET means no side clears +2% EV — passing is a position.<br>
     🧠 The model learns: every final updates per-team Elo ratings (margin-of-victory weighted, faster for barely-seen teams) and a per-sport calibration layer (stored locally in your browser). On launch it studies the last 45 days of results in chronological order, then stays current. Predictions blend the record/ranking prior with learned Elo, and the Elo weight grows as the brain sees more of each team. ⭐ picks are logged at the pregame price and settled against the final score. 📜 History keeps a match-by-match record. ⬆⬇ Export/import moves a trained brain between devices.<br>
@@ -548,13 +549,20 @@ function regressedWinPct(wins, losses) {
   return (wins + REGRESS_GAMES * 0.5) / (g + REGRESS_GAMES);
 }
 
-// log5 matchup probability, then shift by home advantage in logit space
-function predictUS(home, away, hfaWin) {
-  const pH = regressedWinPct(home.w, home.l);
-  const pA = regressedWinPct(away.w, away.l);
+// log5 matchup probability from team strengths, then home advantage in logit space
+function predictUS(pH, pA, hfaWin) {
   const log5 = (pH * (1 - pA)) / (pH * (1 - pA) + pA * (1 - pH));
   const pHome = clamp(invlogit(logit(clamp(log5)) + logit(hfaWin)));
   return { home: pHome, away: 1 - pHome, draw: 0 };
+}
+
+// team strength: actual record blended with Pythagorean expectation (points
+// scored vs allowed — leads the record, so it gets the majority weight)
+function teamStrength(t) {
+  const pct = regressedWinPct(t.rec.w, t.rec.l);
+  if (t.pyth == null) return pct;
+  const pythReg = (t.pyth * t.pythG + 0.5 * REGRESS_GAMES) / (t.pythG + REGRESS_GAMES);
+  return 0.45 * pct + 0.55 * pythReg;
 }
 
 // Soccer: strength from regressed points-per-game, draw share shrinks as gap grows
@@ -711,7 +719,7 @@ const ymd = d => d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate(
 // Predictions blend the record/ranking prior with learned Elo — the Elo
 // weight grows with how many games the brain has seen for those teams.
 const Brain = (() => {
-  const KEY = 'de-brain-v2';   // v2: margin-weighted Elo + per-team form history
+  const KEY = 'de-brain-v3';   // v3: 120-day study window + pythagorean/statcast priors
   const ELO_K = { mlb: 6, wnba: 24, nba: 20, nfl: 24, nhl: 10, mls: 24, wc: 28, tennis: 32 };
   const LR = 0.04;                 // calibration learning rate
   let db;
@@ -913,6 +921,60 @@ function getInjuries(sport) {
   return injCache.get(sport.id);
 }
 
+// ── Team quality feeds ──────────────────────────────────────────────────
+// Pythagorean expectation from league standings (points for/against), the
+// classic "record leads, run differential predicts" upgrade — every team sport
+const PYTH_EXP = { mlb: 1.83, wnba: 13.9, nba: 13.9, nfl: 2.37, nhl: 2.15, mls: 1.35, wc: 1.35 };
+const qualCache = new Map();
+function getQuality(sport) {
+  if (!PYTH_EXP[sport.id]) return Promise.resolve(null);
+  if (!qualCache.has(sport.id)) {
+    qualCache.set(sport.id, fetch(`https://site.api.espn.com/apis/v2/sports/${sport.path}/standings`)
+      .then(r => r.json()).then(json => {
+        const map = new Map();
+        const groups = json.children?.length ? json.children.map(c => c.standings) : [json.standings];
+        groups.forEach(st => (st?.entries || []).forEach(e => {
+          const s = {};
+          (e.stats || []).forEach(x => { s[x.name] = x.value; });
+          const pf = s.pointsFor, pa = s.pointsAgainst;
+          if (pf == null || pa == null || !(pf + pa)) return;
+          const ex = PYTH_EXP[sport.id];
+          const pyth = Math.pow(pf, ex) / (Math.pow(pf, ex) + Math.pow(pa, ex));
+          const g = s.gamesPlayed || (s.wins || 0) + (s.losses || 0) + (s.ties || 0);
+          map.set(String(e.team?.id), { pyth, g: g || 1 });
+        }));
+        return map.size ? map : null;
+      }).catch(() => null));
+  }
+  return qualCache.get(sport.id);
+}
+
+// Baseball Savant Statcast: team expected wOBA for hitting and pitching —
+// contact-quality "deserved" stats that lead actual results
+let savantPromise = null;
+function getSavant() {
+  if (!savantPromise) {
+    const url = t => `https://baseballsavant.mlb.com/leaderboard/expected_statistics?type=${t}&year=${new Date().getFullYear()}&position=&team=&min=1&csv=true`;
+    const parse = csv => {
+      const lines = csv.trim().split('\n');
+      const head = lines[0].replace(/^﻿/, '').split(',').map(h => h.replace(/"/g, ''));
+      const iName = head.indexOf('team'), iAbbr = head.indexOf('team_id'), iX = head.indexOf('est_woba');
+      const m = new Map();
+      lines.slice(1).forEach(l => {
+        const c = l.split(',').map(x => x.replace(/"/g, ''));
+        const v = Number(c[iX]);
+        if (!isNaN(v)) { m.set(c[iAbbr], v); m.set(c[iName].toLowerCase(), v); }
+      });
+      return m;
+    };
+    savantPromise = Promise.all([fetch(url('batter-team')), fetch(url('pitcher-team'))])
+      .then(rs => Promise.all(rs.map(r => r.text())))
+      .then(([bat, pit]) => ({ bat: parse(bat), pit: parse(pit) }))
+      .catch(() => null);
+  }
+  return savantPromise;
+}
+
 // Star detection: match an injured player against the team's stat leaders.
 // Scoring leader out hurts ~3x a rotation player; other category leaders ~2x.
 const leaderKey = name => {
@@ -944,12 +1006,14 @@ async function fetchSport(sport, date, force = false) {
     ]);
     events = parseTennis(jsons, ranks, date);
   } else {
-    const [res, injuries] = await Promise.all([
+    const [res, injuries, quality, savant] = await Promise.all([
       fetch(`${API}/${sport.path}/scoreboard?dates=${ymd(date)}`),
       getInjuries(sport),
+      getQuality(sport),
+      sport.id === 'mlb' ? getSavant() : Promise.resolve(null),
     ]);
     if (!res.ok) throw new Error('ESPN API responded ' + res.status);
-    events = parseEvents(await res.json(), sport, injuries);
+    events = parseEvents(await res.json(), sport, injuries, quality, savant);
   }
   events.forEach(g => { g.sportId = sport.id; });
   const entry = { events, fetchedAt: Date.now() };
@@ -1044,7 +1108,7 @@ function computeBestPick(g, sport) {
     sub: `model ${pct(best.p)} vs implied ${pct(best.imp)}` };
 }
 
-function parseEvents(json, sport, injuries) {
+function parseEvents(json, sport, injuries, quality, savant) {
   const games = (json.events || []).map(ev => {
     const comp = ev.competitions?.[0];
     if (!comp) return null;
@@ -1062,6 +1126,9 @@ function parseEvents(json, sport, injuries) {
         name: L.leaders?.[0]?.athlete?.shortName || '',
         val: L.leaders?.[0]?.displayValue || '',
       })).filter(x => x.name);
+      const q = quality?.get(String(c.team?.id));
+      const xwBat = savant?.bat.get(c.team?.abbreviation) ?? savant?.bat.get((c.team?.shortDisplayName || '').toLowerCase());
+      const xwPit = savant?.pit.get(c.team?.abbreviation) ?? savant?.pit.get((c.team?.shortDisplayName || '').toLowerCase());
       return {
         name: c.team?.shortDisplayName || c.team?.displayName || '?',
         abbr: c.team?.abbreviation || '?',
@@ -1072,6 +1139,8 @@ function parseEvents(json, sport, injuries) {
         score: c.score,
         winner: c.winner === true,
         probable, leaders,
+        pyth: q?.pyth ?? null, pythG: q?.g || 0,
+        xw: (xwBat != null && xwPit != null) ? { bat: xwBat, pit: xwPit } : null,
         inj: injuries?.get(String(c.team?.id)) || null,
       };
     };
@@ -1093,10 +1162,17 @@ function parseEvents(json, sport, injuries) {
     if (sport.soccer && (!played(home.rec) || !played(away.rec))) {
       if (vegas?.homeProb != null) { model = predictFromMarket(vegas.homeProb); marketPrior = true; }
       else model = { home: 0.37, away: 0.37, draw: 0.26 };
+    } else if (sport.soccer) {
+      model = predictSoccer(home.rec, away.rec, sport.hfaWin);
+      // goal-differential quality (Pythagorean) sharpens the points-based prior
+      if (home.pyth != null && away.pyth != null) {
+        const sh = (logit(clamp(home.pyth)) - logit(clamp(away.pyth))) * 0.35;
+        const share = clamp(invlogit(logit(clamp(model.home / (model.home + model.away))) + sh));
+        const rest = 1 - model.draw;
+        model = { home: clamp(rest * share), away: clamp(rest * (1 - share)), draw: model.draw };
+      }
     } else {
-      model = sport.soccer
-        ? predictSoccer(home.rec, away.rec, sport.hfaWin)
-        : predictUS(home.rec, away.rec, sport.hfaWin);
+      model = predictUS(teamStrength(home), teamStrength(away), sport.hfaWin);
     }
     // brain pass: blend the prior with learned Elo, then recalibrate.
     // Soccer keeps its draw share and blends only the home-vs-away split;
@@ -1113,6 +1189,11 @@ function parseEvents(json, sport, injuries) {
       let shift = 0;
       if (sport.id === 'mlb' && home.probable?.era != null && away.probable?.era != null) {
         shift += Math.max(-0.5, Math.min(0.5, (away.probable.era - home.probable.era) * 0.13));
+      }
+      // Statcast: expected-wOBA quality gap (own hitting minus own pitching allowed)
+      if (sport.id === 'mlb' && home.xw && away.xw) {
+        const sc = t => t.xw.bat - t.xw.pit;
+        shift += Math.max(-0.4, Math.min(0.4, (sc(home) - sc(away)) * 6));
       }
       if (injuries) {
         const pen = t => Math.min(60, (t.injEff || 0) * (INJ_PENALTY[sport.id] || 0));
@@ -1308,8 +1389,10 @@ function formSection(g) {
   if (!eA?.hist?.length && !eH?.hist?.length) return '';
   const row = (t, e) => {
     const wl = e?.hist ? `${e.hist.filter(m => m > 0).length}-${e.hist.filter(m => m < 0).length} last ${e.hist.length}` : '';
+    const qual = (t.pyth != null ? ` · pyth ${t.pyth.toFixed(3)}` : '')
+      + (t.xw ? ` · xwOBA ${t.xw.bat.toFixed(3)}/${t.xw.pit.toFixed(3)}` : '');
     return `<div class="form-row"><span class="form-abbr">${esc(t.abbr)}</span>${sparkline(e?.hist)}
-      <span class="form-elo">⚡${e ? Math.round(e.r) : '—'}</span><span class="form-rec">${wl}</span></div>`;
+      <span class="form-elo">⚡${e ? Math.round(e.r) : '—'}</span><span class="form-rec">${wl}${qual}</span></div>`;
   };
   return `<div class="bo-h" style="margin-top:13px">RECENT FORM · margin per game</div>${row(g.away, eA)}${row(g.home, eH)}`;
 }
@@ -1524,7 +1607,7 @@ function renderBrain() {
     <button class="b-btn" id="histbtn">📜 ${state.showHistory ? 'hide' : 'history'}</button>
     <button class="b-btn" id="exportbtn" title="Copy this trained brain to the clipboard">⬆ export</button>
     <button class="b-btn" id="importbtn" title="Paste a brain export from another device">⬇ import</button>
-    <span class="b-note">studies the last ${BACKFILL_DAYS} days automatically · margin-weighted Elo</span>
+    <span class="b-note">studies the last ${BACKFILL_DAYS} days automatically · margin-weighted Elo · statcast + pythagorean priors</span>
   </div>`;
   renderHistory();
 }
@@ -1658,7 +1741,7 @@ async function refresh(force = false) {
 // evolves in true chronological order. Progress is tracked in the brain db, so
 // each launch only studies days it hasn't seen — a fresh brain arrives
 // season-smart after one load, then stays current forever.
-const BACKFILL_DAYS = 45;
+const BACKFILL_DAYS = 120, BACKFILL_CHUNK = 4;
 let absorbed = false;
 async function absorbYesterday() {
   if (absorbed) return;
@@ -1674,11 +1757,13 @@ async function absorbYesterday() {
   }
   const days = [];
   for (let x = new Date(cur); x < today; x.setDate(x.getDate() + 1)) days.push(new Date(x));
-  for (let i = 0; i < days.length; i++) {
+  // small chunks keep Elo chronology essentially intact while going ~4x faster
+  for (let i = 0; i < days.length; i += BACKFILL_CHUNK) {
+    const chunk = days.slice(i, i + BACKFILL_CHUNK);
     const el = $('#brainprog');
-    if (el) el.textContent = `📚 studying the season… day ${i + 1}/${days.length}`;
-    await Promise.allSettled(SPORTS.map(s => fetchSport(s, days[i])));
-    Brain.setThrough(ymd(days[i]));
+    if (el) el.textContent = `📚 studying the season… day ${Math.min(i + BACKFILL_CHUNK, days.length)}/${days.length}`;
+    await Promise.allSettled(chunk.flatMap(d => SPORTS.map(s => fetchSport(s, d))));
+    Brain.setThrough(ymd(chunk[chunk.length - 1]));
   }
   if (days.length) renderBrain();
   else { const el = $('#brainprog'); if (el) el.textContent = ''; }
