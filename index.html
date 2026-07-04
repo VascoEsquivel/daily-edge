@@ -453,6 +453,8 @@
     outline: none; cursor: pointer; min-width: 170px;
   }
   .pr-select:focus { border-color: var(--accent2); }
+  .pr-ctx { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-top: 10px; }
+  .pr-ctx-l { font-size: 10px; color: var(--muted); letter-spacing: 2px; width: 62px; }
   .elab-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 6px; }
   .elab-grid label { display: flex; flex-direction: column; gap: 5px; font-size: 10.5px; color: var(--muted); letter-spacing: .5px; }
   .elab-grid input {
@@ -550,7 +552,7 @@
     📐 Team strength blends the actual record with Pythagorean expectation from points scored/allowed (ESPN standings, all team sports). MLB additionally factors Baseball Savant Statcast expected-wOBA for hitting and pitching — contact-quality stats that lead results. See both in the expanded panel's form rows.<br>
     🎯 Totals: expected combined score from each team's scoring/allowing rates vs the posted O/U — Over/Under sides compete with moneyline/spread for the ⭐ best pick. MLB totals factor starters, bullpen relief ERA (MLB StatsAPI), game-time temperature/rain, and 💨 wind (Open-Meteo, computed as blowing-out/in relative to each park's center-field orientation — the Wrigley effect). Venue splits, 😴 back-to-back fatigue, and line movement vs the opener are all factored; "drivers" in the expanded panel says what's pushing each pick.<br>
     🎮 Esports EV Lab: live Valorant/League feeds require paid keys and are CORS-locked from a static site, so the tab is a manual EV engine — your odds and your read in, the +EV side, ¼-Kelly stake, and slip integration out. No fake data, real math.<br>
-    🎯 Player Prop Lab: projects a per-game average into an over/under probability (Poisson for counting stats, Normal for high-count stats) and prints an alternate-line ladder with fair Kalshi prices in cents — built for spotting mispriced alt lines on Kalshi. Enter a price to grade the bet and add it to your slip. It's a season-rate model; it doesn't yet weigh matchup/pace/role, so treat edges as a shortlist.<br>
+    🎯 Player Prop Lab: a contextual projection engine — starts from the season rate, blends recent form (with a role/usage-change detector when recent diverges ≥20% from season), then scales by matchup and pace. Projects the over/under curve (Poisson for counting stats, Normal for high-count) and prints an alternate-line ladder with fair Kalshi prices in cents, built for spotting mispriced alt lines. Enter a price to grade the bet and add it to your slip. Matchup/pace are your read (or a defense-vs-stat rank); still a shortlist tool, not gospel.<br>
     🔥🥶 Hot/cold: recent margin form gives a small, capped model shift (streaks are mostly noise — never more than ~3%) and chips flag teams 4-1 or better / 1-4 or worse in their last five. Player-level streaks aren't in free data feeds; prop angles show season rates.<br>
     Vegas comparison uses ESPN's published line; "VALUE" flags games where the model disagrees with the market by ≥4%.<br>
     ⭐ BEST PICK is the highest expected-value wager at the listed price (vig included; the unlisted dog price is estimated from a 4.5% book margin). Stake sizes are ¼-Kelly, in units of 1% of bankroll. ✋ NO BET means no side clears +2% EV — passing is a position.<br>
@@ -596,7 +598,7 @@ const state = {
   lastEntries: new Map(), activeEntry: null,
   esports: { a: '', b: '', pa: '', oa: '', ob: '' },
   parlay: { n: 3, style: 'value', out: null },
-  props: { player: '', stat: 'pts', avg: '', line: '', price: '' },
+  props: { player: '', stat: 'pts', avg: '', recent: '', matchup: 'neutral', pace: 'neutral', line: '', price: '' },
 };
 try { state.slip = JSON.parse(localStorage.getItem('de-slip-v1')) || []; } catch {}
 try { Object.assign(state.esports, JSON.parse(localStorage.getItem('de-elab-v1')) || {}); } catch {}
@@ -2301,16 +2303,44 @@ function renderElabOut() {
     <div class="bo-fair">book hold: ${((vig - 1) * 100).toFixed(1)}% · de-vigged market has ${esc(A)} at ${pct(impA / vig)} — bet only when your read clears that plus the juice</div></div>`;
 }
 
-// 🎯 Player Props — projects a per-game average into an over/under probability,
-// builds an alternate-line ladder (where Kalshi edges hide), and prices your
-// Kalshi contract in cents. Kalshi price = implied probability directly.
+// 🎯 Player Props — contextual projection engine. Blends season rate with
+// recent form (role-change detector), then scales by matchup and pace, and
+// prices the full alternate-line ladder in Kalshi cents.
+const MATCHUP_MULT = { elite: 0.86, tough: 0.93, neutral: 1, soft: 1.07, smash: 1.14 };
+const PACE_MULT = { slow: 0.94, neutral: 1, fast: 1.06 };
+
+// build the adjusted projection from all context inputs
+function propProjection() {
+  const p = state.props;
+  const season = Number(p.avg);
+  if (!(season > 0)) return null;
+  const steps = [['season', season]];
+  let proj = season, w = 0, roleShift = false;
+  const recent = Number(p.recent);
+  if (recent > 0) {
+    const div = Math.abs(recent - season) / season;
+    roleShift = div >= 0.20;                         // sharp divergence → usage/role change
+    w = roleShift ? 0.6 : 0.4;                       // trust recent more when it's clearly shifted
+    proj = season * (1 - w) + recent * w;
+    steps.push([`recent ${recent} (×${w})`, proj]);
+  }
+  const mm = MATCHUP_MULT[p.matchup] ?? 1, pm = PACE_MULT[p.pace] ?? 1;
+  if (mm !== 1) { proj *= mm; steps.push([`matchup ×${mm}`, proj]); }
+  if (pm !== 1) { proj *= pm; steps.push([`pace ×${pm}`, proj]); }
+  return { proj, season, recent, w, roleShift, mm, pm, steps };
+}
+
 function renderProps() {
   const p = state.props;
   const opts = PROP_STATS.map(s => `<option value="${s.id}" ${p.stat === s.id ? 'selected' : ''}>${s.label}</option>`).join('');
+  const matchBtns = [['elite', '🔒 Elite D'], ['tough', '😤 Tough'], ['neutral', '— Neutral'], ['soft', '🎯 Soft'], ['smash', '🔥 Smash']]
+    .map(([v, l]) => `<button class="pg-btn ${p.matchup === v ? 'on' : ''}" data-pmatch="${v}">${l}</button>`).join('');
+  const paceBtns = [['slow', '🐢 Slow'], ['neutral', '— Neutral'], ['fast', '🚀 Fast']]
+    .map(([v, l]) => `<button class="pg-btn ${p.pace === v ? 'on' : ''}" data-ppace="${v}">${l}</button>`).join('');
   $('#content').innerHTML = `
     <div class="section-h">🎯 Player Prop Lab</div>
     <div class="brain" style="border-color:rgba(0,200,255,.3);box-shadow:0 0 26px rgba(0,200,255,.06)">
-      <span class="b-item">Drop in a player's per-game average and the tool projects the full over/under curve, then prints an <b>alternate-line ladder</b> — the fair price at every line, so on Kalshi you can spot which alt line is mispriced. Enter a Kalshi price (in cents = probability) and it grades the bet and pipes it to your slip.</span>
+      <span class="b-item">A <b>contextual projection engine</b>: it starts from the season rate, blends in recent form (and flags when a role/usage has clearly shifted), then scales for matchup and pace. It prints the full <b>alternate-line ladder</b> with fair Kalshi prices in cents — so you can spot which alt line is mispriced — grades your price, and pipes the bet to your slip.</span>
     </div>
     <div class="elab">
       <div class="elab-teams">
@@ -2319,9 +2349,12 @@ function renderProps() {
       </div>
       <div class="elab-grid">
         <label>Season per-game avg<input id="pr-avg" type="number" step="0.1" placeholder="24.5" value="${esc(p.avg)}"></label>
+        <label>Recent avg · last 5–10 <span style="color:var(--muted)">(role change)</span><input id="pr-recent" type="number" step="0.1" placeholder="optional" value="${esc(p.recent)}"></label>
         <label>Prop line<input id="pr-line" type="number" step="0.5" placeholder="23.5" value="${esc(p.line)}"></label>
         <label>Kalshi Yes/Over price ¢<input id="pr-price" type="number" min="1" max="99" placeholder="55" value="${esc(p.price)}"></label>
       </div>
+      <div class="pr-ctx"><span class="pr-ctx-l">MATCHUP</span>${matchBtns}</div>
+      <div class="pr-ctx"><span class="pr-ctx-l">PACE</span>${paceBtns}</div>
       <div id="pr-out"></div>
     </div>`;
   renderPropsOut();
@@ -2331,16 +2364,16 @@ function renderPropsOut() {
   const el = $('#pr-out'); if (!el) return;
   const p = state.props;
   const stat = PROP_STATS.find(s => s.id === p.stat) || PROP_STATS[0];
-  const avg = Number(p.avg);
-  if (!(avg > 0)) { el.innerHTML = '<div class="bo-fair">enter the player\'s season per-game average to project the line</div>'; return; }
-  const fair = c => Math.round(c * 100);                 // prob → Kalshi cents
+  const pr = propProjection();
+  if (!pr) { el.innerHTML = '<div class="bo-fair">enter the player\'s season per-game average to project the line</div>'; return; }
+  const proj = pr.proj, fair = c => Math.round(c * 100);
   // alternate-line ladder centred on the entered line (so it's always visible) or the projection
-  const center = Number(p.line) > 0 ? Number(p.line) : avg;
+  const center = Number(p.line) > 0 ? Number(p.line) : proj;
   const base = stat.step >= 5 ? Math.round(center / stat.step) * stat.step : Math.round(center);
   const ladder = [-3, -2, -1, 0, 1, 2, 3].map(k => {
     const line = base + k * stat.step + 0.5;
     if (line <= 0) return null;
-    const over = propOver(stat, avg, line);
+    const over = propOver(stat, proj, line);
     const near = Number(p.line) === line;
     return `<div class="bo-row ${near ? 'bet' : 'skip'}">
       <span class="bo-bet">o/u ${line}</span>
@@ -2350,13 +2383,14 @@ function renderPropsOut() {
   }).filter(Boolean).join('');
 
   // if a specific line + Kalshi price is entered, grade the bet
-  let verdict = '', slip = '';
+  let verdict = '';
   const line = Number(p.line), price = Number(p.price);
   if (line > 0 && price >= 1 && price <= 99) {
-    const over = propOver(stat, avg, line);
+    const over = propOver(stat, proj, line);
+    const label = stat.label.replace(/^\S+\s/, '');
     const sides = [
-      { name: `${p.player || 'Player'} OVER ${line} ${stat.label.replace(/^\S+\s/, '')}`, prob: over, cents: price, side: 'over' },
-      { name: `${p.player || 'Player'} UNDER ${line} ${stat.label.replace(/^\S+\s/, '')}`, prob: 1 - over, cents: 100 - price, side: 'under' },
+      { name: `${p.player || 'Player'} OVER ${line} ${label}`, prob: over, cents: price, side: 'over' },
+      { name: `${p.player || 'Player'} UNDER ${line} ${label}`, prob: 1 - over, cents: 100 - price, side: 'under' },
     ].map(s => {
       const b = (100 - s.cents) / s.cents;               // profit multiple on a Kalshi contract
       const ev = s.prob * b - (1 - s.prob);
@@ -2369,10 +2403,16 @@ function renderPropsOut() {
       ? `<div class="bestpick ev"><span class="bp-tag">⭐ +EV</span><span class="bp-main">${esc(best.side.toUpperCase())} @ ${best.cents}¢</span><span class="bp-ev">+${(best.ev * 100).toFixed(1)}% EV</span><span class="bp-units">${fmtStake(best.kelly)}</span><button class="addleg" data-leg="${esc(JSON.stringify(leg))}">🎟️ + slip</button></div>`
       : `<div class="bestpick pass"><span class="bp-tag">✋ NO BET</span><span class="bp-main">neither side clears the price — model over ${pct(over)} vs Yes ${price}¢</span></div>`;
   }
+  const adj = Math.abs(proj - pr.season) >= 0.05
+    ? `<span style="color:var(--gold)"> ← from season ${pr.season.toFixed(1)}</span>` : '';
+  const roleFlag = pr.roleShift
+    ? `<div class="bo-fair" style="color:var(--gold)">⚠️ role/usage shift: recent ${pr.recent} vs season ${pr.season.toFixed(1)} — weighting recent 60%</div>` : '';
+  const chain = pr.steps.length > 1
+    ? `<div class="bo-fair">${pr.steps.map(s => `${s[0]}: ${(+s[1]).toFixed(1)}`).join(' → ')}</div>` : '';
   el.innerHTML = `${verdict}
-    <div class="bo-h" style="margin-top:12px">PROJECTION ${avg.toFixed(1)} · ALTERNATE-LINE LADDER</div>
-    <div class="betboard" style="display:block">${ladder}
-    <div class="bo-fair">${stat.dist === 'poisson' ? 'Poisson' : 'Normal'} model off the season rate — a real projection also weighs matchup, pace, and role, so treat the edges as a shortlist, not gospel. Kalshi price in ¢ = implied probability.</div></div>`;
+    <div class="bo-h" style="margin-top:12px">PROJECTION ${proj.toFixed(1)}${adj} · ALTERNATE-LINE LADDER</div>
+    <div class="betboard" style="display:block">${ladder}${roleFlag}${chain}
+    <div class="bo-fair">${stat.dist === 'poisson' ? 'Poisson' : 'Normal'} model on the context-adjusted projection. Matchup/pace are your read (or a defense-vs-stat rank); recent avg is the role-change signal. Treat edges as a shortlist. Kalshi price in ¢ = implied probability.</div></div>`;
 }
 
 // ── Events ─────────────────────────────────────────────────────────────
@@ -2403,6 +2443,14 @@ $('#content').addEventListener('click', e => {
   if (leg) { try { addLeg(JSON.parse(leg.dataset.leg)); } catch {} return; }
   const pg = e.target.closest('[data-pn],[data-ps],[data-pgen],[data-pload],[data-pcopy]');
   if (pg) { handleParlay(pg); return; }
+  const pctx = e.target.closest('[data-pmatch],[data-ppace]');
+  if (pctx) {
+    if (pctx.dataset.pmatch) state.props.matchup = pctx.dataset.pmatch;
+    if (pctx.dataset.ppace) state.props.pace = pctx.dataset.ppace;
+    localStorage.setItem('de-props-v1', JSON.stringify(state.props));
+    renderProps();   // re-render to reflect the active pill + new projection
+    return;
+  }
   const fb = e.target.closest('.f-btn');
   if (fb) {
     if (fb.dataset.f) state.filter = fb.dataset.f;
@@ -2424,7 +2472,7 @@ $('#content').addEventListener('input', e => {
     renderElabOut();   // update math without re-rendering inputs (keeps focus)
     return;
   }
-  const pmap = { 'pr-player': 'player', 'pr-stat': 'stat', 'pr-avg': 'avg', 'pr-line': 'line', 'pr-price': 'price' };
+  const pmap = { 'pr-player': 'player', 'pr-stat': 'stat', 'pr-avg': 'avg', 'pr-recent': 'recent', 'pr-line': 'line', 'pr-price': 'price' };
   if (pmap[e.target.id]) {
     state.props[pmap[e.target.id]] = e.target.value;
     localStorage.setItem('de-props-v1', JSON.stringify(state.props));
