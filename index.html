@@ -494,7 +494,8 @@
   <footer>
     Model: regressed win% → log5 matchup probability + sport-specific home advantage (logit space). Soccer uses points-per-game strength with a closeness-weighted draw share; tournament play (World Cup knockouts) falls back to a market-based prior. Tennis uses ATP/WTA ranking-points share. MLB factors the probable starters' ERA gap; team sports factor the live injury report weighted by player skill — an injured stat leader (⭐ in the 🏥 tooltip) counts 2-3x a rotation player, biggest impact in basketball. Day-to-day weighs less than out.<br>
     📐 Team strength blends the actual record with Pythagorean expectation from points scored/allowed (ESPN standings, all team sports). MLB additionally factors Baseball Savant Statcast expected-wOBA for hitting and pitching — contact-quality stats that lead results. See both in the expanded panel's form rows.<br>
-    🎯 Totals: expected combined score from each team's scoring/allowing rates (pitcher-adjusted for MLB) vs the posted O/U — Over/Under sides compete with moneyline/spread for the ⭐ best pick. Venue splits (home/road personality), 😴 back-to-back fatigue, and line movement vs the opener are all factored; "drivers" in the expanded panel says what's pushing each pick.<br>
+    🎯 Totals: expected combined score from each team's scoring/allowing rates vs the posted O/U — Over/Under sides compete with moneyline/spread for the ⭐ best pick. MLB totals factor starters, bullpen relief ERA (MLB StatsAPI), and game-time weather (temperature and rain, outdoor parks only). Venue splits, 😴 back-to-back fatigue, and line movement vs the opener are all factored; "drivers" in the expanded panel says what's pushing each pick.<br>
+    🔥🥶 Hot/cold: recent margin form gives a small, capped model shift (streaks are mostly noise — never more than ~3%) and chips flag teams 4-1 or better / 1-4 or worse in their last five. Player-level streaks aren't in free data feeds; prop angles show season rates.<br>
     Vegas comparison uses ESPN's published line; "VALUE" flags games where the model disagrees with the market by ≥4%.<br>
     ⭐ BEST PICK is the highest expected-value wager at the listed price (vig included; the unlisted dog price is estimated from a 4.5% book margin). Stake sizes are ¼-Kelly, in units of 1% of bankroll. ✋ NO BET means no side clears +2% EV — passing is a position.<br>
     🧠 The model learns: every final updates per-team Elo ratings (margin-of-victory weighted, faster for barely-seen teams) and a per-sport calibration layer (stored locally in your browser). On launch it studies the last 45 days of results in chronological order, then stays current. Predictions blend the record/ranking prior with learned Elo, and the Elo weight grows as the brain sees more of each team. ⭐ picks are logged at the pregame price and settled against the final score. 📜 History keeps a match-by-match record. ⬆⬇ Export/import moves a trained brain between devices.<br>
@@ -986,6 +987,23 @@ function getSavant() {
   return savantPromise;
 }
 
+// MLB bullpen quality: relief-pitching ERA per team from MLB StatsAPI, one league-wide call
+let bullpenPromise = null;
+function getBullpen() {
+  if (!bullpenPromise) {
+    bullpenPromise = fetch(`https://statsapi.mlb.com/api/v1/teams/stats?season=${new Date().getFullYear()}&group=pitching&stats=statSplits&sitCodes=rp&sportIds=1`)
+      .then(r => r.json()).then(j => {
+        const m = new Map();
+        (j.stats?.[0]?.splits || []).forEach(s => {
+          const era = Number(s.stat?.era);
+          if (s.team?.name && !isNaN(era)) m.set(s.team.name.toLowerCase(), era);
+        });
+        return m.size ? m : null;
+      }).catch(() => null);
+  }
+  return bullpenPromise;
+}
+
 // totals: stdev of combined final score, for Over/Under probability
 const TOTAL_SIGMA = { mlb: 4.6, wnba: 17, nba: 19, nfl: 13.5, nhl: 2.2 };
 // back-to-back fatigue (logit penalty) — biggest in basketball, real in hockey
@@ -1022,14 +1040,15 @@ async function fetchSport(sport, date, force = false) {
     ]);
     events = parseTennis(jsons, ranks, date);
   } else {
-    const [res, injuries, quality, savant] = await Promise.all([
+    const [res, injuries, quality, savant, bullpen] = await Promise.all([
       fetch(`${API}/${sport.path}/scoreboard?dates=${ymd(date)}`),
       getInjuries(sport),
       getQuality(sport),
       sport.id === 'mlb' ? getSavant() : Promise.resolve(null),
+      sport.id === 'mlb' ? getBullpen() : Promise.resolve(null),
     ]);
     if (!res.ok) throw new Error('ESPN API responded ' + res.status);
-    events = parseEvents(await res.json(), sport, injuries, quality, savant);
+    events = parseEvents(await res.json(), sport, injuries, quality, savant, bullpen);
   }
   events.forEach(g => { g.sportId = sport.id; });
   const entry = { events, fetchedAt: Date.now() };
@@ -1130,7 +1149,7 @@ function computeBestPick(g, sport) {
     sub: `model ${pct(best.p)} vs implied ${pct(best.imp)}` };
 }
 
-function parseEvents(json, sport, injuries, quality, savant) {
+function parseEvents(json, sport, injuries, quality, savant, bullpen) {
   const games = (json.events || []).map(ev => {
     const comp = ev.competitions?.[0];
     if (!comp) return null;
@@ -1151,6 +1170,11 @@ function parseEvents(json, sport, injuries, quality, savant) {
       const q = quality?.get(String(c.team?.id));
       const xwBat = savant?.bat.get(c.team?.abbreviation) ?? savant?.bat.get((c.team?.shortDisplayName || '').toLowerCase());
       const xwPit = savant?.pit.get(c.team?.abbreviation) ?? savant?.pit.get((c.team?.shortDisplayName || '').toLowerCase());
+      let pen = null;
+      if (bullpen) {
+        const full = (c.team?.displayName || '').toLowerCase(), short = (c.team?.shortDisplayName || '§').toLowerCase();
+        for (const [k, v] of bullpen) if (k === full || k.includes(short)) { pen = v; break; }
+      }
       return {
         name: c.team?.shortDisplayName || c.team?.displayName || '?',
         abbr: c.team?.abbreviation || '?',
@@ -1160,7 +1184,7 @@ function parseEvents(json, sport, injuries, quality, savant) {
         rec: parseRecord(recSummary, sport.soccer),
         score: c.score,
         winner: c.winner === true,
-        probable, leaders,
+        probable, leaders, pen,
         pyth: q?.pyth ?? null, pythG: q?.g || 0,
         pfg: q?.pfg ?? null, pag: q?.pag ?? null,
         hw: q?.hw ?? null, hl: q?.hl ?? null, rw: q?.rw ?? null, rl: q?.rl ?? null,
@@ -1230,6 +1254,23 @@ function parseEvents(json, sport, injuries, quality, savant) {
         shift += d * Math.LN10 / 400;
         if (Math.abs(d) >= 10) why.push(`injuries hit ${d > 0 ? away.abbr : home.abbr}`);
       }
+      // MLB bullpen quality gap (relief ERA — the starter only covers ~60% of innings)
+      if (sport.id === 'mlb' && home.pen != null && away.pen != null) {
+        const d = away.pen - home.pen;
+        shift += Math.max(-0.25, Math.min(0.25, d * 0.06));
+        if (Math.abs(d) >= 0.8) why.push(`bullpen edge ${d > 0 ? home.abbr : away.abbr}`);
+      }
+      // hot/cold form: recent margins vs the sport's typical spread (small, honest weight —
+      // streaks are mostly noise, so this never moves a game more than ~3%)
+      const formF = t => {
+        const h = Brain.rating(sport.id, t)?.hist || [];
+        if (h.length < 5) return 0;
+        const l5 = h.slice(-5);
+        return (l5.reduce((a, b) => a + b, 0) / l5.length) / (LIVE_SIGMA[sport.id] || 10);
+      };
+      const fd = formF(home) - formF(away);
+      shift += Math.max(-0.12, Math.min(0.12, fd * 0.10));
+      if (Math.abs(fd) >= 0.5) why.push(`form edge ${fd > 0 ? home.abbr : away.abbr}`);
       // venue personality: deviation from the expected home/road performance
       const meanBoost = sport.hfaWin - 0.5;
       const venueDev = (t, isHome) => {
@@ -1264,20 +1305,34 @@ function parseEvents(json, sport, injuries, quality, savant) {
       ? model.home - vegas.homeProb : null;
 
     // totals model: expected combined score from scoring/allowing rates,
-    // pitcher-adjusted for MLB, vs the posted O/U line
+    // pitcher/bullpen/weather-adjusted for MLB, vs the posted O/U line
+    const wx = ev.weather && !comp.venue?.indoor
+      ? { t: ev.weather.temperature ?? null, txt: ev.weather.displayValue || '' } : null;
     let total = null;
     if (vegas?.ou && TOTAL_SIGMA[sport.id] && home.pfg != null && away.pfg != null) {
       let exp = (home.pfg + away.pag) / 2 + (away.pfg + home.pag) / 2;
-      if (sport.id === 'mlb' && home.probable?.era != null && away.probable?.era != null) {
-        exp += ((home.probable.era + away.probable.era) / 2 - 4.2) * 0.8;
+      const notes = [];
+      if (sport.id === 'mlb') {
+        if (home.probable?.era != null && away.probable?.era != null) {
+          exp += ((home.probable.era + away.probable.era) / 2 - 4.2) * 0.8;
+        }
+        if (home.pen != null && away.pen != null) {
+          exp += ((home.pen + away.pen) / 2 - 4.1) * 0.35;
+        }
+        if (wx?.t != null) {
+          exp += (wx.t - 70) * 0.018;   // hot air carries — roughly +0.4 runs on a 92° day
+          if (wx.t >= 85) notes.push(`${wx.t}° heat → over`);
+          else if (wx.t <= 55) notes.push(`${wx.t}° cold → under`);
+        }
+        if (wx && /rain|shower|storm|drizzle/i.test(wx.txt)) { exp -= 0.25; notes.push('rain → under'); }
       }
-      total = { exp, line: vegas.ou, pOver: clamp(normalCdf((exp - vegas.ou) / TOTAL_SIGMA[sport.id])) };
+      total = { exp, line: vegas.ou, pOver: clamp(normalCdf((exp - vegas.ou) / TOTAL_SIGMA[sport.id])), notes };
     }
 
     const st = ev.status?.type || {};
     return {
       id: ev.id, home, away, model, pick, pickProb, vegas, edge, marketPrior,
-      total, why: typeof whyDrivers !== 'undefined' ? whyDrivers : [],
+      total, wx, why: typeof whyDrivers !== 'undefined' ? whyDrivers : [],
       state: st.state || 'pre',                       // pre | in | post
       statusText: st.shortDetail || st.detail || '',
       period: ev.status?.period, clock: ev.status?.displayClock || '',
@@ -1451,7 +1506,8 @@ function formSection(g) {
   const row = (t, e) => {
     const wl = e?.hist ? `${e.hist.filter(m => m > 0).length}-${e.hist.filter(m => m < 0).length} last ${e.hist.length}` : '';
     const qual = (t.pyth != null ? ` · pyth ${t.pyth.toFixed(3)}` : '')
-      + (t.xw ? ` · xwOBA ${t.xw.bat.toFixed(3)}/${t.xw.pit.toFixed(3)}` : '');
+      + (t.xw ? ` · xwOBA ${t.xw.bat.toFixed(3)}/${t.xw.pit.toFixed(3)}` : '')
+      + (t.pen != null ? ` · pen ${t.pen.toFixed(2)}` : '');
     return `<div class="form-row"><span class="form-abbr">${esc(t.abbr)}</span>${sparkline(e?.hist)}
       <span class="form-elo">⚡${e ? Math.round(e.r) : '—'}</span><span class="form-rec">${wl}${qual}</span></div>`;
   };
@@ -1487,7 +1543,7 @@ function betBoard(g) {
   return `<div class="betboard"><div class="bo-h">FULL BET BOARD</div>
     ${rows || '<div class="bo-row skip"><span class="bo-bet">no priced markets listed for this match</span></div>'}
     <div class="bo-fair">model's fair prices: ${esc(g.home.abbr)} ${fh} / ${esc(g.away.abbr)} ${fa}${fd} — only take better numbers than these</div>
-    ${g.total ? `<div class="bo-fair">model total: ${g.total.exp.toFixed(1)} vs line ${g.total.line} → ${g.total.pOver >= 0.5 ? 'Over' : 'Under'} ${pct(Math.max(g.total.pOver, 1 - g.total.pOver))}</div>`
+    ${g.total ? `<div class="bo-fair">model total: ${g.total.exp.toFixed(1)} vs line ${g.total.line} → ${g.total.pOver >= 0.5 ? 'Over' : 'Under'} ${pct(Math.max(g.total.pOver, 1 - g.total.pOver))}${g.total.notes?.length ? ' · ' + esc(g.total.notes.join(' · ')) : ''}${g.wx ? ` · ${esc(g.wx.txt)}` : ''}</div>`
       : g.vegas?.ou ? `<div class="bo-fair">total: O/U ${g.vegas.ou}</div>` : ''}
     ${g.why?.length ? `<div class="bo-fair">drivers: ${esc(g.why.join(' · '))}</div>` : ''}
     ${extras}
@@ -1504,9 +1560,13 @@ function teamRow(t, g, side) {
     ? ` · P: ${t.probable.name}${t.probable.era != null ? ` (${t.probable.era.toFixed(2)})` : ''}` : '';
   const injChip = t.inj?.n ? `<span class="injchip" title="${esc(t.injTitle || '')}">🏥${t.inj.n}${t.injStar ? '⭐' : ''}</span>` : '';
   const b2bChip = t.b2b ? '<span class="injchip" title="played yesterday — fatigue penalty applied">😴B2B</span>' : '';
+  const l5 = (e?.hist || []).slice(-5);
+  const w5 = l5.filter(m => m > 0).length;
+  const streakChip = l5.length === 5 && w5 >= 4 ? `<span class="injchip" title="${w5}-${5 - w5} last 5 — hot" style="color:var(--gold)">🔥</span>`
+    : l5.length === 5 && w5 <= 1 ? `<span class="injchip" title="${w5}-${5 - w5} last 5 — ice cold" style="color:var(--accent2)">🥶</span>` : '';
   return `<div class="teamrow ${isWinner ? 'winner' : ''} ${isPicked ? 'picked' : ''}">
     ${teamLogo(t)}
-    <div><div class="tname">${esc(t.name)}${injChip}${b2bChip}</div><div class="trec">${esc(t.recSummary)}${eloStr}${esc(pit)}</div></div>
+    <div><div class="tname">${esc(t.name)}${injChip}${b2bChip}${streakChip}</div><div class="trec">${esc(t.recSummary)}${eloStr}${esc(pit)}</div></div>
     ${score}
   </div>`;
 }
@@ -1555,7 +1615,7 @@ function gameCard(g, i, sport) {
     style="animation-delay:${Math.min(i * 45, 450)}ms">
     <div class="g-top">
       ${badge}
-      <span class="where">${esc(g.state === 'pre' ? (g.tv || g.venue) : g.statusText)}</span>
+      <span class="where">${esc(g.state === 'pre' ? (g.tv || g.venue) : g.statusText)}${g.wx?.t != null && g.state !== 'post' ? esc(` · ${g.wx.t}°`) : ''}</span>
     </div>
     ${teamRow(g.away, g, 'away')}
     ${teamRow(g.home, g, 'home')}
