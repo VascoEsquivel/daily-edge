@@ -561,7 +561,7 @@
     🔥🥶 Hot/cold: recent margin form gives a small, capped model shift (streaks are mostly noise — never more than ~3%) and chips flag teams 4-1 or better / 1-4 or worse in their last five. Player-level streaks aren't in free data feeds; prop angles show season rates.<br>
     Vegas comparison uses ESPN's published line; "VALUE" flags games where the model disagrees with the market by ≥4%.<br>
     ⭐ BEST PICK is the highest expected-value wager at the listed price (vig included; the unlisted dog price is estimated from a 4.5% book margin). Stake sizes are ¼-Kelly, in units of 1% of bankroll. ✋ NO BET means no side clears +2% EV — passing is a position.<br>
-    🧠 The model learns: every final updates per-team Elo ratings (margin-of-victory weighted, faster for barely-seen teams) and a per-sport calibration layer (stored locally in your browser). On launch it studies the last 45 days of results in chronological order, then stays current. Predictions blend the record/ranking prior with learned Elo, and the Elo weight grows as the brain sees more of each team. ⭐ picks are logged at the pregame price and settled against the final score. 📜 History keeps a match-by-match record. ⬆⬇ Export/import moves a trained brain between devices.<br>
+    🧠 The model learns: every final updates per-team Elo ratings (margin-of-victory weighted, faster for barely-seen teams) and a per-sport calibration layer (stored locally in your browser). On launch it studies the last 45 days of results in chronological order, then stays current. Predictions blend the record/ranking prior with learned Elo, and the Elo weight grows as the brain sees more of each team. ⭐ picks are logged at the pregame price and settled against the final score. The brain bar separates two records: <b>model picks · straight-up</b> (how often the who-wins pick is right) and <b>⭐ suggested-bet hit</b> (how often the +EV plays cash — usually lower, since value bets are often plus-money dogs, with ROI showing they still profit). "exp" is the rate the model expected; beating it means the edge is real. 📜 History keeps a match-by-match record. ⬆⬇ Export/import moves a trained brain between devices.<br>
     ⚡ Live win probability uses the Stern model — current margin + time remaining vs the pregame expectation — and updates each poll; the ▲▼ shows movement vs the opening number. Click any upcoming match for its full bet board with model vs market prices on every side.<br>
     🎟️ The slip combines legs assuming independence; parlays stack the book's vig, so most are −EV — the slip will tell you. 🎰 The Parlay Generator (top of The Card) auto-builds Safe / Value / Longshot parlays from the day's priced picks and labels each +EV or −EV honestly. 💵 Set a bankroll to see stakes in dollars. Keys: ← → dates · t today · r refresh · 1–9 tabs.<br>
     ⚠️ Predictions are statistical estimates for entertainment and research — no model prints money. If you bet, bet what you can afford to lose.
@@ -833,6 +833,16 @@ const Brain = (() => {
            pending: {} };
   }
   db.log = db.log || [];   // permanent match-by-match record, newest first
+  if (db.stats.betsStaked == null) db.stats.betsStaked = 0;
+  if (db.stats.betsExpWon == null) db.stats.betsExpWon = 0;
+  // one-time: the old bet ledger lacked staked/expected data, so ROI & expected-rate
+  // couldn't be computed consistently. Reset just the bet counters (learning is untouched)
+  // so hit%, expected%, ROI and P/L are all correct going forward.
+  if (!db.betLedgerV2) {
+    Object.assign(db.stats, { bets: 0, betsWon: 0, pnl: 0, betsStaked: 0, betsExpWon: 0 });
+    db.pending = {};   // re-log open tickets with the model prob attached
+    db.betLedgerV2 = true;
+  }
   const cutoff = ymd(new Date(Date.now() - 60 * 864e5));
   for (const k in db.processed) if (db.processed[k] < cutoff) delete db.processed[k];
 
@@ -900,6 +910,8 @@ const Brain = (() => {
       won = bet.side === 'home' ? scoreH === 1 : scoreH === 0;
     }
     db.stats.bets++;
+    db.stats.betsStaked += bet.units || 0;          // for ROI
+    db.stats.betsExpWon += bet.p || 0;              // sum of model probs = expected wins
     if (won) { db.stats.betsWon++; db.stats.pnl += bet.units * bet.b; }
     else db.stats.pnl -= bet.units;
   }
@@ -938,7 +950,7 @@ const Brain = (() => {
       if (g.state !== 'pre' || g.bp?.kind !== 'ev' || !g.bp.side) return;
       const key = sport.id + '|' + g.id;
       if (db.pending[key]) return;                  // first listed price stands
-      db.pending[key] = { side: g.bp.side, b: g.bp.b, units: g.bp.units,
+      db.pending[key] = { side: g.bp.side, b: g.bp.b, units: g.bp.units, p: g.bp.p ?? null,
                           type: g.bp.betType, homeSpread: g.bp.homeSpread ?? null,
                           line: g.bp.line ?? null };
       changed = true;
@@ -1975,9 +1987,18 @@ function renderBrain() {
     items = `<span class="b-item">fresh brain — it absorbs every final and studies yesterday's slate automatically</span>`;
   } else {
     const acc = st.hits + st.misses ? Math.round(st.hits / (st.hits + st.misses) * 100) : 0;
+    const betHit = st.bets ? Math.round(st.betsWon / st.bets * 100) : 0;
+    const expHit = st.bets ? Math.round(st.betsExpWon / st.bets * 100) : 0;
+    const roi = st.betsStaked ? st.pnl / st.betsStaked * 100 : 0;
+    const itemT = (label, val, cls, tip) => `<span class="b-item" title="${esc(tip)}">${label} <b class="${cls}">${val}</b></span>`;
     items = item('results absorbed', st.absorbed)
-      + item('all-time record', `${st.hits}–${st.misses} (${acc}%)`, st.hits >= st.misses ? 'good' : 'bad')
-      + (st.bets ? item('⭐ picks settled', `${st.betsWon}/${st.bets}`) : '')
+      + itemT('model picks · straight-up', `${st.hits}–${st.misses} (${acc}%)`, st.hits >= st.misses ? 'good' : 'bad',
+          'How often the model\'s who-wins pick is right. Different from the ⭐ suggested-bet hit rate — those are value plays.')
+      + (st.bets ? itemT('⭐ suggested-bet hit', `${st.betsWon}–${st.bets - st.betsWon} (${betHit}% · exp ${expHit}%)`,
+          betHit >= expHit ? 'good' : 'bad',
+          '⭐ +EV plays are often plus-money underdogs, so a hit% below the straight-up rate is normal and still profitable. "exp" is the rate the model expected — beating it means the edge is real.') : '')
+      + (st.bets ? itemT('bet ROI', `${roi >= 0 ? '+' : ''}${roi.toFixed(1)}%`, roi >= 0 ? 'good' : 'bad',
+          'Return on amount staked across all settled ⭐ bets — the number that actually matters.') : '')
       + (st.bets ? item('P/L', `${st.pnl >= 0 ? '+' : ''}${st.pnl.toFixed(1)}u`, st.pnl >= 0 ? 'good' : 'bad') : '')
       + item('teams & players rated', st.tracked, 'gold')
       + (st.pendingN ? item('open tickets', st.pendingN) : '');
