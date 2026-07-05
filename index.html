@@ -831,7 +831,7 @@ const ymd = d => d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate(
 // Predictions blend the record/ranking prior with learned Elo — the Elo
 // weight grows with how many games the brain has seen for those teams.
 const Brain = (() => {
-  const KEY = 'de-brain-v3';   // v3: 120-day study window + pythagorean/statcast priors
+  const KEY = 'de-brain-v4';   // v4: self-calibrating totals bias (relearns the season with it)
   const ELO_K = { mlb: 6, wnba: 24, nba: 20, nfl: 24, nhl: 10, mls: 24, wc: 28, tennis: 32 };
   const LR = 0.04;                 // calibration learning rate
   let db;
@@ -847,6 +847,7 @@ const Brain = (() => {
   if (db.stats.betsExpWon == null) db.stats.betsExpWon = 0;
   if (db.stats.clvSum == null) { db.stats.clvSum = 0; db.stats.clvN = 0; db.stats.clvBeat = 0; }
   db.stats.betlog = db.stats.betlog || [];   // {c: cumulative P/L, w: won} per settled bet
+  db.totalsBias = db.totalsBias || {};       // per-sport EMA of (actual − predicted) total
   // one-time: the old bet ledger lacked staked/expected data, so ROI & expected-rate
   // couldn't be computed consistently. Reset just the bet counters (learning is untouched)
   // so hit%, expected%, ROI and P/L are all correct going forward.
@@ -980,6 +981,15 @@ const Brain = (() => {
         Math.floor(g.start.getTime() / 864e5));
       g.correct ? db.stats.hits++ : db.stats.misses++;
       db.stats.absorbed++;
+      // totals self-calibration: ESPN strips odds from finals, so the pregame
+      // prediction comes from the Open snapshot taken while the game was upcoming
+      const preTotal = g.total?.exp ?? (typeof Open !== 'undefined' ? Open.get(sport, g)?.te : null);
+      if (preTotal != null) {
+        const actual = (Number(g.home.score) || 0) + (Number(g.away.score) || 0);
+        const tb = db.totalsBias[sport.id] = db.totalsBias[sport.id] || { b: 0, n: 0 };
+        tb.b += 0.08 * ((actual - preTotal) - tb.b);   // EMA of the residual error
+        tb.n++;
+      }
       settle(key, g, scoreH);
       db.log.unshift({ d: ymd(g.start), s: sport.id,
         a: g.away.abbr, h: g.home.abbr, sa: g.away.score ?? '', sh: g.home.score ?? '',
@@ -1026,6 +1036,7 @@ const Brain = (() => {
 
   return { adjust, processResults, recordPending, stats, history: () => db.log,
     postmortems: () => db.postmortems,
+    totalsBias: sportId => db.totalsBias[sportId] || null,
     rating: (sportId, t) => db.elo[sportId]?.[t.flagLogo ? t.name : t.abbr] || null,
     through: () => db.through,
     setThrough: y => { db.through = y; save(); },
@@ -1052,8 +1063,12 @@ const Open = (() => {
       let changed = false;
       events.forEach(g => {
         const k = sport.id + '|' + g.id;
-        if (g.state === 'pre' && !db[k]) {
-          db[k] = { p: g.model.home, d: g.vegas?.detail || '', t: Date.now() };
+        if (g.state !== 'pre') return;
+        if (!db[k]) {
+          db[k] = { p: g.model.home, d: g.vegas?.detail || '', t: Date.now(), te: g.total?.exp ?? null };
+          changed = true;
+        } else if (db[k].te == null && g.total?.exp != null) {
+          db[k].te = g.total.exp;   // snapshots from before totals tracking existed
           changed = true;
         }
       });
@@ -1651,6 +1666,14 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
           notes.push(`${Math.round(wind.speed)}mph ${wind.out > 0 ? 'blowing out → over' : 'blowing in → under'}`);
         }
         if (wx && /rain|shower|storm|drizzle/i.test(wx.txt)) { exp -= 0.25; notes.push('rain → under'); }
+      }
+      // self-calibration: apply the brain's learned totals bias once it has a real sample
+      const tb = Brain.totalsBias(sport.id);
+      if (tb && tb.n >= 20) {
+        const cap = TOTAL_SIGMA[sport.id] * 0.4;
+        const adj = Math.max(-cap, Math.min(cap, tb.b));
+        exp += adj;
+        if (Math.abs(adj) >= TOTAL_SIGMA[sport.id] * 0.08) notes.push(`learned bias ${adj > 0 ? '+' : ''}${adj.toFixed(1)}`);
       }
       total = { exp, line: vegas.ou, pOver: clamp(normalCdf((exp - vegas.ou) / TOTAL_SIGMA[sport.id])), notes };
     }
@@ -2447,7 +2470,8 @@ function renderSlip() {
     <span><b>${esc(l.t)}</b><div class="lg-m">${esc(l.m)} · ${esc(l.tm)} · model ${pct(l.p)}</div></span>
     <button class="rmleg" data-gid="${esc(l.gid)}">✕</button></div>`).join('');
   const { D, P, ev } = slipMath();
-  const kelly = ev > 0 ? Math.min(2, Math.max(0.5, Math.round((D * P - 1) / (D - 1) * 0.25 * 1000) / 10)) : 0;
+  // singles use the same 5u cap as the cards; multi-leg parlays stay conservative at 2u
+  const kelly = ev > 0 ? Math.min(n === 1 ? 5 : 2, Math.max(0.5, Math.round((D * P - 1) / (D - 1) * 0.25 * 1000) / 10)) : 0;
   const evStr = `<b class="${ev >= 0 ? 'pos' : 'neg'}">${(ev * 100).toFixed(1)}%</b>`;
   const math = n === 1
     ? `<div class="s-math">model ${pct(P)} to hit · EV ${evStr}${kelly ? ` · stake <b>${fmtStake(kelly)}</b>` : ''}</div>`
