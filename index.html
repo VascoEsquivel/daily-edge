@@ -386,6 +386,14 @@
   .hist .h-row .ok { color: var(--accent); font-weight: 700; }
   .hist .h-row .bad { color: var(--hot); font-weight: 700; }
   .hist .h-empty { color: var(--muted); font-size: 12.5px; }
+  .pm-breakdown { display: flex; flex-wrap: wrap; gap: 7px; margin: 4px 0 10px; }
+  .pm-pill { background: rgba(255,77,109,.08); border: 1px solid rgba(255,77,109,.25); color: var(--text);
+    border-radius: 999px; padding: 3px 11px; font-size: 11px; font-family: 'JetBrains Mono', monospace; }
+  .pm-pill b { color: var(--hot); }
+  .pm-take { background: rgba(0,200,255,.07); border: 1px solid rgba(0,200,255,.25); border-radius: 10px;
+    padding: 9px 13px; font-size: 12.5px; line-height: 1.6; color: var(--text); margin-bottom: 6px; }
+  .pm-tag { font-size: 11.5px; color: var(--text); padding: 2px 8px 8px; }
+  .pm-tag .pm-res { color: var(--muted); font-family: 'JetBrains Mono', monospace; font-size: 10.5px; }
 
   /* ── Filter bar ── */
   .fbar {
@@ -548,6 +556,7 @@
   <nav class="tabs" id="tabs"></nav>
   <div id="brainbar"></div>
   <div id="histpanel"></div>
+  <div id="pmpanel"></div>
   <div id="content"></div>
   <div id="slipbox"></div>
 
@@ -597,7 +606,7 @@ const state = {
   cache: new Map(),            // key: sportId|yyyymmdd -> { events, fetchedAt }
   liveTimer: null,
   openCards: new Set(),        // expanded bet boards, kept open across refreshes
-  showHistory: false,
+  showHistory: false, showPM: false,
   filter: 'all', sort: 'time', query: '',
   slip: [], slipOpen: false,
   lastEntries: new Map(), activeEntry: null,
@@ -833,6 +842,7 @@ const Brain = (() => {
            pending: {} };
   }
   db.log = db.log || [];   // permanent match-by-match record, newest first
+  db.postmortems = db.postmortems || [];   // why each ⭐ bet lost, newest first
   if (db.stats.betsStaked == null) db.stats.betsStaked = 0;
   if (db.stats.betsExpWon == null) db.stats.betsExpWon = 0;
   // one-time: the old bet ledger lacked staked/expected data, so ROI & expected-rate
@@ -913,7 +923,35 @@ const Brain = (() => {
     db.stats.betsStaked += bet.units || 0;          // for ROI
     db.stats.betsExpWon += bet.p || 0;              // sum of model probs = expected wins
     if (won) { db.stats.betsWon++; db.stats.pnl += bet.units * bet.b; }
-    else db.stats.pnl -= bet.units;
+    else {
+      db.stats.pnl -= bet.units;
+      const a = analyzeLoss(bet, g);                // post-mortem: why did this ⭐ bet miss?
+      db.postmortems.unshift({ d: ymd(g.start), t: bet.text || `${bet.side} ${bet.type}`, m: bet.m || '',
+        p: Math.round((bet.p || 0) * 100), mkt: Math.round((bet.marketP || 0) * 100),
+        cat: a.cat, tag: a.tag, result: a.resultStr, why: bet.why || [] });
+      if (db.postmortems.length > 120) db.postmortems.length = 120;
+    }
+  }
+
+  // classify why a losing ⭐ bet missed
+  function analyzeLoss(bet, g) {
+    const hs = Number(g.home.score) || 0, as = Number(g.away.score) || 0;
+    const p = bet.p || 0.5, mkt = bet.marketP || 0.5;
+    let missBy = null, resultStr = `${g.away.abbr} ${as}–${hs} ${g.home.abbr}`;
+    if (bet.type === 'spread') {
+      const homeCover = (hs - as) + (bet.homeSpread || 0);
+      missBy = Math.abs(bet.side === 'home' ? homeCover : -homeCover);
+    } else if (bet.type === 'total') {
+      missBy = Math.abs((hs + as) - (bet.line || 0));
+      resultStr = `total ${hs + as} vs line ${bet.line}`;
+    } else missBy = Math.abs(hs - as);
+    let cat, tag;
+    if (p >= 0.65) { cat = 'badbeat'; tag = `🎲 Bad beat — model had it ${Math.round(p * 100)}%, ran into the ${Math.round((1 - p) * 100)}% tail. Variance, not a bad read.`; }
+    else if (p - mkt >= 0.08) { cat = 'overconf'; tag = `⚠️ Model overconfident — liked it ${Math.round(p * 100)}% vs market ${Math.round(mkt * 100)}%; the market was right. Fade big gaps.`; }
+    else if ((bet.type === 'total' && missBy <= 1.5) || (bet.type === 'spread' && missBy <= 2)) { cat = 'close'; tag = `😤 Close miss — off by just ${(+missBy).toFixed(1)}. Brutal variance.`; }
+    else if (p <= 0.55) { cat = 'coinflip'; tag = `🪙 Coin-flip (${Math.round(p * 100)}%) landed the wrong way. Priced right, lost the flip.`; }
+    else { cat = 'clean'; tag = '❌ Clean miss — the model was simply off on this one.'; }
+    return { cat, tag, resultStr, missBy };
   }
 
   // absorb finals the brain hasn't seen yet
@@ -952,7 +990,9 @@ const Brain = (() => {
       if (db.pending[key]) return;                  // first listed price stands
       db.pending[key] = { side: g.bp.side, b: g.bp.b, units: g.bp.units, p: g.bp.p ?? null,
                           type: g.bp.betType, homeSpread: g.bp.homeSpread ?? null,
-                          line: g.bp.line ?? null };
+                          line: g.bp.line ?? null,
+                          text: g.bp.text, why: g.why || [],   // for the loss post-mortem
+                          m: `${g.away.abbr} @ ${g.home.abbr}`, marketP: 1 / (g.bp.b + 1) };
       changed = true;
     });
     if (changed) save();
@@ -965,6 +1005,7 @@ const Brain = (() => {
   }
 
   return { adjust, processResults, recordPending, stats, history: () => db.log,
+    postmortems: () => db.postmortems,
     rating: (sportId, t) => db.elo[sportId]?.[t.flagLogo ? t.name : t.abbr] || null,
     through: () => db.through,
     setThrough: y => { db.through = y; save(); },
@@ -2008,11 +2049,50 @@ function renderBrain() {
     ${items}
     <span class="b-item" id="brainprog"></span>
     <button class="b-btn" id="histbtn">📜 ${state.showHistory ? 'hide' : 'history'}</button>
+    <button class="b-btn" id="pmbtn" title="Why the losing ⭐ bets missed">🔍 ${state.showPM ? 'hide' : 'post-mortems'}${Brain.postmortems().length ? ' (' + Brain.postmortems().length + ')' : ''}</button>
     <button class="b-btn" id="exportbtn" title="Copy this trained brain to the clipboard">⬆ export</button>
     <button class="b-btn" id="importbtn" title="Paste a brain export from another device">⬇ import</button>
     <span class="b-note">studies the last ${BACKFILL_DAYS} days automatically · margin-weighted Elo · statcast + pythagorean priors</span>
   </div>`;
   renderHistory();
+  renderPostmortems();
+}
+
+// 🔍 Loss post-mortems: per-bet analysis of why ⭐ picks missed, plus the pattern across them
+function renderPostmortems() {
+  const el = $('#pmpanel');
+  if (!state.showPM) { el.innerHTML = ''; return; }
+  const pm = Brain.postmortems() || [];
+  if (!pm.length) {
+    el.innerHTML = '<div class="hist"><div class="h-empty">No losing ⭐ bets on record yet — every miss will be auto-analyzed here (bad beat vs. overconfident model vs. close miss), with the pattern across them.</div></div>';
+    return;
+  }
+  const LABEL = { badbeat: '🎲 Bad beats (variance)', overconf: '⚠️ Model overconfident', close: '😤 Close misses', coinflip: '🪙 Coin-flips lost', clean: '❌ Clean misses' };
+  const counts = {}; pm.forEach(x => counts[x.cat] = (counts[x.cat] || 0) + 1);
+  const total = pm.length;
+  const breakdown = Object.entries(counts).sort((a, b) => b[1] - a[1])
+    .map(([c, n]) => `<span class="pm-pill">${LABEL[c]} <b>${n}</b> (${Math.round(n / total * 100)}%)</span>`).join('');
+  // headline takeaway from the dominant loss type
+  const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0];
+  const TAKE = {
+    badbeat: 'Most of your misses are high-probability bad beats — that\'s expected variance, not bad picks. Keep sizing sensibly and stay the course.',
+    overconf: 'Your losses skew to spots where the model out-ran the market. Lesson: fade the biggest model-vs-market gaps — trust small edges more than monster ones.',
+    close: 'Lots of losses are razor-thin spread/total misses — brutal variance. The reads were fine; keep unit sizes disciplined.',
+    coinflip: 'Most misses are near coin-flips that landed wrong. These are priced right; the fix is betting fewer marginal spots, not changing the model.',
+    clean: 'Several clean misses where the model was simply off — worth checking if a data gap (injury, lineup) was in play on those.',
+  };
+  const takeaway = `<div class="pm-take">🧭 ${esc(TAKE[top] || '')}</div>`;
+  const rows = pm.slice(0, 60).map(x => {
+    const ds = String(x.d);
+    return `<div class="h-row"><span class="h-match">${esc(x.t)}</span>
+      <span class="h-pick">${esc(x.m)} · ${x.p}% (mkt ${x.mkt}%)</span></div>
+      <div class="pm-tag">${esc(x.tag)} <span class="pm-res">— ${esc(x.result)}${x.why?.length ? ' · drivers: ' + esc(x.why.join(', ')) : ''}</span></div>`;
+  }).join('');
+  el.innerHTML = `<div class="hist">
+    <div class="h-date">🔍 LOSS POST-MORTEMS · ${total} settled misses</div>
+    <div class="pm-breakdown">${breakdown}</div>${takeaway}
+    <div class="h-date" style="margin-top:12px">EVERY MISS, NEWEST FIRST</div>${rows}
+  </div>`;
 }
 
 const SPORT_ICON = { esports: '🎮', props: '🎯', ...Object.fromEntries(SPORTS.map(s => [s.id, s.label.split(' ')[0]])) };
@@ -2715,6 +2795,7 @@ $('#content').addEventListener('input', e => {
 });
 $('#brainbar').addEventListener('click', e => {
   if (e.target.closest('#histbtn')) { state.showHistory = !state.showHistory; renderBrain(); return; }
+  if (e.target.closest('#pmbtn')) { state.showPM = !state.showPM; renderBrain(); return; }
   if (e.target.closest('#exportbtn')) {
     navigator.clipboard?.writeText(Brain.exportDb());
     const b = e.target.closest('#exportbtn');
