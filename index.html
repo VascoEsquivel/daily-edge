@@ -846,11 +846,12 @@ const Brain = (() => {
   if (db.stats.betsStaked == null) db.stats.betsStaked = 0;
   if (db.stats.betsExpWon == null) db.stats.betsExpWon = 0;
   if (db.stats.clvSum == null) { db.stats.clvSum = 0; db.stats.clvN = 0; db.stats.clvBeat = 0; }
+  db.stats.betlog = db.stats.betlog || [];   // {c: cumulative P/L, w: won} per settled bet
   // one-time: the old bet ledger lacked staked/expected data, so ROI & expected-rate
   // couldn't be computed consistently. Reset just the bet counters (learning is untouched)
   // so hit%, expected%, ROI and P/L are all correct going forward.
   if (!db.betLedgerV2) {
-    Object.assign(db.stats, { bets: 0, betsWon: 0, pnl: 0, betsStaked: 0, betsExpWon: 0, clvSum: 0, clvN: 0, clvBeat: 0 });
+    Object.assign(db.stats, { bets: 0, betsWon: 0, pnl: 0, betsStaked: 0, betsExpWon: 0, clvSum: 0, clvN: 0, clvBeat: 0, betlog: [] });
     db.pending = {};   // re-log open tickets with the model prob attached
     db.betLedgerV2 = true;
   }
@@ -938,6 +939,8 @@ const Brain = (() => {
         cat: a.cat, tag: a.tag, result: a.resultStr, why: bet.why || [] });
       if (db.postmortems.length > 120) db.postmortems.length = 120;
     }
+    db.stats.betlog.push({ c: +db.stats.pnl.toFixed(2), w: !!won });   // bankroll trajectory
+    if (db.stats.betlog.length > 250) db.stats.betlog.shift();
   }
 
   // classify why a losing ⭐ bet missed
@@ -1811,6 +1814,19 @@ function bestPickStrip(g) {
 }
 
 // ── Expanded panel pieces: form sparklines, prop angles, bet board ──────
+// line sparkline of cumulative P/L, with a zero baseline
+function lineSparkline(vals) {
+  if (!vals || vals.length < 2) return '';
+  const w = 88, h = 20, min = Math.min(0, ...vals), max = Math.max(0, ...vals), range = (max - min) || 1;
+  const pts = vals.map((v, i) => `${(i / (vals.length - 1) * w).toFixed(1)},${(h - (v - min) / range * h).toFixed(1)}`).join(' ');
+  const zeroY = (h - (0 - min) / range * h).toFixed(1);
+  const up = vals[vals.length - 1] >= 0;
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="vertical-align:middle;margin-left:4px">
+    <line x1="0" y1="${zeroY}" x2="${w}" y2="${zeroY}" stroke="rgba(132,148,184,.35)" stroke-width="1" stroke-dasharray="2 2"/>
+    <polyline points="${pts}" fill="none" stroke="${up ? 'var(--accent)' : 'var(--hot)'}" stroke-width="1.6" stroke-linejoin="round" filter="drop-shadow(0 0 3px ${up ? 'rgba(0,255,136,.5)' : 'rgba(255,77,109,.4)'})"/>
+  </svg>`;
+}
+
 function sparkline(hist) {
   if (!hist || !hist.length) return '<span class="spark-none">no games seen yet</span>';
   const max = Math.max(1, ...hist.map(Math.abs));
@@ -2061,7 +2077,14 @@ function renderBrain() {
           'Return on amount staked across all settled ⭐ bets — the number that actually matters.') : '')
       + (st.clvN ? itemT('📈 CLV', `${clvAvg >= 0 ? '+' : ''}${clvAvg.toFixed(1)}% · beat close ${clvBeat}%`, clvAvg >= 0 ? 'good' : 'bad',
           'Closing Line Value: how much the market moved toward our side between the pick and the game start (vs the last line seen). Positive CLV is the strongest sign the model is genuinely sharp — it means we consistently beat where the market closed, which predicts long-run profit better than win rate.') : '')
-      + (st.bets ? item('P/L', `${st.pnl >= 0 ? '+' : ''}${st.pnl.toFixed(1)}u`, st.pnl >= 0 ? 'good' : 'bad') : '')
+      + (st.bets ? item('P/L', `${st.pnl >= 0 ? '+' : ''}${st.pnl.toFixed(1)}u`, st.pnl >= 0 ? 'good' : 'bad')
+          + lineSparkline((st.betlog || []).map(x => x.c)) : '')
+      + (st.betlog && st.betlog.length >= 3 ? (() => {
+          const l10 = st.betlog.slice(-10); const w10 = l10.filter(x => x.w).length;
+          const seq = l10.map(x => x.w ? 'W' : 'L').join('');
+          return itemT('L10', `${w10}–${l10.length - w10} <span style="letter-spacing:1px;font-size:10px">${seq}</span>`,
+            w10 >= l10.length - w10 ? 'good' : 'bad', 'Your last 10 settled ⭐ bets — recent form (heating up or cooling off).');
+        })() : '')
       + item('teams & players rated', st.tracked, 'gold')
       + (st.pendingN ? item('open tickets', st.pendingN) : '');
   }
