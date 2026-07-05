@@ -845,11 +845,12 @@ const Brain = (() => {
   db.postmortems = db.postmortems || [];   // why each ⭐ bet lost, newest first
   if (db.stats.betsStaked == null) db.stats.betsStaked = 0;
   if (db.stats.betsExpWon == null) db.stats.betsExpWon = 0;
+  if (db.stats.clvSum == null) { db.stats.clvSum = 0; db.stats.clvN = 0; db.stats.clvBeat = 0; }
   // one-time: the old bet ledger lacked staked/expected data, so ROI & expected-rate
   // couldn't be computed consistently. Reset just the bet counters (learning is untouched)
   // so hit%, expected%, ROI and P/L are all correct going forward.
   if (!db.betLedgerV2) {
-    Object.assign(db.stats, { bets: 0, betsWon: 0, pnl: 0, betsStaked: 0, betsExpWon: 0 });
+    Object.assign(db.stats, { bets: 0, betsWon: 0, pnl: 0, betsStaked: 0, betsExpWon: 0, clvSum: 0, clvN: 0, clvBeat: 0 });
     db.pending = {};   // re-log open tickets with the model prob attached
     db.betLedgerV2 = true;
   }
@@ -922,6 +923,12 @@ const Brain = (() => {
     db.stats.bets++;
     db.stats.betsStaked += bet.units || 0;          // for ROI
     db.stats.betsExpWon += bet.p || 0;              // sum of model probs = expected wins
+    // closing-line value: did our side's price shorten (market moved toward us) by close?
+    if (bet.takenImplied != null && bet.closeImplied != null) {
+      const clv = bet.closeImplied - bet.takenImplied;
+      db.stats.clvSum += clv; db.stats.clvN++;
+      if (clv > 0.002) db.stats.clvBeat++;
+    }
     if (won) { db.stats.betsWon++; db.stats.pnl += bet.units * bet.b; }
     else {
       db.stats.pnl -= bet.units;
@@ -985,14 +992,24 @@ const Brain = (() => {
   function recordPending(sport, events) {
     let changed = false;
     events.forEach(g => {
-      if (g.state !== 'pre' || g.bp?.kind !== 'ev' || !g.bp.side) return;
+      if (g.state !== 'pre') return;
       const key = sport.id + '|' + g.id;
-      if (db.pending[key]) return;                  // first listed price stands
+      const ex = db.pending[key];
+      if (ex) {
+        // closing-line value: keep updating the market's implied price for our side as it moves
+        const cand = (g.bp?.board || []).find(c => c.side === ex.side && c.type === ex.type
+          && (ex.line == null || c.line === ex.line));
+        if (cand?.imp != null && Math.abs(cand.imp - (ex.closeImplied ?? ex.takenImplied)) > 1e-4) {
+          ex.closeImplied = cand.imp; changed = true;
+        }
+        return;
+      }
+      if (g.bp?.kind !== 'ev' || !g.bp.side) return;
+      const taken = 1 / (g.bp.b + 1);              // implied prob of the price we took
       db.pending[key] = { side: g.bp.side, b: g.bp.b, units: g.bp.units, p: g.bp.p ?? null,
-                          type: g.bp.betType, homeSpread: g.bp.homeSpread ?? null,
-                          line: g.bp.line ?? null,
-                          text: g.bp.text, why: g.why || [],   // for the loss post-mortem
-                          m: `${g.away.abbr} @ ${g.home.abbr}`, marketP: 1 / (g.bp.b + 1) };
+                          type: g.bp.betType, homeSpread: g.bp.homeSpread ?? null, line: g.bp.line ?? null,
+                          text: g.bp.text, why: g.why || [], m: `${g.away.abbr} @ ${g.home.abbr}`,
+                          marketP: taken, takenImplied: taken, closeImplied: taken };
       changed = true;
     });
     if (changed) save();
@@ -2031,6 +2048,8 @@ function renderBrain() {
     const betHit = st.bets ? Math.round(st.betsWon / st.bets * 100) : 0;
     const expHit = st.bets ? Math.round(st.betsExpWon / st.bets * 100) : 0;
     const roi = st.betsStaked ? st.pnl / st.betsStaked * 100 : 0;
+    const clvAvg = st.clvN ? st.clvSum / st.clvN * 100 : 0;
+    const clvBeat = st.clvN ? Math.round(st.clvBeat / st.clvN * 100) : 0;
     const itemT = (label, val, cls, tip) => `<span class="b-item" title="${esc(tip)}">${label} <b class="${cls}">${val}</b></span>`;
     items = item('results absorbed', st.absorbed)
       + itemT('model picks · straight-up', `${st.hits}–${st.misses} (${acc}%)`, st.hits >= st.misses ? 'good' : 'bad',
@@ -2040,6 +2059,8 @@ function renderBrain() {
           '⭐ +EV plays are often plus-money underdogs, so a hit% below the straight-up rate is normal and still profitable. "exp" is the rate the model expected — beating it means the edge is real.') : '')
       + (st.bets ? itemT('bet ROI', `${roi >= 0 ? '+' : ''}${roi.toFixed(1)}%`, roi >= 0 ? 'good' : 'bad',
           'Return on amount staked across all settled ⭐ bets — the number that actually matters.') : '')
+      + (st.clvN ? itemT('📈 CLV', `${clvAvg >= 0 ? '+' : ''}${clvAvg.toFixed(1)}% · beat close ${clvBeat}%`, clvAvg >= 0 ? 'good' : 'bad',
+          'Closing Line Value: how much the market moved toward our side between the pick and the game start (vs the last line seen). Positive CLV is the strongest sign the model is genuinely sharp — it means we consistently beat where the market closed, which predicts long-run profit better than win rate.') : '')
       + (st.bets ? item('P/L', `${st.pnl >= 0 ? '+' : ''}${st.pnl.toFixed(1)}u`, st.pnl >= 0 ? 'good' : 'bad') : '')
       + item('teams & players rated', st.tracked, 'gold')
       + (st.pendingN ? item('open tickets', st.pendingN) : '');
