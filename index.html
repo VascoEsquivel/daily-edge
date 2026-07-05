@@ -394,6 +394,11 @@
     padding: 9px 13px; font-size: 12.5px; line-height: 1.6; color: var(--text); margin-bottom: 6px; }
   .pm-tag { font-size: 11.5px; color: var(--text); padding: 2px 8px 8px; }
   .pm-tag .pm-res { color: var(--muted); font-family: 'JetBrains Mono', monospace; font-size: 10.5px; }
+  .mb-form { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0 4px; }
+  .mb-form input { background: rgba(0,0,0,.35); border: 1px solid var(--border); color: var(--text);
+    padding: 7px 11px; border-radius: 8px; font-family: inherit; font-size: 12px; flex: 1; min-width: 150px; outline: none; }
+  .mb-form input:focus { border-color: var(--accent2); }
+  .slip .s-actions .logbets { background: rgba(255,209,102,.12); border-color: rgba(255,209,102,.45); color: var(--gold); }
 
   /* ── Filter bar ── */
   .fbar {
@@ -557,6 +562,7 @@
   <div id="brainbar"></div>
   <div id="histpanel"></div>
   <div id="pmpanel"></div>
+  <div id="mybetspanel"></div>
   <div id="content"></div>
   <div id="slipbox"></div>
 
@@ -606,7 +612,7 @@ const state = {
   cache: new Map(),            // key: sportId|yyyymmdd -> { events, fetchedAt }
   liveTimer: null,
   openCards: new Set(),        // expanded bet boards, kept open across refreshes
-  showHistory: false, showPM: false,
+  showHistory: false, showPM: false, showMyBets: false,
   filter: 'all', sort: 'time', query: '',
   slip: [], slipOpen: false,
   lastEntries: new Map(), activeEntry: null,
@@ -1078,6 +1084,105 @@ const Open = (() => {
   };
 })();
 
+// ── My Bets: the user's REAL tickets (separate from the model's auto-ledger) ──
+// Game legs settle themselves off final scores; manual bets settle with a tap.
+const MyBets = (() => {
+  const KEY = 'de-mybets-v1';
+  let db;
+  try { db = JSON.parse(localStorage.getItem(KEY)) || { bets: [], seq: 1 }; } catch { db = { bets: [], seq: 1 }; }
+  const save = () => { try { localStorage.setItem(KEY, JSON.stringify(db)); } catch {} };
+
+  const legResult = (leg, g) => {
+    const hs = Number(g.home.score) || 0, as = Number(g.away.score) || 0;
+    if (leg.bt === 'spread') {
+      const d = hs - as + (leg.hs || 0);
+      return d === 0 ? 'push' : ((leg.side === 'home' ? d > 0 : d < 0) ? 'won' : 'lost');
+    }
+    if (leg.bt === 'total') {
+      const t = hs + as;
+      if (t === leg.line) return 'push';
+      return (leg.side === 'over' ? t > leg.line : t < leg.line) ? 'won' : 'lost';
+    }
+    if (leg.bt === 'ml') {
+      const hw = g.home.winner === true, aw = g.away.winner === true;
+      if (!hw && !aw) return 'push';
+      return (leg.side === 'home' ? hw : aw) ? 'won' : 'lost';
+    }
+    return null;
+  };
+
+  // a lost leg kills the ticket immediately; otherwise wait for every leg,
+  // pushes drop out of the payout (standard parlay rules)
+  function finalize(bet) {
+    if (bet.legs.some(l => l.res === 'lost')) { bet.status = 'lost'; bet.pnl = -bet.stake; }
+    else if (bet.legs.every(l => l.res)) {
+      const winners = bet.legs.filter(l => l.res === 'won');
+      if (!winners.length) { bet.status = 'push'; bet.pnl = 0; }
+      else {
+        const D = winners.reduce((d, l) => d * (1 + l.b), 1);
+        bet.status = 'won'; bet.pnl = +(bet.stake * (D - 1)).toFixed(2);
+      }
+    } else return false;
+    bet.settled = Date.now();
+    return true;
+  }
+
+  return {
+    add(legs, stake, asParlay) {
+      const mk = ls => ({ id: db.seq++, ts: Date.now(), stake, status: 'open', legs: ls });
+      if (asParlay && legs.length > 1) db.bets.unshift(mk(legs.map(l => ({ ...l }))));
+      else legs.forEach(l => db.bets.unshift(mk([{ ...l }])));
+      save();
+    },
+    addManual(text, american, stake) {
+      const b = american > 0 ? american / 100 : 100 / -american;
+      db.bets.unshift({ id: db.seq++, ts: Date.now(), stake, status: 'open',
+        legs: [{ t: `${text} ${fmtML(american)}`, b: +b.toFixed(3), m: '' }] });
+      save();
+    },
+    settleFromEvents(sport, events) {
+      let changed = false;
+      const finals = new Map(events.filter(g => g.state === 'post').map(g => [String(g.id), g]));
+      db.bets.forEach(bet => {
+        if (bet.status !== 'open') return;
+        bet.legs.forEach(l => {
+          if (l.res || l.k !== sport.id || !l.bt) return;
+          const g = finals.get(String(l.gid));
+          if (!g) return;
+          const r = legResult(l, g);
+          if (r) { l.res = r; changed = true; }
+        });
+        if (bet.legs.some(l => l.res)) { if (finalize(bet)) changed = true; }
+      });
+      if (changed) save();
+    },
+    resolve(id, status) {
+      const bet = db.bets.find(b => b.id === id);
+      if (!bet || bet.status !== 'open') return;
+      const D = bet.legs.reduce((d, l) => d * (1 + l.b), 1);
+      bet.status = status;
+      bet.pnl = status === 'won' ? +(bet.stake * (D - 1)).toFixed(2) : status === 'lost' ? -bet.stake : 0;
+      bet.settled = Date.now();
+      save();
+    },
+    remove(id) { db.bets = db.bets.filter(b => b.id !== id); save(); },
+    list: () => db.bets,
+    stats() {
+      const settled = db.bets.filter(b => b.status !== 'open').sort((a, b) => (a.settled || 0) - (b.settled || 0));
+      let pnl = 0, staked = 0, w = 0, l = 0;
+      const series = [];
+      settled.forEach(b => {
+        pnl += b.pnl || 0;
+        if (b.status !== 'push') staked += b.stake;
+        if (b.status === 'won') w++; else if (b.status === 'lost') l++;
+        series.push(+pnl.toFixed(2));
+      });
+      return { open: db.bets.filter(b => b.status === 'open').length, settled: settled.length,
+        w, l, pnl: +pnl.toFixed(2), staked, roi: staked ? pnl / staked * 100 : 0, series };
+    },
+  };
+})();
+
 // ATP + WTA rankings (top 150 each), fetched once per session: athleteId -> { rank, points }
 let rankingsPromise = null;
 function getRankings() {
@@ -1391,6 +1496,7 @@ async function fetchSport(sport, date, force = false) {
   Brain.processResults(sport, events);   // absorb any finals the brain hasn't seen
   Brain.recordPending(sport, events);    // log ⭐ picks at today's price for honest settling
   Open.record(sport, events);            // snapshot pregame odds/model for live movement tracking
+  MyBets.settleFromEvents(sport, events);// settle the user's real game bets off finals
   return entry;
 }
 
@@ -1781,8 +1887,10 @@ function fmtStake(units) {
   const bank = Number(localStorage.getItem('de-bank')) || 0;
   return units + 'u' + (bank ? ` · $${Math.max(1, Math.round(units * bank / 100))}` : '');
 }
-const legOf = (g, text, p, b) => ({ gid: g.id, t: text, p: +p.toFixed(3), b: +b.toFixed(3),
-  m: `${g.away.abbr} @ ${g.home.abbr}`, k: g.sportId, tm: timeOf(g.start) });
+const legOf = (g, text, p, b, meta) => ({ gid: g.id, t: text, p: +p.toFixed(3), b: +b.toFixed(3),
+  m: `${g.away.abbr} @ ${g.home.abbr}`, k: g.sportId, tm: timeOf(g.start),
+  // bet semantics so My Bets can auto-settle game legs against final scores
+  ...(meta ? { side: meta.side, bt: meta.type, line: meta.line ?? null, hs: meta.homeSpread ?? null } : {}) });
 
 function tierChip(p) {
   if (p >= 0.68) return '<span class="chip strong">🔒 STRONG</span>';
@@ -1827,7 +1935,7 @@ function bestPickStrip(g) {
   const ev = bp.kind === 'ev' ? `<span class="bp-ev">+${(bp.ev * 100).toFixed(1)}% EV</span>` : '';
   const units = bp.units ? `<span class="bp-units">${fmtStake(bp.units)}</span>` : '';
   const slipBtn = bp.kind === 'ev' && g.state === 'pre'
-    ? `<button class="addleg" data-leg="${esc(JSON.stringify(legOf(g, bp.text, bp.p, bp.b)))}">🎟️ + slip</button>` : '';
+    ? `<button class="addleg" data-leg="${esc(JSON.stringify(legOf(g, bp.text, bp.p, bp.b, { side: bp.side, type: bp.betType, line: bp.line, homeSpread: bp.homeSpread })))}">🎟️ + slip</button>` : '';
   return `<div class="bestpick ${bp.kind}">
     <span class="bp-tag">${icon} ${tag}</span>
     <span class="bp-main">${esc(bp.text)}</span>
@@ -1897,7 +2005,7 @@ function betBoard(g) {
       <span>mkt ${pct(c.imp)}</span>
       <span class="bo-ev ${c.ev >= 0 ? 'pos' : 'neg'}">${(c.ev * 100).toFixed(1)}%</span>
       <span>${c.units ? c.units + 'u' : 'pass'}</span>
-      <button class="addleg" data-leg="${esc(JSON.stringify(legOf(g, c.text, c.p, c.b)))}">+ slip</button>
+      <button class="addleg" data-leg="${esc(JSON.stringify(legOf(g, c.text, c.p, c.b, c)))}">+ slip</button>
     </div>`;
   }).join('');
   const fh = fmtML(probToAmerican(clamp(g.model.home))), fa = fmtML(probToAmerican(clamp(g.model.away)));
@@ -2111,18 +2219,61 @@ function renderBrain() {
       + item('teams & players rated', st.tracked, 'gold')
       + (st.pendingN ? item('open tickets', st.pendingN) : '');
   }
+  const mb = MyBets.stats();
+  if (mb.settled) {
+    items += `<span class="b-item" title="Your actual logged bets — separate from the model's auto-tracked ⭐ ledger. Log from the 🎟️ slip or the 🎯 my bets panel.">🎯 MY P/L <b class="${mb.pnl >= 0 ? 'good' : 'bad'}">${mb.pnl >= 0 ? '+' : ''}${mb.pnl.toFixed(1)}u (${mb.w}–${mb.l} · ROI ${mb.roi >= 0 ? '+' : ''}${mb.roi.toFixed(0)}%)</b></span>`
+      + lineSparkline(mb.series);
+  }
   $('#brainbar').innerHTML = `<div class="brain">
     <span class="b-title">🧠 MODEL BRAIN</span><span class="lvl">LVL ${lvl}</span>
     ${items}
     <span class="b-item" id="brainprog"></span>
     <button class="b-btn" id="histbtn">📜 ${state.showHistory ? 'hide' : 'history'}</button>
     <button class="b-btn" id="pmbtn" title="Why the losing ⭐ bets missed">🔍 ${state.showPM ? 'hide' : 'post-mortems'}${Brain.postmortems().length ? ' (' + Brain.postmortems().length + ')' : ''}</button>
+    <button class="b-btn" id="mybtn" title="Track the bets you actually place">🎯 ${state.showMyBets ? 'hide' : 'my bets'}${mb.open ? ' (' + mb.open + ' open)' : ''}</button>
     <button class="b-btn" id="exportbtn" title="Copy this trained brain to the clipboard">⬆ export</button>
     <button class="b-btn" id="importbtn" title="Paste a brain export from another device">⬇ import</button>
     <span class="b-note">studies the last ${BACKFILL_DAYS} days automatically · margin-weighted Elo · statcast + pythagorean priors</span>
   </div>`;
   renderHistory();
   renderPostmortems();
+  renderMyBets();
+}
+
+// 🎯 My Bets panel: log, view, settle, and audit your real tickets
+function renderMyBets() {
+  const el = $('#mybetspanel');
+  if (!state.showMyBets) { el.innerHTML = ''; return; }
+  const bets = MyBets.list(), mb = MyBets.stats();
+  const row = b => {
+    const legs = b.legs.map(l => `${esc(l.t)}${l.res ? ` <span class="${l.res === 'won' ? 'ok' : l.res === 'lost' ? 'bad' : 'h-pick'}">[${l.res}]</span>` : ''}`).join(' + ');
+    const meta = `${b.stake}u${b.legs.length > 1 ? ' · ' + b.legs.length + '-leg parlay' : ''}${b.legs[0].m ? ' · ' + esc(b.legs[0].m) : ''}`;
+    const auto = b.legs.every(l => l.bt);
+    const act = b.status === 'open'
+      ? (auto ? '<span class="h-pick">auto-settles at final</span>'
+          : `<button class="b-btn mb-res" data-bid="${b.id}" data-st="won">✓ won</button><button class="b-btn mb-res" data-bid="${b.id}" data-st="lost">✗ lost</button><button class="b-btn mb-res" data-bid="${b.id}" data-st="push">push</button>`)
+      : `<span class="${b.status === 'won' ? 'ok' : b.status === 'lost' ? 'bad' : 'h-pick'}">${b.status.toUpperCase()} ${b.pnl > 0 ? '+' : ''}${(b.pnl ?? 0).toFixed(2)}u</span>`;
+    return `<div class="h-row"><span class="h-match">${legs}</span><span class="h-pick">${meta}</span>${act}<button class="rmleg mb-del" data-bid="${b.id}" title="delete">✕</button></div>`;
+  };
+  const open = bets.filter(b => b.status === 'open'), done = bets.filter(b => b.status !== 'open');
+  el.innerHTML = `<div class="hist">
+    <div class="h-date">🎯 MY BETS — your real tickets</div>
+    <div class="bo-fair">Two ways to log: build the 🎟️ slip anywhere in the app and hit "🎯 I bet this" (multi-leg slips log as one parlay ticket), or add anything manually below (Kalshi props, esports, whatever). Game bets settle themselves off final scores; manual ones you settle with a tap. This record is YOUR P/L — separate from the model's ⭐ ledger.</div>
+    <div class="mb-form">
+      <input id="mb-text" placeholder="manual bet (e.g. Wilson o21.5 pts on Kalshi)">
+      <input id="mb-odds" type="text" placeholder="+100 / -120" style="max-width:100px;flex:0 1 auto">
+      <input id="mb-stake" type="number" step="0.5" min="0.5" placeholder="stake u" style="max-width:90px;flex:0 1 auto">
+      <button class="b-btn" id="mb-add">+ log it</button>
+    </div>
+    ${mb.settled ? (() => {
+      const bank = Number(localStorage.getItem('de-bank')) || 0;
+      const dollars = bank ? ` (${mb.pnl >= 0 ? '+' : '-'}$${Math.abs(Math.round(mb.pnl * bank / 100))})` : '';
+      return `<div class="h-date" style="margin-top:10px">RECORD ${mb.w}–${mb.l} · P/L ${mb.pnl >= 0 ? '+' : ''}${mb.pnl.toFixed(2)}u${dollars} · ROI ${mb.roi >= 0 ? '+' : ''}${mb.roi.toFixed(1)}% ${lineSparkline(mb.series)}</div>`;
+    })() : ''}
+    ${open.length ? `<div class="h-date" style="margin-top:8px">OPEN (${open.length})</div>` + open.map(row).join('') : ''}
+    ${done.length ? `<div class="h-date" style="margin-top:8px">SETTLED</div>` + done.slice(0, 40).map(row).join('') : ''}
+    ${!bets.length ? '<div class="h-empty">No bets logged yet — build a slip and hit "🎯 I bet this", or log one manually above.</div>' : ''}
+  </div>`;
 }
 
 // 🔍 Loss post-mortems: per-bet analysis of why ⭐ picks missed, plus the pattern across them
@@ -2236,6 +2387,7 @@ function parlayCandidates(allEvents) {
     if (!sides.length) return null;
     const best = sides.reduce((a, b) => b.p > a.p ? b : a);   // side the model favors
     return { gid: g.id, t: best.text, p: best.p, b: best.b, ev: best.ev,
+             side: best.side, bt: best.type, line: best.line ?? null, hs: best.homeSpread ?? null,
              m: `${g.away.abbr} @ ${g.home.abbr}`, k: g.sportId, tm: timeOf(g.start) };
   }).filter(Boolean);
   return games;   // props join parlays via the slip (user-vetted), not auto-injected here
@@ -2480,7 +2632,7 @@ function renderSlip() {
   box.innerHTML = `<div class="slip">
     <div class="s-head" id="sliphead">🎟️ BET SLIP · ${n}<span class="x">— minimize</span></div>
     ${legs}${math}
-    <div class="s-actions"><button class="copyslip">📋 copy</button><button class="clearslip">clear</button></div>
+    <div class="s-actions"><button class="logbets">🎯 I bet this</button><button class="copyslip">📋 copy</button><button class="clearslip">clear</button></div>
   </div>`;
 }
 
@@ -2864,6 +3016,7 @@ $('#content').addEventListener('input', e => {
 $('#brainbar').addEventListener('click', e => {
   if (e.target.closest('#histbtn')) { state.showHistory = !state.showHistory; renderBrain(); return; }
   if (e.target.closest('#pmbtn')) { state.showPM = !state.showPM; renderBrain(); return; }
+  if (e.target.closest('#mybtn')) { state.showMyBets = !state.showMyBets; renderBrain(); return; }
   if (e.target.closest('#exportbtn')) {
     navigator.clipboard?.writeText(Brain.exportDb());
     const b = e.target.closest('#exportbtn');
@@ -2886,6 +3039,21 @@ $('#slipbox').addEventListener('click', e => {
     saveSlip(); renderSlip(); return;
   }
   if (e.target.closest('.clearslip')) { state.slip = []; saveSlip(); renderSlip(); return; }
+  if (e.target.closest('.logbets')) {
+    if (!state.slip.length) return;
+    const isParlay = state.slip.length > 1;
+    const v = prompt(isParlay
+      ? `Stake in units on this ${state.slip.length}-leg PARLAY (one ticket, 1u = 1% bankroll):`
+      : 'Stake in units (1u = 1% bankroll):', '1');
+    if (v === null) return;
+    const stake = Number(v);
+    if (!(stake > 0)) { alert('Enter a stake above 0.'); return; }
+    MyBets.add(state.slip, stake, isParlay);
+    const b = e.target.closest('.logbets');
+    b.textContent = '✓ logged'; setTimeout(renderSlip, 1200);
+    state.showMyBets = true; renderBrain();
+    return;
+  }
   if (e.target.closest('.copyslip')) {
     const { D, P } = slipMath();
     const txt = `🎟️ DAILY EDGE — ${fmtDate(state.date)}\n`
@@ -2897,6 +3065,25 @@ $('#slipbox').addEventListener('click', e => {
     return;
   }
   if (e.target.closest('#sliphead')) { state.slipOpen = false; renderSlip(); }
+});
+
+// 🎯 My Bets panel: settle, delete, manual add
+$('#mybetspanel').addEventListener('click', e => {
+  const res = e.target.closest('.mb-res');
+  if (res) { MyBets.resolve(Number(res.dataset.bid), res.dataset.st); renderBrain(); return; }
+  const del = e.target.closest('.mb-del');
+  if (del) { MyBets.remove(Number(del.dataset.bid)); renderBrain(); return; }
+  if (e.target.closest('#mb-add')) {
+    const text = $('#mb-text')?.value.trim();
+    const odds = Number($('#mb-odds')?.value);
+    const stake = Number($('#mb-stake')?.value);
+    if (!text || !odds || Math.abs(odds) < 100 || !(stake > 0)) {
+      alert('Need a description, American odds (e.g. -120 or +100), and a stake above 0.');
+      return;
+    }
+    MyBets.addManual(text, odds, stake);
+    renderBrain();
+  }
 });
 
 // keyboard: ←/→ dates · t today · r refresh · 1-9 tabs (1 = The Card)
