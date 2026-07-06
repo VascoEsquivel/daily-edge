@@ -302,6 +302,8 @@
   .bestpick.model .bp-tag { background: #a78bfa; color: #16102b; }
   .bestpick.pass { background: rgba(132,148,184,.05); border: 1px dashed rgba(132,148,184,.35); }
   .bestpick.pass .bp-tag { background: rgba(132,148,184,.25); color: var(--text); }
+  .bestpick.lost { background: rgba(255,77,109,.06); border: 1px solid rgba(255,77,109,.4); }
+  .bestpick.lost .bp-tag { background: var(--hot); color: #2b0a12; }
   .bestpick .bp-main { font-weight: 800; font-size: 13.5px; }
   .bestpick .bp-ev { font-family: 'JetBrains Mono', monospace; font-weight: 700; color: var(--accent); text-shadow: 0 0 12px rgba(0,255,136,.4); }
   .bestpick .bp-units {
@@ -587,7 +589,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v9.0';   // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v9.1';   // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -951,6 +953,7 @@ const Brain = (() => {
     }
     // full pick record: fuels the bankroll sparkline AND the ⭐ pick ledger display
     db.stats.betlog.push({ c: +db.stats.pnl.toFixed(2), w: !!won,
+      gid: String(g.id), k: key.split('|')[0],
       d: ymd(g.start), t: bet.text || `${bet.side} ${bet.type}`, m: bet.m || '',
       u: bet.units, b: bet.b, p: bet.p ?? null,
       pnl: +(won ? bet.units * bet.b : -bet.units).toFixed(2),
@@ -1051,6 +1054,8 @@ const Brain = (() => {
   return { adjust, processResults, recordPending, stats, history: () => db.log,
     postmortems: () => db.postmortems,
     totalsBias: sportId => db.totalsBias[sportId] || null,
+    pendingFor: (sportId, gid) => db.pending[sportId + '|' + gid] || null,
+    settledFor: (sportId, gid) => db.stats.betlog.find(x => x.gid === String(gid) && x.k === sportId) || null,
     rating: (sportId, t) => db.elo[sportId]?.[t.flagLogo ? t.name : t.abbr] || null,
     through: () => db.through,
     setThrough: y => { db.through = y; save(); },
@@ -2028,6 +2033,27 @@ function betBoard(g) {
   </div>`;
 }
 
+// ⭐ pick strip for every game state: pregame = live best pick; live/final = the
+// ticket the brain actually logged pregame (honest — never recomputed after the fact)
+function suggestedStrip(g) {
+  if (g.state === 'pre') return bestPickStrip(g);
+  const pend = Brain.pendingFor(g.sportId, g.id);
+  if (pend?.text) {
+    return `<div class="bestpick ev"><span class="bp-tag">⭐ SUGGESTED</span>
+      <span class="bp-main">${esc(pend.text)}</span><span class="bp-units">${fmtStake(pend.units)}</span>
+      <span class="bp-sub">logged pregame${pend.p != null ? ' · model ' + Math.round(pend.p * 100) + '%' : ''} · settles at final</span></div>`;
+  }
+  const done = Brain.settledFor(g.sportId, g.id);
+  if (done) {
+    return `<div class="bestpick ${done.w ? 'ev' : 'lost'}">
+      <span class="bp-tag">⭐ SUGGESTED — ${done.w ? 'WON' : 'LOST'}</span>
+      <span class="bp-main">${esc(done.t)}</span>
+      <span class="bp-ev"${done.w ? '' : ' style="color:var(--hot);text-shadow:none"'}>${done.pnl >= 0 ? '+' : ''}${(done.pnl ?? 0).toFixed(2)}u</span>
+      <span class="bp-sub">${done.u}u${done.p != null ? ' · model ' + Math.round(done.p * 100) + '%' : ''}</span></div>`;
+  }
+  return '';   // no ⭐ bet was suggested pregame (or the game was never seen pregame)
+}
+
 function teamRow(t, g, side) {
   const isWinner = g.state === 'post' && t.winner;
   const isPicked = g.pick === side && g.state !== 'post';
@@ -2101,7 +2127,7 @@ function gameCard(g, i, sport) {
     ${probLabels(g, lp)}
     ${liveLine}
     <div class="g-verdict">${verdict}${vegasStr}</div>
-    ${bestPickStrip(g)}
+    ${suggestedStrip(g)}
     ${hint}
     ${panel}
   </div>`;
