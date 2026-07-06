@@ -589,7 +589,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v9.2';   // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v9.3';   // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -2305,6 +2305,16 @@ function renderBrain() {
       + item('teams & players rated', st.tracked, 'gold')
       + (st.pendingN ? item('open tickets', st.pendingN) : '');
   }
+  // tilt guard: flag a real drawdown so cold stretches get smaller stakes, not chases
+  {
+    const series = (st.betlog || []).map(x => x.c);
+    if (series.length >= 10) {
+      const dd = Math.max(0, ...series) - series[series.length - 1];
+      if (dd >= 8) {
+        items += `<span class="b-item" title="The pick ledger is ${dd.toFixed(1)}u below its peak. Cold stretches are normal — the discipline that survives them is smaller stakes, never bigger ones. Consider half units until the line turns.">⚠️ <b class="bad">drawdown −${dd.toFixed(1)}u — half stakes advised</b></span>`;
+      }
+    }
+  }
   const mb = MyBets.stats();
   if (mb.settled) {
     items += `<span class="b-item" title="Your actual logged bets — separate from the model's auto-tracked ⭐ ledger. Log from the 🎟️ slip or the 🎯 my bets panel.">🎯 MY P/L <b class="${mb.pnl >= 0 ? 'good' : 'bad'}">${mb.pnl >= 0 ? '+' : ''}${mb.pnl.toFixed(1)}u (${mb.w}–${mb.l} · ROI ${mb.roi >= 0 ? '+' : ''}${mb.roi.toFixed(0)}%)</b></span>`
@@ -2588,10 +2598,14 @@ function renderCard(allEvents) {
   const live = allEvents.filter(g => g.state === 'in');
   const locks = allEvents.filter(g => g.state === 'pre' && g.bp?.kind !== 'ev' && g.pick !== 'draw' && g.pickProb >= 0.62)
     .sort((a, b) => b.pickProb - a.pickProb).slice(0, 6);
+  // picks never leave the Card: upcoming → live → settled receipts
+  const settled = allEvents.filter(g => g.state === 'post' && Brain.settledFor(g.sportId, g.id))
+    .sort((a, b) => b.start - a.start);
   const sec = (title, arr) => arr.length
     ? `<div class="section-h">${title}</div><div class="games" style="margin-bottom:24px">${arr.map((g, i) => gameCard(g, i, bySport[g.sportId])).join('')}</div>` : '';
   const body = sec('💰 +EV plays — every sport, ranked', evs)
     + sec('● Live right now', live)
+    + sec('⭐ Settled — the day\'s receipts', settled)
     + sec('🔒 Confidence board — big favorites, no priced edge', locks);
   $('#content').innerHTML = summaryBar(allEvents)
     + `<div id="pgen-wrap">${parlaySection()}</div>`
