@@ -589,7 +589,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v9.1';   // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v9.2';   // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -953,7 +953,7 @@ const Brain = (() => {
     }
     // full pick record: fuels the bankroll sparkline AND the ⭐ pick ledger display
     db.stats.betlog.push({ c: +db.stats.pnl.toFixed(2), w: !!won,
-      gid: String(g.id), k: key.split('|')[0],
+      gid: String(g.id), k: key.split('|')[0], rec: bet.rec || undefined,
       d: ymd(g.start), t: bet.text || `${bet.side} ${bet.type}`, m: bet.m || '',
       u: bet.units, b: bet.b, p: bet.p ?? null,
       pnl: +(won ? bet.units * bet.b : -bet.units).toFixed(2),
@@ -1056,6 +1056,15 @@ const Brain = (() => {
     totalsBias: sportId => db.totalsBias[sportId] || null,
     pendingFor: (sportId, gid) => db.pending[sportId + '|' + gid] || null,
     settledFor: (sportId, gid) => db.stats.betlog.find(x => x.gid === String(gid) && x.k === sportId) || null,
+    // grade a game from its retained closing line: log the would-be ticket, and
+    // settle immediately if the game is already final (live ones settle at final)
+    reconstruct(sport, g, bet) {
+      const key = sport.id + '|' + g.id;
+      if (db.pending[key] || db.stats.betlog.some(x => x.gid === String(g.id) && x.k === sport.id)) return;
+      db.pending[key] = bet;
+      if (g.state === 'post') settle(key, g, g.home.winner ? 1 : g.away.winner ? 0 : 0.5);
+      save();
+    },
     rating: (sportId, t) => db.elo[sportId]?.[t.flagLogo ? t.name : t.abbr] || null,
     through: () => db.through,
     setThrough: y => { db.through = y; save(); },
@@ -1455,6 +1464,34 @@ function fetchGameProps(sport, ev) {
   return p;
 }
 
+// ── Pick reconstruction: grade games nobody saw pregame ─────────────────
+// The site scoreboard strips odds from finals, but the core odds API keeps
+// the closing lines forever — so recent finished/live games can still be
+// graded and settled, no pregame visit required.
+const RECON_WINDOW_MS = 3 * 864e5;   // reconstruct today + the last ~2 days
+const coreOddsCache = new Map();
+function getCoreOdds(sport, id) {
+  const key = sport.id + '|' + id;
+  if (!coreOddsCache.has(key)) {
+    coreOddsCache.set(key, fetch(`${CORE_API}/${coreBase(sport)}/events/${id}/competitions/${id}/odds`)
+      .then(r => r.json()).then(j => j.items?.[0] || null).catch(() => null));
+  }
+  return coreOddsCache.get(key);
+}
+
+function reconstructPicks(sport, events) {
+  events.forEach(g => {
+    if (g.state === 'pre' || !g.vegas) return;
+    if (Brain.pendingFor(sport.id, g.id) || Brain.settledFor(sport.id, g.id)) return;
+    const bp = computeBestPick({ ...g, state: 'pre' }, sport);   // what the pick would have been
+    if (bp?.kind !== 'ev' || !bp.side) return;
+    Brain.reconstruct(sport, g, { side: bp.side, b: bp.b, units: bp.units, p: bp.p ?? null,
+      type: bp.betType, homeSpread: bp.homeSpread ?? null, line: bp.line ?? null,
+      text: bp.text, why: g.why || [], m: `${g.away.abbr} @ ${g.home.abbr}`,
+      marketP: 1 / (bp.b + 1), rec: true });
+  });
+}
+
 // totals: stdev of combined final score, for Over/Under probability
 const TOTAL_SIGMA = { mlb: 4.6, wnba: 17, nba: 19, nfl: 13.5, nhl: 2.2 };
 // back-to-back fatigue (logit penalty) — biggest in basketball, real in hockey
@@ -1500,8 +1537,22 @@ async function fetchSport(sport, date, force = false) {
     ]);
     if (!res.ok) throw new Error('ESPN API responded ' + res.status);
     const json = await res.json();
+    // recent finished/live games with stripped odds: re-inject the retained
+    // closing line from the core API so they can still be graded
+    const recent = Date.now() - date.getTime() < RECON_WINDOW_MS;
+    if (recent && !sport.soccer) {
+      await Promise.allSettled((json.events || []).map(async ev => {
+        const comp = ev.competitions?.[0];
+        const st = ev.status?.type?.state;
+        if (!comp || comp.odds?.length || (st !== 'post' && st !== 'in')) return;
+        if (Brain.settledFor(sport.id, ev.id) || Brain.pendingFor(sport.id, ev.id)) return;
+        const o = await getCoreOdds(sport, ev.id);
+        if (o) comp.odds = [o];
+      }));
+    }
     const winds = sport.id === 'mlb' ? await getWinds(json) : null;
     events = parseEvents(json, sport, injuries, quality, savant, bullpen, winds);
+    if (recent && !sport.soccer) reconstructPicks(sport, events);
   }
   events.forEach(g => { g.sportId = sport.id; });
   const entry = { events, fetchedAt: Date.now() };
@@ -2041,7 +2092,7 @@ function suggestedStrip(g) {
   if (pend?.text) {
     return `<div class="bestpick ev"><span class="bp-tag">⭐ SUGGESTED</span>
       <span class="bp-main">${esc(pend.text)}</span><span class="bp-units">${fmtStake(pend.units)}</span>
-      <span class="bp-sub">logged pregame${pend.p != null ? ' · model ' + Math.round(pend.p * 100) + '%' : ''} · settles at final</span></div>`;
+      <span class="bp-sub">${pend.rec ? 'from the closing line' : 'logged pregame'}${pend.p != null ? ' · model ' + Math.round(pend.p * 100) + '%' : ''} · settles at final</span></div>`;
   }
   const done = Brain.settledFor(g.sportId, g.id);
   if (done) {
@@ -2049,7 +2100,7 @@ function suggestedStrip(g) {
       <span class="bp-tag">⭐ SUGGESTED — ${done.w ? 'WON' : 'LOST'}</span>
       <span class="bp-main">${esc(done.t)}</span>
       <span class="bp-ev"${done.w ? '' : ' style="color:var(--hot);text-shadow:none"'}>${done.pnl >= 0 ? '+' : ''}${(done.pnl ?? 0).toFixed(2)}u</span>
-      <span class="bp-sub">${done.u}u${done.p != null ? ' · model ' + Math.round(done.p * 100) + '%' : ''}</span></div>`;
+      <span class="bp-sub">${done.u}u${done.p != null ? ' · model ' + Math.round(done.p * 100) + '%' : ''}${done.rec ? ' · closing line' : ''}</span></div>`;
   }
   return '';   // no ⭐ bet was suggested pregame (or the game was never seen pregame)
 }
@@ -2305,7 +2356,7 @@ function renderPickLedger() {
       rows += `<div class="h-date" style="margin-top:8px">${ds.slice(0, 4)}-${ds.slice(4, 6)}-${ds.slice(6)}</div>`;
     }
     rows += `<div class="h-row"><span class="h-match">${esc(x.t)}</span>
-      <span class="h-pick">${esc(x.m)}${x.res ? ' · ' + esc(x.res) : ''} · ${x.u}u${x.p != null ? ' · model ' + Math.round(x.p * 100) + '%' : ''}</span>
+      <span class="h-pick">${esc(x.m)}${x.res ? ' · ' + esc(x.res) : ''} · ${x.u}u${x.p != null ? ' · model ' + Math.round(x.p * 100) + '%' : ''}${x.rec ? ' · CL' : ''}</span>
       <span class="${x.w ? 'ok' : 'bad'}">${x.w ? 'WON +' + x.pnl.toFixed(2) : 'LOST ' + x.pnl.toFixed(2)}u</span></div>`;
   });
   el.innerHTML = `<div class="hist">${head}${summary}${rows}</div>`;
@@ -2628,8 +2679,13 @@ async function absorbYesterday() {
     await Promise.allSettled(chunk.flatMap(d => SPORTS.map(s => fetchSport(s, d))));
     Brain.setThrough(ymd(chunk[chunk.length - 1]));
   }
-  if (days.length) renderBrain();
-  else { const el = $('#brainprog'); if (el) el.textContent = ''; }
+  // settlement sweep: always revisit yesterday once per session, so open tickets
+  // and reconstructed closing-line picks settle even when the learning backfill
+  // already covered that day
+  const y = new Date(today); y.setDate(y.getDate() - 1);
+  await Promise.allSettled(SPORTS.map(s => fetchSport(s, y)));
+  renderBrain();
+  const el = $('#brainprog'); if (el) el.textContent = '';
 }
 
 function scheduleLivePoll(events) {
