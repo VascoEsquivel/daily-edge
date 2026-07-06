@@ -562,6 +562,7 @@
   <div id="brainbar"></div>
   <div id="histpanel"></div>
   <div id="pmpanel"></div>
+  <div id="ledgerpanel"></div>
   <div id="mybetspanel"></div>
   <div id="content"></div>
   <div id="slipbox"></div>
@@ -585,6 +586,8 @@
 
 <script>
 'use strict';
+
+const APP_VERSION = 'v9.0';   // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -612,7 +615,7 @@ const state = {
   cache: new Map(),            // key: sportId|yyyymmdd -> { events, fetchedAt }
   liveTimer: null,
   openCards: new Set(),        // expanded bet boards, kept open across refreshes
-  showHistory: false, showPM: false, showMyBets: false,
+  showHistory: false, showPM: false, showMyBets: false, showLedger: false,
   filter: 'all', sort: 'time', query: '',
   slip: [], slipOpen: false,
   lastEntries: new Map(), activeEntry: null,
@@ -946,7 +949,12 @@ const Brain = (() => {
         cat: a.cat, tag: a.tag, result: a.resultStr, why: bet.why || [] });
       if (db.postmortems.length > 120) db.postmortems.length = 120;
     }
-    db.stats.betlog.push({ c: +db.stats.pnl.toFixed(2), w: !!won });   // bankroll trajectory
+    // full pick record: fuels the bankroll sparkline AND the ⭐ pick ledger display
+    db.stats.betlog.push({ c: +db.stats.pnl.toFixed(2), w: !!won,
+      d: ymd(g.start), t: bet.text || `${bet.side} ${bet.type}`, m: bet.m || '',
+      u: bet.units, b: bet.b, p: bet.p ?? null,
+      pnl: +(won ? bet.units * bet.b : -bet.units).toFixed(2),
+      res: `${g.away.abbr} ${g.away.score ?? ''}–${g.home.score ?? ''} ${g.home.abbr}` });
     if (db.stats.betlog.length > 250) db.stats.betlog.shift();
   }
 
@@ -2209,7 +2217,8 @@ function renderBrain() {
       + (st.clvN ? itemT('📈 CLV', `${clvAvg >= 0 ? '+' : ''}${clvAvg.toFixed(1)}% · beat close ${clvBeat}%`, clvAvg >= 0 ? 'good' : 'bad',
           'Closing Line Value: how much the market moved toward our side between the pick and the game start (vs the last line seen). Positive CLV is the strongest sign the model is genuinely sharp — it means we consistently beat where the market closed, which predicts long-run profit better than win rate.') : '')
       + (st.bets ? item('P/L', `${st.pnl >= 0 ? '+' : ''}${st.pnl.toFixed(1)}u`, st.pnl >= 0 ? 'good' : 'bad')
-          + lineSparkline((st.betlog || []).map(x => x.c)) : '')
+          + lineSparkline((st.betlog || []).map(x => x.c))
+        : st.pendingN ? `<span class="b-item" title="The P/L number and its graph appear here after the first ⭐ picks settle — every suggested pick is tailed automatically, bet or not.">P/L <b>graph appears once tonight's ${st.pendingN} open picks settle</b></span>` : '')
       + (st.betlog && st.betlog.length >= 3 ? (() => {
           const l10 = st.betlog.slice(-10); const w10 = l10.filter(x => x.w).length;
           const seq = l10.map(x => x.w ? 'W' : 'L').join('');
@@ -2229,6 +2238,7 @@ function renderBrain() {
     ${items}
     <span class="b-item" id="brainprog"></span>
     <button class="b-btn" id="histbtn">📜 ${state.showHistory ? 'hide' : 'history'}</button>
+    <button class="b-btn" id="ledgerbtn" title="Every ⭐ suggested pick with its result — the tail-everything record">⭐ ${state.showLedger ? 'hide' : 'pick ledger'}</button>
     <button class="b-btn" id="pmbtn" title="Why the losing ⭐ bets missed">🔍 ${state.showPM ? 'hide' : 'post-mortems'}${Brain.postmortems().length ? ' (' + Brain.postmortems().length + ')' : ''}</button>
     <button class="b-btn" id="mybtn" title="Track the bets you actually place">🎯 ${state.showMyBets ? 'hide' : 'my bets'}${mb.open ? ' (' + mb.open + ' open)' : ''}</button>
     <button class="b-btn" id="exportbtn" title="Copy this trained brain to the clipboard">⬆ export</button>
@@ -2238,6 +2248,41 @@ function renderBrain() {
   renderHistory();
   renderPostmortems();
   renderMyBets();
+  renderPickLedger();
+}
+
+// ⭐ Pick Ledger: EVERY suggested pick with its result — the tail-everything record.
+// Answers: what would blindly following the model have returned?
+function renderPickLedger() {
+  const el = $('#ledgerpanel');
+  if (!state.showLedger) { el.innerHTML = ''; return; }
+  const st = Brain.stats();
+  const log = (st.betlog || []).filter(x => x.t).slice().reverse();   // newest first, full records only
+  const head = `<div class="h-date">⭐ PICK LEDGER — every suggested pick, tailed automatically (bet or not)</div>
+    <div class="bo-fair">This is the record of blindly following every ⭐ +EV pick at the suggested stake. Your own bets live separately in 🎯 my bets — compare the two to see if your filter beats the machine.${st.pendingN ? ` <b>${st.pendingN} picks open now</b>, they settle at final.` : ''}</div>`;
+  if (!log.length) {
+    el.innerHTML = `<div class="hist">${head}<div class="h-empty">No settled picks on display yet — the ledger fills as games finish (aggregate stats since earlier resets live in the brain bar).</div></div>`;
+    return;
+  }
+  const w = log.filter(x => x.w).length, l = log.length - w;
+  const staked = log.reduce((s, x) => s + (x.u || 0), 0);
+  const pnl = log.reduce((s, x) => s + (x.pnl || 0), 0);
+  const roi = staked ? pnl / staked * 100 : 0;
+  const bank = Number(localStorage.getItem('de-bank')) || 0;
+  const dollars = bank ? ` (${pnl >= 0 ? '+' : '-'}$${Math.abs(Math.round(pnl * bank / 100))})` : '';
+  const summary = `<div class="h-date" style="margin-top:10px">TAIL-EVERYTHING: ${w}–${l} (${Math.round(w / log.length * 100)}%) · staked ${staked.toFixed(1)}u · P/L ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}u${dollars} · ROI ${roi >= 0 ? '+' : ''}${roi.toFixed(1)}% ${lineSparkline(log.slice().reverse().map(x => x.c))}</div>`;
+  let lastDate = null, rows = '';
+  log.slice(0, 80).forEach(x => {
+    if (x.d !== lastDate) {
+      lastDate = x.d;
+      const ds = String(x.d);
+      rows += `<div class="h-date" style="margin-top:8px">${ds.slice(0, 4)}-${ds.slice(4, 6)}-${ds.slice(6)}</div>`;
+    }
+    rows += `<div class="h-row"><span class="h-match">${esc(x.t)}</span>
+      <span class="h-pick">${esc(x.m)}${x.res ? ' · ' + esc(x.res) : ''} · ${x.u}u${x.p != null ? ' · model ' + Math.round(x.p * 100) + '%' : ''}</span>
+      <span class="${x.w ? 'ok' : 'bad'}">${x.w ? 'WON +' + x.pnl.toFixed(2) : 'LOST ' + x.pnl.toFixed(2)}u</span></div>`;
+  });
+  el.innerHTML = `<div class="hist">${head}${summary}${rows}</div>`;
 }
 
 // 🎯 My Bets panel: log, view, settle, and audit your real tickets
@@ -3016,6 +3061,7 @@ $('#content').addEventListener('input', e => {
 $('#brainbar').addEventListener('click', e => {
   if (e.target.closest('#histbtn')) { state.showHistory = !state.showHistory; renderBrain(); return; }
   if (e.target.closest('#pmbtn')) { state.showPM = !state.showPM; renderBrain(); return; }
+  if (e.target.closest('#ledgerbtn')) { state.showLedger = !state.showLedger; renderBrain(); return; }
   if (e.target.closest('#mybtn')) { state.showMyBets = !state.showMyBets; renderBrain(); return; }
   if (e.target.closest('#exportbtn')) {
     navigator.clipboard?.writeText(Brain.exportDb());
@@ -3100,6 +3146,7 @@ document.addEventListener('keydown', e => {
   }
 });
 
+document.querySelector('.logo .sub').textContent += ' · ' + APP_VERSION;
 renderSlip();
 refresh();
 </script>
