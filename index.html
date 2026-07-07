@@ -589,7 +589,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v9.7';   // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v9.8';   // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -876,15 +876,17 @@ const Brain = (() => {
     return db.elo[sport][key] = db.elo[sport][key] || { r: 1500, n: 0 };
   };
   const getCalib = sport => db.calib[sport] = db.calib[sport] || { a: 0, b: 1, n: 0 };
-  const eloProb = (sport, kH, kA, hfaLogit) => {
+  const eloProb = (sport, kH, kA, hfaLogit, surf = null) => {
     const eH = getElo(sport, kH), eA = getElo(sport, kA);
-    return { p: invlogit((eH.r - eA.r) * Math.LN10 / 400 + hfaLogit), eH, eA };
+    // tennis: per-surface skill deltas (clay-courters vs grass specialists) ride on top
+    const sd = surf ? ((eH.s?.[surf] || 0) - (eA.s?.[surf] || 0)) : 0;
+    return { p: invlogit((eH.r - eA.r + sd) * Math.LN10 / 400 + hfaLogit), eH, eA };
   };
   const teamKey = t => t.flagLogo ? t.name : t.abbr;
 
   // blend prior with Elo, then run through the calibration layer
-  function adjust(sport, home, away, pRaw, hfaLogit, maxW = 0.65, calibrate = true) {
-    const { p: pElo, eH, eA } = eloProb(sport, teamKey(home), teamKey(away), hfaLogit);
+  function adjust(sport, home, away, pRaw, hfaLogit, maxW = 0.65, calibrate = true, surf = null) {
+    const { p: pElo, eH, eA } = eloProb(sport, teamKey(home), teamKey(away), hfaLogit, surf);
     const nMin = Math.min(eH.n, eA.n);
     const w = Math.min(maxW, nMin / (nMin + 12));
     let x = (1 - w) * logit(clamp(pRaw)) + w * logit(clamp(pElo));
@@ -892,8 +894,8 @@ const Brain = (() => {
     return clamp(invlogit(x));
   }
 
-  function learn(sport, kH, kA, hfaLogit, scoreH, mov = 1, day = null) {
-    const { p: pElo, eH, eA } = eloProb(sport, kH, kA, hfaLogit);
+  function learn(sport, kH, kA, hfaLogit, scoreH, mov = 1, day = null, surf = null) {
+    const { p: pElo, eH, eA } = eloProb(sport, kH, kA, hfaLogit, surf);
     // margin-of-victory multiplier (538-style: blowouts teach more, garbage-time
     // wins by heavy favorites teach less) + faster learning for barely-seen teams
     const movM = mov > 0 ? Math.log(mov + 1) * 2.2 / (Math.abs(eH.r - eA.r) * 0.001 + 2.2) : 1;
@@ -906,6 +908,13 @@ const Brain = (() => {
     (eH.hist = eH.hist || []).push(hMargin); if (eH.hist.length > 10) eH.hist.shift();
     (eA.hist = eA.hist || []).push(-hMargin); if (eA.hist.length > 10) eA.hist.shift();
     if (day) { eH.last = Math.max(eH.last || 0, day); eA.last = Math.max(eA.last || 0, day); }
+    // surface-specific deltas learn at half speed, capped so one upset can't define a player
+    if (surf) {
+      const capped = v => Math.max(-200, Math.min(200, v));
+      eH.s = eH.s || {}; eA.s = eA.s || {};
+      eH.s[surf] = capped((eH.s[surf] || 0) + 0.5 * k * (scoreH - pElo));
+      eA.s[surf] = capped((eA.s[surf] || 0) - 0.5 * k * (scoreH - pElo));
+    }
     if (scoreH !== 0.5) {
       const c = getCalib(sport);
       const x = logit(clamp(pElo));
@@ -995,7 +1004,7 @@ const Brain = (() => {
       if (g.tennis) { const [th, ta] = setsTally(g.home.sets, g.away.sets); mov = Math.abs(th - ta); }
       else mov = Math.abs((Number(g.home.score) || 0) - (Number(g.away.score) || 0));
       learn(sport.id, teamKey(g.home), teamKey(g.away), hfaLogit, scoreH, mov,
-        Math.floor(g.start.getTime() / 864e5));
+        Math.floor(g.start.getTime() / 864e5), g.surface || null);
       g.correct ? db.stats.hits++ : db.stats.misses++;
       db.stats.absorbed++;
       // totals self-calibration: ESPN strips odds from finals, so the pregame
@@ -1886,6 +1895,16 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
   return games.sort((a, b) => (STATE_ORDER[a.state] - STATE_ORDER[b.state]) || (a.start - b.start));
 }
 
+// tournament name → court surface. Keyword map covers the tour's big stops; anything
+// unknown defaults to hard (the tour's most common surface). Deltas start at 0, so a
+// rare misclassification costs almost nothing.
+function tennisSurface(name) {
+  const n = (name || '').toLowerCase();
+  if (/wimbledon|halle|queen|eastbourne|mallorca|newport|hertogenbosch|berlin|bad homburg/.test(n)) return 'grass';
+  if (/roland|french open|monte|madrid|rome|italian open|barcelona|hamburg|gstaad|bastad|umag|kitzb|estoril|bucharest|marrakech|geneva|lyon|cordoba|munich|houston|rio|buenos aires|santiago|charleston|strasbourg|rabat|palermo|budapest/.test(n)) return 'clay';
+  return 'hard';
+}
+
 // Tennis scoreboards nest matches inside event groupings (singles only, doubles skipped).
 // ATP and WTA endpoints both return combined Grand Slam draws, so dedupe by match id.
 function parseTennis(jsons, ranks, date) {
@@ -1920,9 +1939,10 @@ function parseTennis(jsons, ranks, date) {
           };
         };
         const home = side('home'), away = side('away');
+        const surf = tennisSurface(ev.shortName || ev.name);
         let model = predictTennis(home.pts, away.pts);
         {
-          const p = Brain.adjust('tennis', home, away, model.home, 0, 0.6, true);
+          const p = Brain.adjust('tennis', home, away, model.home, 0, 0.6, true, surf);
           model = { home: p, away: 1 - p, draw: 0 };
         }
         const pick = model.home >= model.away ? 'home' : 'away';
@@ -1934,9 +1954,10 @@ function parseTennis(jsons, ranks, date) {
           state: st.state || 'pre',
           statusText: [round, st.shortDetail].filter(Boolean).join(' · '),
           start,
-          venue: [ev.shortName || ev.name, round, comp.venue?.court].filter(Boolean).join(' · '),
+          venue: [ev.shortName || ev.name, { grass: '🌿 grass', clay: '🧱 clay', hard: '🏟️ hard' }[surf], round, comp.venue?.court].filter(Boolean).join(' · '),
           tv: '',
           tennis: true,
+          surface: surf,
           correct: null,
         };
         if (g.state === 'post') g.correct = g.pick === (home.winner ? 'home' : 'away');
