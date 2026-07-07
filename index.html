@@ -589,7 +589,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v9.6';   // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v9.7';   // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1056,6 +1056,13 @@ const Brain = (() => {
     totalsBias: sportId => db.totalsBias[sportId] || null,
     pendingFor: (sportId, gid) => db.pending[sportId + '|' + gid] || null,
     settledFor: (sportId, gid) => db.stats.betlog.find(x => x.gid === String(gid) && x.k === sportId) || null,
+    // unit P/L per day for one sport, newest day first: [[ymd, pnl], ...]
+    sportDaily(sportId) {
+      const byDay = {};
+      db.stats.betlog.filter(x => x.k === sportId)
+        .forEach(x => { byDay[x.d] = +((byDay[x.d] || 0) + (x.pnl || 0)).toFixed(2); });
+      return Object.entries(byDay).sort((a, b) => String(b[0]).localeCompare(String(a[0])));
+    },
     // ⭐ suggested-pick record for one sport, from the tail-everything ledger
     sportRecord(sportId) {
       const rows = db.stats.betlog.filter(x => x.k === sportId);
@@ -2265,6 +2272,11 @@ function summaryBar(events, sport) {
     if (r.n) {
       html += stat(`${r.w}–${r.l}`, `⭐ picks hit ${Math.round(r.w / r.n * 100)}%`, r.w >= r.l ? 'good' : 'bad');
       html += stat(`${r.pnl >= 0 ? '+' : ''}${r.pnl.toFixed(1)}u`, '⭐ P/L this sport', r.pnl >= 0 ? 'good' : 'bad');
+      // day-by-day P/L counters for this sport, newest first, beside the total
+      Brain.sportDaily(sport.id).slice(0, 7).forEach(([d, u]) => {
+        const ds = String(d);
+        html += stat(`${u >= 0 ? '+' : ''}${u.toFixed(1)}u`, `⭐ ${ds.slice(4, 6)}/${ds.slice(6)}`, u >= 0 ? 'good' : 'bad');
+      });
     }
   }
   return `<div class="summary">${html}</div>`;
@@ -2391,12 +2403,6 @@ function renderPickLedger() {
   // per-day record, shown on each date header
   const byDay = {};
   log.forEach(x => { const r = byDay[x.d] = byDay[x.d] || { w: 0, n: 0, pnl: 0 }; r.n++; if (x.w) r.w++; r.pnl += x.pnl || 0; });
-  // 💵 unit P/L day by day — a separate counter per day, then the total
-  const daysDesc = Object.entries(byDay).sort((a, b) => String(b[0]).localeCompare(String(a[0])));
-  const perDay = `<div class="bo-fair" style="margin-top:6px">💵 ${daysDesc.slice(0, 14).map(([d, r]) => {
-      const ds = String(d);
-      return `<span class="chip ${r.pnl >= 0 ? 'hit' : 'miss'}" style="margin-right:6px">${ds.slice(4, 6)}/${ds.slice(6)} ${r.pnl >= 0 ? '+' : ''}${r.pnl.toFixed(1)}u</span>`;
-    }).join('')}<span class="chip ${pnl >= 0 ? 'hit' : 'miss'}"><b>TOTAL ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}u</b></span></div>`;
   let lastDate = null, rows = '';
   log.slice(0, 80).forEach(x => {
     if (x.d !== lastDate) {
@@ -2411,7 +2417,7 @@ function renderPickLedger() {
   });
   // explicit total under the day-by-day list — same numbers as TAIL-EVERYTHING above
   const totalRow = `<div class="h-date" style="margin-top:10px">TOTAL: ${w}–${l} (${Math.round(w / log.length * 100)}%) · <span class="${pnl >= 0 ? 'ok' : 'bad'}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}u</span></div>`;
-  el.innerHTML = `<div class="hist">${head}${summary}${perSport}${perDay}${rows}${totalRow}</div>`;
+  el.innerHTML = `<div class="hist">${head}${summary}${perSport}${rows}${totalRow}</div>`;
 }
 
 // 🎯 My Bets panel: log, view, settle, and audit your real tickets
