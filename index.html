@@ -589,7 +589,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v9.9';   // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v10.0';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -2989,6 +2989,7 @@ function renderProps() {
       </div>
       <div class="pr-ctx"><span class="pr-ctx-l">MATCHUP</span>${matchBtns}</div>
       <div class="pr-ctx"><span class="pr-ctx-l">PACE</span>${paceBtns}</div>
+      <div id="pr-auto"></div>
       <div id="pr-out"></div>
     </div>
     <datalist id="pr-players">${playerSuggestions().map(s => `<option value="${esc(s.name)}">${esc(s.cat)} ${esc(s.val)}</option>`).join('')}</datalist>
@@ -3004,11 +3005,53 @@ function renderProps() {
     </div>`;
   renderPropsOut();
   renderLiveProps();
+  updatePropAuto();
 }
 
 const PROP_MIN_EV = 0.03;    // slightly above game MIN_EV — milestone odds carry one-sided vig
 const OVERROUND_PROP = 1.06; // assumed two-way hold: the unlisted side costs (106¢ − listed side),
                              // so betting the "under" pays a realistic spread, not a free 100−yes
+
+// auto-suggest the matchup/pace pills: find the player's game in today's slate via the
+// leaders lists, rank the opponent's points-allowed against the league's slate, and
+// compare this game's expected total to the slate median for pace
+function propAutoContext() {
+  const name = (state.props.player || '').trim().toLowerCase();
+  if (!name) return null;
+  let found = null, fallback = null;   // prefer the pregame match, else any game today
+  state.lastEntries.forEach((entry, sid) => (entry.events || []).forEach(g => {
+    [['away', 'home'], ['home', 'away']].forEach(([mine, opp]) => {
+      if ((g[mine].leaders || []).some(l => (l.name || '').toLowerCase() === name)) {
+        const hit = { g, sid, opp: g[opp] };
+        if (g.state === 'pre') found = found || hit; else fallback = fallback || hit;
+      }
+    });
+  }));
+  found = found || fallback;
+  if (!found || found.opp.pag == null) return null;
+  const evs = state.lastEntries.get(found.sid)?.events || [];
+  const pags = evs.flatMap(g => [g.away.pag, g.home.pag]).filter(v => v != null).sort((a, b) => a - b);
+  if (pags.length < 6) return null;
+  const pct = pags.filter(v => v < found.opp.pag).length / pags.length;  // high = leaky defense
+  const matchup = pct < 0.15 ? 'elite' : pct < 0.35 ? 'tough' : pct < 0.65 ? 'neutral' : pct < 0.85 ? 'soft' : 'smash';
+  const expT = g => (g.home.pfg + g.away.pag) / 2 + (g.away.pfg + g.home.pag) / 2;
+  const totals = evs.filter(g => g.home.pfg != null && g.away.pfg != null).map(expT).sort((a, b) => a - b);
+  let pace = 'neutral';
+  if (found.g.home.pfg != null && found.g.away.pfg != null && totals.length >= 3) {
+    const r = expT(found.g) / totals[Math.floor(totals.length / 2)];
+    pace = r >= 1.03 ? 'fast' : r <= 0.97 ? 'slow' : 'neutral';
+  }
+  return { opp: found.opp, matchup, pace, pct };
+}
+
+function updatePropAuto() {
+  const el = $('#pr-auto');
+  if (!el) return;
+  const a = propAutoContext();
+  el.innerHTML = a ? `<div class="pr-ctx"><span class="pr-ctx-l">AUTO</span>
+    <span class="b-item">vs ${esc(a.opp.abbr)} — allows ${a.opp.pag.toFixed(1)}/gm (leakier than ${Math.round(a.pct * 100)}% of the slate) → suggests <b>${a.matchup}</b> · <b>${a.pace}</b> pace</span>
+    <button class="pg-btn" data-pmatch="${a.matchup}" data-ppace="${a.pace}">⚡ apply</button></div>` : '';
+}
 
 // distinct high-value players from the day's stat leaders (autocomplete + suggestions)
 function playerSuggestions() {
@@ -3244,6 +3287,7 @@ $('#content').addEventListener('input', e => {
   if (pmap[e.target.id]) {
     state.props[pmap[e.target.id]] = e.target.value;
     localStorage.setItem('de-props-v1', JSON.stringify(state.props));
+    if (e.target.id === 'pr-player') updatePropAuto();   // refresh the auto-suggested context
     renderPropsOut();
   }
 });
