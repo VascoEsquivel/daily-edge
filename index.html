@@ -589,7 +589,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v10.0';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v10.1';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1518,6 +1518,15 @@ function reconstructPicks(sport, events) {
 
 // totals: stdev of combined final score, for Over/Under probability
 const TOTAL_SIGMA = { mlb: 4.6, wnba: 17, nba: 19, nfl: 13.5, nhl: 2.2 };
+// MLB park run factors (multi-year approximations, keyed by home-team abbr).
+// Applied at half strength (sqrt) because team scoring rates already carry
+// ~half of their own home park's effect.
+const PARK_RUN_FACTOR = {
+  COL: 1.15, CIN: 1.09, BOS: 1.07, KC: 1.06, ARI: 1.04, PHI: 1.04, NYY: 1.03, TEX: 1.03,
+  ATH: 1.03, TOR: 1.02, ATL: 1.02, MIL: 1.02, CHW: 1.01, WSH: 1.01, CHC: 1.00, HOU: 1.00,
+  MIN: 0.99, LAA: 0.99, LAD: 0.98, BAL: 0.98, STL: 0.98, TB: 0.98, NYM: 0.97, DET: 0.96,
+  CLE: 0.96, SD: 0.96, MIA: 0.95, PIT: 0.95, SF: 0.94, SEA: 0.92,
+};
 // back-to-back fatigue (logit penalty) — biggest in basketball, real in hockey
 const B2B_PEN = { wnba: 0.10, nba: 0.10, nhl: 0.08 };
 
@@ -1843,6 +1852,11 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
       let exp = (home.pfg + away.pag) / 2 + (away.pfg + home.pag) / 2;
       const notes = [];
       if (sport.id === 'mlb') {
+        const pf = PARK_RUN_FACTOR[home.abbr];
+        if (pf && pf !== 1) {
+          exp *= Math.sqrt(pf);
+          if (Math.abs(pf - 1) >= 0.05) notes.push(`park factor ×${pf.toFixed(2)} → ${pf > 1 ? 'over' : 'under'}`);
+        }
         if (home.probable?.era != null && away.probable?.era != null) {
           exp += ((home.probable.era + away.probable.era) / 2 - 4.2) * 0.8;
         }
@@ -2525,6 +2539,15 @@ function renderPostmortems() {
     clean: 'Several clean misses where the model was simply off — worth checking if a data gap (injury, lineup) was in play on those.',
   };
   const takeaway = `<div class="pm-take">🧭 ${esc(TAKE[top] || '')}</div>`;
+  // which model drivers keep showing up in losses — a lying ingredient leaves fingerprints
+  const drv = {};
+  pm.forEach(x => (x.why || []).forEach(w => {
+    // group by driver type: strip trailing numbers and team abbrs ("injuries hit KC −0.1" → "injuries hit")
+    const k = String(w).replace(/\s*[-+±×]?\d.*$/, '').replace(/\s+[A-Z]{2,4}\.?$/, '').trim() || String(w);
+    drv[k] = (drv[k] || 0) + 1;
+  }));
+  const drvTop = Object.entries(drv).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const drivers = drvTop.length ? `<div class="pm-take">🔬 drivers present in misses: ${drvTop.map(([k, n]) => `${esc(k)} ×${n}`).join(' · ')} <span class="pm-res">— a driver that dominates here far beyond its share of picks is the ingredient to distrust.</span></div>` : '';
   const rows = pm.slice(0, 60).map(x => {
     const ds = String(x.d);
     return `<div class="h-row"><span class="h-match">${esc(x.t)}</span>
@@ -2533,7 +2556,7 @@ function renderPostmortems() {
   }).join('');
   el.innerHTML = `<div class="hist">
     <div class="h-date">🔍 LOSS POST-MORTEMS · ${total} settled misses</div>
-    <div class="pm-breakdown">${breakdown}</div>${takeaway}
+    <div class="pm-breakdown">${breakdown}</div>${takeaway}${drivers}
     <div class="h-date" style="margin-top:12px">EVERY MISS, NEWEST FIRST</div>${rows}
   </div>`;
 }
