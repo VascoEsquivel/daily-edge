@@ -589,7 +589,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v9.3';   // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v9.4';   // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1056,6 +1056,14 @@ const Brain = (() => {
     totalsBias: sportId => db.totalsBias[sportId] || null,
     pendingFor: (sportId, gid) => db.pending[sportId + '|' + gid] || null,
     settledFor: (sportId, gid) => db.stats.betlog.find(x => x.gid === String(gid) && x.k === sportId) || null,
+    // ⭐ suggested-pick record for one sport, from the tail-everything ledger
+    sportRecord(sportId) {
+      const rows = db.stats.betlog.filter(x => x.k === sportId);
+      const w = rows.filter(x => x.w).length;
+      return { n: rows.length, w, l: rows.length - w,
+        staked: rows.reduce((s, x) => s + (x.u || 0), 0),
+        pnl: rows.reduce((s, x) => s + (x.pnl || 0), 0) };
+    },
     // grade a game from its retained closing line: log the would-be ticket, and
     // settle immediately if the game is already final (live ones settle at final)
     reconstruct(sport, g, bet) {
@@ -2240,7 +2248,7 @@ function bestBets(events) {
   }).join('')}</div></div>`;
 }
 
-function summaryBar(events) {
+function summaryBar(events, sport) {
   const finals = events.filter(g => g.state === 'post');
   const hits = finals.filter(g => g.correct).length;
   const live = events.filter(g => g.state === 'in').length;
@@ -2251,6 +2259,14 @@ function summaryBar(events) {
   if (live) html += stat(live, 'live now', 'bad');
   if (finals.length) html += stat(`${hits}–${finals.length - hits}`, 'model on finals', hits >= finals.length - hits ? 'good' : 'bad');
   if (evPlays) html += stat(evPlays, '+EV plays', 'gold');
+  // this sport's all-time ⭐ suggested-pick record (every pick tailed, bet or not)
+  if (sport) {
+    const r = Brain.sportRecord(sport.id);
+    if (r.n) {
+      html += stat(`${r.w}–${r.l}`, `⭐ picks hit ${Math.round(r.w / r.n * 100)}%`, r.w >= r.l ? 'good' : 'bad');
+      html += stat(`${r.pnl >= 0 ? '+' : ''}${r.pnl.toFixed(1)}u`, '⭐ P/L this sport', r.pnl >= 0 ? 'good' : 'bad');
+    }
+  }
   return `<div class="summary">${html}</div>`;
 }
 
@@ -2358,6 +2374,13 @@ function renderPickLedger() {
   const bank = Number(localStorage.getItem('de-bank')) || 0;
   const dollars = bank ? ` (${pnl >= 0 ? '+' : '-'}$${Math.abs(Math.round(pnl * bank / 100))})` : '';
   const summary = `<div class="h-date" style="margin-top:10px">TAIL-EVERYTHING: ${w}–${l} (${Math.round(w / log.length * 100)}%) · staked ${staked.toFixed(1)}u · P/L ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}u${dollars} · ROI ${roi >= 0 ? '+' : ''}${roi.toFixed(1)}% ${lineSparkline(log.slice().reverse().map(x => x.c))}</div>`;
+  // per-sport split of the same record (also shown on each sport's tab) —
+  // numbers come from Brain.sportRecord so both views always agree exactly
+  const sportsSeen = [...new Set(log.map(x => x.k).filter(Boolean))]
+    .map(k => [k, Brain.sportRecord(k)]).sort((a, b) => b[1].n - a[1].n);
+  const perSport = !sportsSeen.length ? '' :
+    `<div class="bo-fair" style="margin-top:6px">${sportsSeen.map(([k, r]) =>
+      `<span class="chip ${r.pnl >= 0 ? 'hit' : 'miss'}" style="margin-right:6px">${SPORT_ICON[k] || k} ${r.w}–${r.l} · ${r.pnl >= 0 ? '+' : ''}${r.pnl.toFixed(1)}u</span>`).join('')}</div>`;
   let lastDate = null, rows = '';
   log.slice(0, 80).forEach(x => {
     if (x.d !== lastDate) {
@@ -2369,7 +2392,7 @@ function renderPickLedger() {
       <span class="h-pick">${esc(x.m)}${x.res ? ' · ' + esc(x.res) : ''} · ${x.u}u${x.p != null ? ' · model ' + Math.round(x.p * 100) + '%' : ''}${x.rec ? ' · CL' : ''}</span>
       <span class="${x.w ? 'ok' : 'bad'}">${x.w ? 'WON +' + x.pnl.toFixed(2) : 'LOST ' + x.pnl.toFixed(2)}u</span></div>`;
   });
-  el.innerHTML = `<div class="hist">${head}${summary}${rows}</div>`;
+  el.innerHTML = `<div class="hist">${head}${summary}${perSport}${rows}</div>`;
 }
 
 // 🎯 My Bets panel: log, view, settle, and audit your real tickets
@@ -2480,7 +2503,7 @@ function renderContent(sport, entry) {
   else if (state.filter !== 'all') grid = grid.filter(g => g.state === state.filter);
   if (state.sort === 'ev') grid = [...grid].sort((a, b) => (b.bp?.ev ?? -9) - (a.bp?.ev ?? -9));
   else if (state.sort === 'conf') grid = [...grid].sort((a, b) => b.pickProb - a.pickProb);
-  c.innerHTML = summaryBar(entry.events) + heroCard(entry.events) + bestBets(entry.events)
+  c.innerHTML = summaryBar(entry.events, sport) + heroCard(entry.events) + bestBets(entry.events)
     + filterBar()
     + (grid.length
         ? `<div class="games">${grid.map((g, i) => gameCard(g, i, sport)).join('')}</div>`
