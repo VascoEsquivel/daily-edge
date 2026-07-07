@@ -589,7 +589,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v9.8';   // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v9.9';   // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -2093,9 +2093,33 @@ function propsSection(g) {
   return html ? `<div class="bo-h" style="margin-top:13px">PROP ANGLES · team leaders</div>${html}` : '';
 }
 
+// last meetings between the two sides, straight from the brain's absorbed-results log
+function h2hSection(g) {
+  const A = g.away.abbr, H = g.home.abbr;
+  const meet = Brain.history().filter(r => r.s === g.sportId
+    && ((r.a === A && r.h === H) || (r.a === H && r.h === A))).slice(0, 5);
+  if (!meet.length) return '';
+  let aW = 0, hW = 0;
+  const rows = meet.map(r => {
+    const sa = Number(r.sa), sh = Number(r.sh);
+    let win;
+    if (r.sa !== '' && r.sh !== '' && Number.isFinite(sa) && Number.isFinite(sh)) {
+      win = sa > sh ? r.a : sh > sa ? r.h : null;          // team sports: by score (null = draw)
+    } else {
+      // tennis scores are set strings — derive the winner from the logged pick + result
+      win = r.ok ? (r.pk === 'Draw' ? null : r.pk) : (r.pk === r.a ? r.h : r.pk === r.h ? r.a : null);
+    }
+    if (win === A) aW++; else if (win === H) hW++;
+    const ds = String(r.d);
+    return `<div class="bo-row skip"><span class="bo-bet">${ds.slice(4, 6)}/${ds.slice(6)} — ${esc(r.a)} ${esc(r.sa)} @ ${esc(r.h)} ${esc(r.sh)}</span><span>${win ? esc(win) + ' won' : 'draw'}</span></div>`;
+  }).join('');
+  const lead = aW === hW ? `even ${aW}–${hW}` : aW > hW ? `${A} leads ${aW}–${hW}` : `${H} leads ${hW}–${aW}`;
+  return `<div class="bo-h" style="margin-top:13px">HEAD-TO-HEAD · last ${meet.length} seen (${esc(lead)})</div>${rows}`;
+}
+
 // Full bet board: every priced side with model %, market %, EV, and stake — plus fair prices
 function betBoard(g) {
-  const extras = formSection(g) + propsSection(g);
+  const extras = formSection(g) + propsSection(g) + h2hSection(g);
   if (g.state !== 'pre') return extras ? `<div class="betboard">${extras}</div>` : '';
   const rows = (g.bp?.board || []).map(c => {
     const star = g.bp.kind === 'ev' && c.text === g.bp.text ? '⭐ ' : '';
