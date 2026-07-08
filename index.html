@@ -589,7 +589,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v10.6';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v10.7';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -856,6 +856,9 @@ const ymd = d => d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate(
 const Brain = (() => {
   const KEY = 'de-brain-v4';   // v4: self-calibrating totals bias (relearns the season with it)
   const ELO_K = { mlb: 6, wnba: 24, nba: 20, nfl: 24, nhl: 10, mls: 24, wc: 28, tennis: 32 };
+  // typical decisive margin per sport — the MOV multiplier is scaled to this so a
+  // 3-run baseball win and a 12-point NBA win teach comparable amounts
+  const MOV_REF = { mlb: 3, wnba: 10, nba: 12, nfl: 10, nhl: 2, mls: 1.5, wc: 1.5, tennis: 1.5 };
   const LR = 0.04;                 // calibration learning rate
   let db;
   try { db = JSON.parse(localStorage.getItem(KEY)); } catch { db = null; }
@@ -883,6 +886,7 @@ const Brain = (() => {
   // seed from db.processed: everything already absorbed is already in the Elo, so it must
   // not be re-learned (which would double-count) when yesterday is re-fetched.
   db.learned = db.learned || { ...db.processed };
+  db.perf = db.perf || {};   // per-sport rolling Brier of Elo (be) vs baseline prior (bb)
   const cutoff = ymd(new Date(Date.now() - 60 * 864e5));
   for (const k in db.processed) if (db.processed[k] < cutoff) delete db.processed[k];
   for (const k in db.learned) if (db.learned[k] < cutoff) delete db.learned[k];
@@ -909,24 +913,42 @@ const Brain = (() => {
   };
   const teamKey = t => t.flagLogo ? t.name : t.abbr;
 
-  // blend prior with Elo, then run through the calibration layer
+  // blend prior with Elo, then run through the calibration layer.
+  // The Elo-vs-baseline weight is DYNAMIC: once we have a track record, we lean on
+  // whichever has the lower historical Brier score (bb = baseline, be = Elo). Until then
+  // it falls back to the caller's maxW. It's always further throttled by sample size, so
+  // a barely-seen team never gets a big Elo weight.
   function adjust(sport, home, away, pRaw, hfaLogit, maxW = 0.65, calibrate = true, surf = null) {
     const { p: pElo, eH, eA } = eloProb(sport, teamKey(home), teamKey(away), hfaLogit, surf);
     const nMin = Math.min(eH.n, eA.n);
-    const w = Math.min(maxW, nMin / (nMin + 12));
+    const perf = db.perf[sport];
+    const topW = (perf && perf.n >= 30 && perf.bb + perf.be > 0)
+      ? clamp(perf.bb / (perf.bb + perf.be), 0.2, 0.85) : maxW;
+    const w = Math.min(topW, nMin / (nMin + 12));
     let x = (1 - w) * logit(clamp(pRaw)) + w * logit(clamp(pElo));
     if (calibrate) { const c = getCalib(sport); x = c.a + c.b * x; }
     return clamp(invlogit(x));
   }
 
-  function learn(sport, kH, kA, hfaLogit, scoreH, mov = 1, day = null, surf = null) {
+  function learn(sport, kH, kA, hfaLogit, scoreH, mov = 1, day = null, surf = null, pRaw = null) {
     const { p: pElo, eH, eA } = eloProb(sport, kH, kA, hfaLogit, surf);
-    // margin-of-victory multiplier (538-style: blowouts teach more, garbage-time
-    // wins by heavy favorites teach less) + faster learning for barely-seen teams
-    const movM = mov > 0 ? Math.log(mov + 1) * 2.2 / (Math.abs(eH.r - eA.r) * 0.001 + 2.2) : 1;
-    const boost = (eH.n < 10 || eA.n < 10) ? 1.5 : 1;
-    const k = (ELO_K[sport] || 20) * movM * boost;
-    eH.r += k * (scoreH - pElo); eA.r -= k * (scoreH - pElo);
+    // MOV multiplier — logarithmic diminishing returns scaled to the sport's typical
+    // margin (so a blowout can't distort a team's structural rating), capped at 2×, and
+    // damped by the 538 autocorrelation term so a big favorite winning big doesn't runaway.
+    const ref = MOV_REF[sport] || 10;
+    const movM = mov > 0
+      ? Math.min(2, Math.log(1 + mov / ref) / Math.LN2) * (2.2 / (Math.abs(eH.r - eA.r) * 0.001 + 2.2))
+      : 1;
+    // dynamic K-factor: smooth low-sample boost (teams early in our lookback move fast to
+    // find their level) × a recency lift (recent games count a little more so ratings track
+    // current form). The whole multiplier is capped so no single game can swing a rating wildly.
+    const nMin = Math.min(eH.n, eA.n);
+    const sampleF = 1 + 1.4 / (1 + nMin / 6);
+    const today = Math.floor(Date.now() / 864e5);
+    const recencyF = day ? 0.8 + 0.4 * Math.max(0, Math.min(1, (day - (today - 120)) / 120)) : 1;
+    const kMult = Math.min(4, movM * sampleF * recencyF);
+    const delta = (ELO_K[sport] || 20) * kMult * (scoreH - pElo);
+    eH.r += delta; eA.r -= delta;
     eH.n++; eA.n++;
     // rolling last-10 signed margins, fuel for the form sparklines
     const hMargin = scoreH === 1 ? mov : scoreH === 0 ? -mov : 0;
@@ -937,8 +959,8 @@ const Brain = (() => {
     if (surf) {
       const capped = v => Math.max(-200, Math.min(200, v));
       eH.s = eH.s || {}; eA.s = eA.s || {};
-      eH.s[surf] = capped((eH.s[surf] || 0) + 0.5 * k * (scoreH - pElo));
-      eA.s[surf] = capped((eA.s[surf] || 0) - 0.5 * k * (scoreH - pElo));
+      eH.s[surf] = capped((eH.s[surf] || 0) + 0.5 * delta);
+      eA.s[surf] = capped((eA.s[surf] || 0) - 0.5 * delta);
     }
     if (scoreH !== 0.5) {
       const c = getCalib(sport);
@@ -947,6 +969,14 @@ const Brain = (() => {
       c.a = Math.max(-0.6, Math.min(0.6, c.a + LR * (scoreH - p)));
       c.b = Math.max(0.5, Math.min(1.6, c.b + LR * (scoreH - p) * x));
       c.n++;
+      // track how well Elo vs the baseline prior predicts, per sport (rolling Brier).
+      // adjust() reads this to decide how much to trust Elo over the record-based prior.
+      if (pRaw != null) {
+        const perf = db.perf[sport] = db.perf[sport] || { be: 0.25, bb: 0.25, n: 0 };
+        perf.be += 0.02 * ((scoreH - pElo) ** 2 - perf.be);
+        perf.bb += 0.02 * ((scoreH - clamp(pRaw)) ** 2 - perf.bb);
+        perf.n++;
+      }
     }
   }
 
@@ -1049,7 +1079,7 @@ const Brain = (() => {
         if (g.tennis) { const [th, ta] = setsTally(g.home.sets, g.away.sets); mov = Math.abs(th - ta); }
         else mov = Math.abs((Number(g.home.score) || 0) - (Number(g.away.score) || 0));
         learn(sport.id, teamKey(g.home), teamKey(g.away), hfaLogit, scoreH, mov,
-          Math.floor(g.start.getTime() / 864e5), g.surface || null);
+          Math.floor(g.start.getTime() / 864e5), g.surface || null, g.pRaw ?? null);
         g.correct ? db.stats.hits++ : db.stats.misses++;
         db.stats.absorbed++;
         // totals self-calibration: ESPN strips odds from finals, so the pregame
@@ -1949,6 +1979,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
       const rest = 1 - model.draw;
       model = { home: clamp(rest * share2), away: clamp(rest * (1 - share2)), draw: model.draw };
     } else {
+      var pRawHome = model.home;   // baseline (record/Pythagorean) prior, kept for Brier tracking
       const p = Brain.adjust(sport.id, home, away, model.home, hfaL, 0.65, true);
       model = { home: p, away: 1 - p, draw: 0 };
       // pregame intel the record can't see: starting pitchers (MLB) + injury report
@@ -2079,6 +2110,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
     return {
       id: ev.id, home, away, model, pick, pickProb, vegas, edge, marketPrior,
       total, sim, wx, why: typeof whyDrivers !== 'undefined' ? whyDrivers : [],
+      pRaw: typeof pRawHome !== 'undefined' ? pRawHome : null,
       state: st.state || 'pre',                       // pre | in | post
       statusText: st.shortDetail || st.detail || '',
       period: ev.status?.period, clock: ev.status?.displayClock || '',
