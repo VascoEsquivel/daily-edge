@@ -589,7 +589,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v10.5';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v10.6';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -739,8 +739,20 @@ const PROP_STATS = [
   { id: 'sog', label: '🏒 Shots on Goal', dist: 'poisson', step: 1 },
   { id: 'goals', label: '⚽/🏒 Goals', dist: 'poisson', step: 1 },
 ];
+// P(X > line) for an overdispersed count (variance = mean + disp·mean²). Real player
+// counting stats are more variable than a pure Poisson (usage swings, blowouts, foul
+// trouble), so a Negative Binomial widens the tails and kills the false "under" edges a
+// thin Poisson invents on high milestone lines.
+function negBinOver(line, mean, disp = 0.18) {
+  if (mean <= 0) return 0;
+  const r = 1 / disp, pp = r / (r + mean);   // size r, success prob pp; NB mean = r(1−pp)/pp
+  const k = Math.floor(line);
+  let term = Math.pow(pp, r), cdf = term;
+  for (let i = 1; i <= k; i++) { term *= (r + i - 1) / i * (1 - pp); cdf += term; }
+  return Math.max(0, Math.min(1, 1 - cdf));
+}
 function propOver(stat, mean, line) {
-  if (stat.dist === 'poisson') return poissonOver(line, mean);
+  if (stat.dist === 'poisson') return negBinOver(line, mean);
   return 1 - normalCdf((line - mean) / Math.max(0.5, stat.sd(mean)));
 }
 
@@ -1686,6 +1698,109 @@ function parseVegas(comp, sport, home) {
   return v;
 }
 
+// ── Monte Carlo score engine ─────────────────────────────────────────────
+// Rather than assume a static Normal (totals) or a flat margin, we SIMULATE each
+// game thousands of times from a sport-appropriate scoring process and read the
+// Over/Under and spread probabilities straight off the empirical distribution.
+// This captures the real skew and fat tails (baseball's crooked innings,
+// basketball runs) plus the natural correlation between the final margin and the
+// total. Each game's team means are anchored so the simulation reproduces BOTH the
+// model's expected total AND its win probability, keeping the sim coherent with the
+// Elo/log5 moneyline. Runs pregame only, memoized per game, ~8k iterations.
+const MonteCarlo = (() => {
+  const N = 8000;
+  // marginSD = the sim's own margin spread (used to convert the model win% into a
+  // team-scoring gap so P(sim home win) ≈ model win%); envSD = per-game scoring-
+  // environment noise (lognormal) that fattens the tails to match real dispersion.
+  const P = {
+    mlb:  { marginSD: 4.2, envSD: 0.46 },
+    nba:  { marginSD: 13.2, ppp: 1.14, r3: 0.30, envSD: 0.05 },
+    wnba: { marginSD: 11.2, ppp: 1.02, r3: 0.25, envSD: 0.05 },
+  };
+  const cache = new Map();
+
+  // geometric # of runs in a half-inning: P(k)=s(1-s)^k, mean (1-s)/s = λ  →  s=1/(1+λ)
+  const geo = s => Math.floor(Math.log(1 - Math.random()) / Math.log(1 - s));
+  const env = eS => Math.exp(eS * randn() - eS * eS / 2);   // lognormal mean-1 multiplier
+
+  function simMLB(muH, muA, p, totals, margins) {
+    const lamH = Math.max(0.01, muH) / 9, lamA = Math.max(0.01, muA) / 9;
+    for (let i = 0; i < N; i++) {
+      const sH = 1 / (1 + lamH * env(p.envSD)), sA = 1 / (1 + lamA * env(p.envSD));
+      let rH = 0, rA = 0;
+      for (let inn = 0; inn < 9; inn++) { rA += geo(sA); rH += geo(sH); }
+      let guard = 0;                                   // extra innings break the tie
+      while (rH === rA && guard++ < 20) { rA += geo(sA); rH += geo(sH); }
+      if (rH === rA) { Math.random() < 0.5 ? rH++ : rA++; }
+      totals[i] = rH + rA; margins[i] = rH - rA;
+    }
+  }
+
+  function simBB(muH, muA, p, totals, margins) {
+    const poss = Math.max(55, Math.round((muH + muA) / (2 * p.ppp)));   // shared pace
+    const mkVal = 2 + p.r3;                                             // avg pts per made possession
+    for (let i = 0; i < N; i++) {
+      const sH = Math.min(0.98, Math.max(0.02, (muH * env(p.envSD) / poss) / mkVal));
+      const sA = Math.min(0.98, Math.max(0.02, (muA * env(p.envSD) / poss) / mkVal));
+      let ph = 0, pa = 0;
+      for (let k = 0; k < poss; k++) {
+        if (Math.random() < sH) ph += Math.random() < p.r3 ? 3 : 2;
+        if (Math.random() < sA) pa += Math.random() < p.r3 ? 3 : 2;
+      }
+      let ot = 0;                                       // overtime minis break the tie
+      while (ph === pa && ot++ < 6) {
+        for (let k = 0; k < 10; k++) {
+          if (Math.random() < sH) ph += Math.random() < p.r3 ? 3 : 2;
+          if (Math.random() < sA) pa += Math.random() < p.r3 ? 3 : 2;
+        }
+      }
+      if (ph === pa) { Math.random() < 0.5 ? ph += 2 : pa += 2; }
+      totals[i] = ph + pa; margins[i] = ph - pa;
+    }
+  }
+
+  function finalize(totals, margins, targetTotal) {
+    const n = totals.length;
+    // mean-correct the total to the model's expected total (removes the small drift
+    // from extra-inning / overtime tie-breaks) while preserving the empirical shape
+    if (targetTotal != null) {
+      let s = 0; for (let i = 0; i < n; i++) s += totals[i];
+      const shift = targetTotal - s / n;
+      if (Math.abs(shift) > 1e-9) for (let i = 0; i < n; i++) totals[i] += shift;
+    }
+    totals.sort(); margins.sort();
+    const mean = a => { let s = 0; for (let i = 0; i < n; i++) s += a[i]; return s / n; };
+    const sd = (a, mu) => { let s = 0; for (let i = 0; i < n; i++) { const d = a[i] - mu; s += d * d; } return Math.sqrt(s / n); };
+    const lb = (a, x) => { let lo = 0, hi = n; while (lo < hi) { const m = (lo + hi) >> 1; a[m] < x ? lo = m + 1 : hi = m; } return lo; };
+    const ub = (a, x) => { let lo = 0, hi = n; while (lo < hi) { const m = (lo + hi) >> 1; a[m] <= x ? lo = m + 1 : hi = m; } return lo; };
+    // fraction strictly greater than x, giving pushes (exact ties) half credit
+    const pGt = (a, x) => { const l = lb(a, x), u = ub(a, x); return (n - u + 0.5 * (u - l)) / n; };
+    const mt = mean(totals), mm = mean(margins);
+    return { n, meanTotal: mt, sdTotal: sd(totals, mt), meanMargin: mm, sdMargin: sd(margins, mm),
+      pOver: line => pGt(totals, line),
+      pHomeCover: homeSpread => pGt(margins, -homeSpread),   // home covers when margin > −spread
+      pHomeWin: () => pGt(margins, 0) };
+  }
+
+  return {
+    supports: id => !!P[id],
+    simGame(sportId, expTotal, pHome, gid) {
+      const p = P[sportId];
+      if (!p || !(expTotal > 0)) return null;
+      const key = `${gid}|${expTotal.toFixed(1)}|${pHome.toFixed(3)}`;
+      if (cache.has(key)) return cache.get(key);
+      const gap = p.marginSD * invNorm(clamp(pHome, 0.02, 0.98));   // model win% → mean score gap
+      const muH = Math.max(0.5, (expTotal + gap) / 2), muA = Math.max(0.5, (expTotal - gap) / 2);
+      const totals = new Float64Array(N), margins = new Float64Array(N);
+      (sportId === 'mlb' ? simMLB : simBB)(muH, muA, p, totals, margins);
+      const res = finalize(totals, margins, expTotal);
+      if (cache.size > 200) cache.delete(cache.keys().next().value);
+      cache.set(key, res);
+      return res;
+    },
+  };
+})();
+
 // ── Best pick per game: highest-EV wager at the listed price, or PASS ──
 const KELLY_FRACTION = 0.25;   // fraction of full Kelly for stake sizing
 const MIN_EV = 0.02;           // minimum EV to recommend a bet
@@ -1712,11 +1827,16 @@ function computeBestPick(g, sport) {
     addML(v.favIsHome ? 'home' : 'away', v.mlFav);
     const dogImp = Math.min(0.97, Math.max(0.03, OVERROUND - mlToProb(v.mlFav)));
     addML(v.favIsHome ? 'away' : 'home', probToAmerican(dogImp), true);
-  } else if (v.spread != null && sport.spreadSigma) {
-    const sigma = sport.spreadSigma;
-    const mu = invNorm(g.model.home) * sigma;               // model's expected home margin
+  } else if (v.spread != null && (sport.spreadSigma || g.sim)) {
     const homeSpread = v.favIsHome ? v.spread : -v.spread;  // favorite's line is negative
-    const pHome = normalCdf((mu + homeSpread) / sigma);
+    // empirical cover prob from the Monte Carlo margin distribution when available,
+    // else the analytic Normal fallback
+    // MLB run margins are discrete & skewed → read the cover prob off the simulation;
+    // basketball margins are near-Normal and spreadSigma is already calibrated to them,
+    // so keep the analytic Normal there (the sim adds value on basketball TOTALS, not spreads)
+    let pHome;
+    if (g.sim && sport.id === 'mlb') pHome = g.sim.pHomeCover(homeSpread);
+    else { const sigma = sport.spreadSigma; pHome = normalCdf((invNorm(g.model.home) * sigma + homeSpread) / sigma); }
     const b = 100 / 110, imp = 0.524;                       // spread bets priced -110
     const s = n => (n > 0 ? '+' : '') + n;
     cands.push({ side: 'home', type: 'spread', homeSpread, p: pHome, b, imp, text: `${g.home.abbr} ${s(homeSpread)}` });
@@ -1907,8 +2027,8 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
     const wind = winds?.get(ev.id) || null;
     const wx = (ev.weather && !comp.venue?.indoor)
       ? { t: ev.weather.temperature ?? null, txt: ev.weather.displayValue || '', wind } : null;
-    let total = null;
-    if (vegas?.ou && TOTAL_SIGMA[sport.id] && home.pfg != null && away.pfg != null) {
+    let total = null, sim = null;
+    if (TOTAL_SIGMA[sport.id] && home.pfg != null && away.pfg != null) {
       let exp = (home.pfg + away.pag) / 2 + (away.pfg + home.pag) / 2;
       const notes = [];
       if (sport.id === 'mlb') {
@@ -1943,13 +2063,22 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
         exp += adj;
         if (Math.abs(adj) >= TOTAL_SIGMA[sport.id] * 0.08) notes.push(`learned bias ${adj > 0 ? '+' : ''}${adj.toFixed(1)}`);
       }
-      total = { exp, line: vegas.ou, pOver: clamp(normalCdf((exp - vegas.ou) / TOTAL_SIGMA[sport.id])), notes };
+      // Monte Carlo: simulate the game for empirical O/U + spread probabilities
+      // (pregame + supported sports only), anchored to exp and the model win prob
+      if ((ev.status?.type?.state || 'pre') === 'pre' && MonteCarlo.supports(sport.id)) {
+        sim = MonteCarlo.simGame(sport.id, exp, model.home, ev.id);
+        if (sim) notes.push(`${sim.n / 1000}k-run sim · σ${sim.sdTotal.toFixed(1)}`);
+      }
+      if (vegas?.ou) {
+        const pOver = sim ? sim.pOver(vegas.ou) : clamp(normalCdf((exp - vegas.ou) / TOTAL_SIGMA[sport.id]));
+        total = { exp, line: vegas.ou, pOver: clamp(pOver), notes };
+      }
     }
 
     const st = ev.status?.type || {};
     return {
       id: ev.id, home, away, model, pick, pickProb, vegas, edge, marketPrior,
-      total, wx, why: typeof whyDrivers !== 'undefined' ? whyDrivers : [],
+      total, sim, wx, why: typeof whyDrivers !== 'undefined' ? whyDrivers : [],
       state: st.state || 'pre',                       // pre | in | post
       statusText: st.shortDetail || st.detail || '',
       period: ev.status?.period, clock: ev.status?.displayClock || '',
