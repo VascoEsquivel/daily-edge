@@ -589,7 +589,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v10.1';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v10.2';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -873,7 +873,15 @@ const Brain = (() => {
   const save = () => { try { localStorage.setItem(KEY, JSON.stringify(db)); } catch {} };
   const getElo = (sport, key) => {
     db.elo[sport] = db.elo[sport] || {};
-    return db.elo[sport][key] = db.elo[sport][key] || { r: 1500, n: 0 };
+    const e = db.elo[sport][key] = db.elo[sport][key] || { r: 1500, n: 0 };
+    // a 90+ day layoff (offseason) decays the rating 30% toward the mean — rosters
+    // turn over between seasons; regAt guards so each gap only regresses once
+    const today = Math.floor(Date.now() / 864e5);
+    if (e.last && today - e.last > 90 && e.regAt !== e.last) {
+      e.r = 1500 + (e.r - 1500) * 0.7;
+      e.regAt = e.last;
+    }
+    return e;
   };
   const getCalib = sport => db.calib[sport] = db.calib[sport] || { a: 0, b: 1, n: 0 };
   const eloProb = (sport, kH, kA, hfaLogit, surf = null) => {
@@ -2050,10 +2058,21 @@ function bestPickStrip(g) {
   const units = bp.units ? `<span class="bp-units">${fmtStake(bp.units)}</span>` : '';
   const slipBtn = bp.kind === 'ev' && g.state === 'pre'
     ? `<button class="addleg" data-leg="${esc(JSON.stringify(legOf(g, bp.text, bp.p, bp.b, { side: bp.side, type: bp.betType, line: bp.line, homeSpread: bp.homeSpread })))}">🎟️ + slip</button>` : '';
+  // steam: how far the market has moved on our side since the ⭐ ticket was logged
+  let steam = '';
+  if (bp.kind === 'ev' && g.state === 'pre') {
+    const pend = Brain.pendingFor(g.sportId, g.id);
+    if (pend?.takenImplied != null && pend?.closeImplied != null) {
+      const mv = pend.closeImplied - pend.takenImplied;
+      if (Math.abs(mv) >= 0.01) steam = mv > 0
+        ? `<span class="chip hit" title="The market's implied probability of our side is up ${(mv * 100).toFixed(1)} points since the pick was logged — the move agrees with us (positive CLV brewing).">📈 steam +${(mv * 100).toFixed(1)}</span>`
+        : `<span class="chip miss" title="The market has drifted ${(Math.abs(mv) * 100).toFixed(1)} points away from our side since the pick was logged — sharp money may disagree.">📉 drift −${(Math.abs(mv) * 100).toFixed(1)}</span>`;
+    }
+  }
   return `<div class="bestpick ${bp.kind}">
     <span class="bp-tag">${icon} ${tag}</span>
     <span class="bp-main">${esc(bp.text)}</span>
-    ${ev}${units}${slipBtn}
+    ${ev}${units}${steam}${slipBtn}
     <span class="bp-sub">${esc(bp.sub)}</span>
   </div>`;
 }
