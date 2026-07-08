@@ -589,7 +589,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v10.4';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v10.5';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -867,8 +867,13 @@ const Brain = (() => {
     db.pending = {};   // re-log open tickets with the model prob attached
     db.betLedgerV2 = true;
   }
+  // games whose result has moved Elo/calib (vs db.processed = ledger-settled). On upgrade,
+  // seed from db.processed: everything already absorbed is already in the Elo, so it must
+  // not be re-learned (which would double-count) when yesterday is re-fetched.
+  db.learned = db.learned || { ...db.processed };
   const cutoff = ymd(new Date(Date.now() - 60 * 864e5));
   for (const k in db.processed) if (db.processed[k] < cutoff) delete db.processed[k];
+  for (const k in db.learned) if (db.learned[k] < cutoff) delete db.learned[k];
 
   const save = () => { try { localStorage.setItem(KEY, JSON.stringify(db)); } catch {} };
   const getElo = (sport, key) => {
@@ -999,38 +1004,54 @@ const Brain = (() => {
     return { cat, tag, resultStr, missBy };
   }
 
-  // absorb finals the brain hasn't seen yet
+  // absorb finals the brain hasn't seen yet.
+  // TWO stages, deliberately decoupled for cross-device determinism:
+  //  • settle+log (personal, immediate) runs for any new final, incl. today's.
+  //  • LEARN (Elo/calib/totalsBias — the stuff that PRICES games) runs only for
+  //    games that finished strictly BEFORE today. That way every device prices
+  //    today's slate from the same "studied through yesterday" brain, so the
+  //    suggested picks match on your iPad and your laptop. Today's finals get
+  //    learned tomorrow (via the once-a-session yesterday sweep / backfill).
   function processResults(sport, events) {
+    const today = ymd(new Date());
     let changed = false;
     events.forEach(g => {
       if (g.state !== 'post') return;
       const key = sport.id + '|' + g.id;
-      if (db.processed[key]) return;
+      const gday = ymd(g.start);
       const scoreH = g.home.winner ? 1 : g.away.winner ? 0 : 0.5;
-      const hfaLogit = g.tennis || sport.hfaWin == null ? 0 : logit(sport.hfaWin);
-      let mov;
-      if (g.tennis) { const [th, ta] = setsTally(g.home.sets, g.away.sets); mov = Math.abs(th - ta); }
-      else mov = Math.abs((Number(g.home.score) || 0) - (Number(g.away.score) || 0));
-      learn(sport.id, teamKey(g.home), teamKey(g.away), hfaLogit, scoreH, mov,
-        Math.floor(g.start.getTime() / 864e5), g.surface || null);
-      g.correct ? db.stats.hits++ : db.stats.misses++;
-      db.stats.absorbed++;
-      // totals self-calibration: ESPN strips odds from finals, so the pregame
-      // prediction comes from the Open snapshot taken while the game was upcoming
-      const preTotal = g.total?.exp ?? (typeof Open !== 'undefined' ? Open.get(sport, g)?.te : null);
-      if (preTotal != null) {
-        const actual = (Number(g.home.score) || 0) + (Number(g.away.score) || 0);
-        const tb = db.totalsBias[sport.id] = db.totalsBias[sport.id] || { b: 0, n: 0 };
-        tb.b += 0.08 * ((actual - preTotal) - tb.b);   // EMA of the residual error
-        tb.n++;
+      // stage 1 — ledger settle + history record (once, immediately)
+      if (!db.processed[key]) {
+        settle(key, g, scoreH);
+        db.log.unshift({ d: gday, s: sport.id,
+          a: g.away.abbr, h: g.home.abbr, sa: g.away.score ?? '', sh: g.home.score ?? '',
+          pk: g.pick === 'draw' ? 'Draw' : g[g.pick].abbr, p: Math.round(g.pickProb * 100), ok: !!g.correct });
+        if (db.log.length > 600) { db.log.sort((x, y) => y.d - x.d); db.log.length = 600; }
+        db.processed[key] = today;
+        changed = true;
       }
-      settle(key, g, scoreH);
-      db.log.unshift({ d: ymd(g.start), s: sport.id,
-        a: g.away.abbr, h: g.home.abbr, sa: g.away.score ?? '', sh: g.home.score ?? '',
-        pk: g.pick === 'draw' ? 'Draw' : g[g.pick].abbr, p: Math.round(g.pickProb * 100), ok: !!g.correct });
-      if (db.log.length > 600) { db.log.sort((x, y) => y.d - x.d); db.log.length = 600; }
-      db.processed[key] = ymd(new Date());
-      changed = true;
+      // stage 2 — deterministic learning, only for games before today, exactly once
+      if (gday < today && !db.learned[key]) {
+        const hfaLogit = g.tennis || sport.hfaWin == null ? 0 : logit(sport.hfaWin);
+        let mov;
+        if (g.tennis) { const [th, ta] = setsTally(g.home.sets, g.away.sets); mov = Math.abs(th - ta); }
+        else mov = Math.abs((Number(g.home.score) || 0) - (Number(g.away.score) || 0));
+        learn(sport.id, teamKey(g.home), teamKey(g.away), hfaLogit, scoreH, mov,
+          Math.floor(g.start.getTime() / 864e5), g.surface || null);
+        g.correct ? db.stats.hits++ : db.stats.misses++;
+        db.stats.absorbed++;
+        // totals self-calibration: ESPN strips odds from finals, so the pregame
+        // prediction comes from the Open snapshot taken while the game was upcoming
+        const preTotal = g.total?.exp ?? (typeof Open !== 'undefined' ? Open.get(sport, g)?.te : null);
+        if (preTotal != null) {
+          const actual = (Number(g.home.score) || 0) + (Number(g.away.score) || 0);
+          const tb = db.totalsBias[sport.id] = db.totalsBias[sport.id] || { b: 0, n: 0 };
+          tb.b += 0.08 * ((actual - preTotal) - tb.b);   // EMA of the residual error
+          tb.n++;
+        }
+        db.learned[key] = today;
+        changed = true;
+      }
     });
     if (changed) save();
   }
@@ -1068,7 +1089,30 @@ const Brain = (() => {
     return { ...db.stats, tracked, pendingN: Object.keys(db.pending).length };
   }
 
-  return { adjust, processResults, recordPending, stats, history: () => db.log,
+  // Deterministic sync fingerprint of the PRICING brain (Elo + calibration). Two
+  // devices that have studied the same public history through the same day produce
+  // the SAME id → identical suggested picks. Compare it across your devices to confirm
+  // they're in sync. Ratings are bucketed to 5 pts so sub-threshold float noise (which
+  // never flips a pick) doesn't show a false mismatch; a real difference (different days
+  // studied) still does. FNV-1a over a canonical sorted string.
+  function syncFingerprint() {
+    const through = db.through || 0;
+    let learned = 0; for (const k in db.learned) learned++;
+    let str = through + '|';
+    for (const s of Object.keys(db.elo).sort()) {
+      str += s + ':';
+      for (const t of Object.keys(db.elo[s]).sort())
+        str += Math.round(db.elo[s][t].r / 5) + ',';
+      const c = db.calib[s];
+      if (c) str += 'c' + Math.round(c.a * 100) + '/' + Math.round(c.b * 100);
+      str += ';';
+    }
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return { id: (h >>> 0).toString(36).slice(0, 6), through, learned };
+  }
+
+  return { adjust, processResults, recordPending, stats, syncFingerprint, history: () => db.log,
     postmortems: () => db.postmortems,
     totalsBias: sportId => db.totalsBias[sportId] || null,
     pendingFor: (sportId, gid) => db.pending[sportId + '|' + gid] || null,
@@ -1684,10 +1728,12 @@ function computeBestPick(g, sport) {
     cands.push({ side: 'under', type: 'total', line: g.total.line, p: 1 - g.total.pOver, b, imp, text: `Under ${g.total.line}` });
   }
   if (!cands.length) return { kind: 'model', text: `${pickName} to win`, sub: 'model lean · line not parseable' };
-  const tilt = Brain.drawdown() >= 8;   // cold stretch: the tilt guard halves every stake
+  // canonical stake = quarter-Kelly, a pure function of price+edge → identical on every
+  // device. The local drawdown guard is shown as ADVICE (see the pick strip / brain bar),
+  // never silently baked into the number, so the suggested pick reads the same everywhere.
   cands.forEach(c => {
     c.ev = c.p * c.b - (1 - c.p);
-    const kf = KELLY_FRACTION * (tilt ? 0.5 : 1) * (c.b * c.p - (1 - c.p)) / c.b;
+    const kf = KELLY_FRACTION * (c.b * c.p - (1 - c.p)) / c.b;
     c.units = c.ev >= MIN_EV ? Math.min(5, Math.max(0.5, Math.round(kf * 1000) / 10)) : 0;
   });
   cands.sort((x, y) => y.ev - x.ev);
@@ -1698,7 +1744,7 @@ function computeBestPick(g, sport) {
     side: best.side, b: best.b, p: best.p, betType: best.type,
     homeSpread: best.homeSpread ?? null, line: best.line ?? null,
     units: best.units,
-    sub: `model ${pct(best.p)} vs implied ${pct(best.imp)}${tilt ? ' · half stakes (drawdown guard)' : ''}` };
+    sub: `model ${pct(best.p)} vs implied ${pct(best.imp)}` };
 }
 
 function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
@@ -2423,14 +2469,20 @@ function renderBrain() {
         })() : '')
       + item('teams & players rated', st.tracked, 'gold')
       + (st.pendingN ? item('open tickets', st.pendingN) : '');
+    // deterministic sync id — same on every device that studied the same history
+    const sync = Brain.syncFingerprint();
+    const st2 = String(sync.through);
+    const thruStr = st2.length === 8 ? `${st2.slice(0, 4)}-${st2.slice(4, 6)}-${st2.slice(6)}` : '—';
+    items += `<span class="b-item" title="A fingerprint of the pricing brain (Elo + calibration). Open the site on another device and check this matches — if the id and 'studied through' date are the same, both devices are working from the identical history and will suggest the same picks. It only changes when a new day of results is studied, not per-device.">🧬 sync <b class="gold">#${sync.id}</b> · studied through ${thruStr}</span>`;
   }
-  // tilt guard: flag a real drawdown so cold stretches get smaller stakes, not chases
+  // tilt guard: a real drawdown is ADVICE now (stakes are no longer silently changed,
+  // so the suggested pick reads the same on every device) — bet smaller by choice.
   {
     const series = (st.betlog || []).map(x => x.c);
     if (series.length >= 10) {
       const dd = Math.max(0, ...series) - series[series.length - 1];
       if (dd >= 8) {
-        items += `<span class="b-item" title="The pick ledger is ${dd.toFixed(1)}u below its peak. Cold stretches are normal — the discipline that survives them is smaller stakes, never bigger ones. Suggested stakes are automatically halved until the line turns.">⚠️ <b class="bad">drawdown −${dd.toFixed(1)}u — half stakes active</b></span>`;
+        items += `<span class="b-item" title="The pick ledger is ${dd.toFixed(1)}u below its peak. Cold stretches are normal — the discipline that survives them is smaller stakes, never bigger ones. Consider betting half the suggested units until the line turns.">⚠️ <b class="bad">drawdown −${dd.toFixed(1)}u — consider half stakes</b></span>`;
       }
     }
   }
