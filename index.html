@@ -589,7 +589,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v10.2';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v10.3';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1073,6 +1073,11 @@ const Brain = (() => {
     totalsBias: sportId => db.totalsBias[sportId] || null,
     pendingFor: (sportId, gid) => db.pending[sportId + '|' + gid] || null,
     settledFor: (sportId, gid) => db.stats.betlog.find(x => x.gid === String(gid) && x.k === sportId) || null,
+    // units below the ⭐ ledger's peak (0 = at a new peak) — fuels the tilt guard
+    drawdown() {
+      const s = db.stats.betlog.map(x => x.c);
+      return s.length ? Math.max(0, ...s) - s[s.length - 1] : 0;
+    },
     // unit P/L per day for one sport, newest day first: [[ymd, pnl], ...]
     sportDaily(sportId) {
       const byDay = {};
@@ -1525,7 +1530,7 @@ function reconstructPicks(sport, events) {
 }
 
 // totals: stdev of combined final score, for Over/Under probability
-const TOTAL_SIGMA = { mlb: 4.6, wnba: 17, nba: 19, nfl: 13.5, nhl: 2.2 };
+const TOTAL_SIGMA = { mlb: 4.6, wnba: 17, nba: 19, nfl: 13.5, nhl: 2.2, mls: 1.8 };
 // MLB park run factors (multi-year approximations, keyed by home-team abbr).
 // Applied at half strength (sqrt) because team scoring rates already carry
 // ~half of their own home park's effect.
@@ -1679,9 +1684,10 @@ function computeBestPick(g, sport) {
     cands.push({ side: 'under', type: 'total', line: g.total.line, p: 1 - g.total.pOver, b, imp, text: `Under ${g.total.line}` });
   }
   if (!cands.length) return { kind: 'model', text: `${pickName} to win`, sub: 'model lean · line not parseable' };
+  const tilt = Brain.drawdown() >= 8;   // cold stretch: the tilt guard halves every stake
   cands.forEach(c => {
     c.ev = c.p * c.b - (1 - c.p);
-    const kf = KELLY_FRACTION * (c.b * c.p - (1 - c.p)) / c.b;
+    const kf = KELLY_FRACTION * (tilt ? 0.5 : 1) * (c.b * c.p - (1 - c.p)) / c.b;
     c.units = c.ev >= MIN_EV ? Math.min(5, Math.max(0.5, Math.round(kf * 1000) / 10)) : 0;
   });
   cands.sort((x, y) => y.ev - x.ev);
@@ -1692,7 +1698,7 @@ function computeBestPick(g, sport) {
     side: best.side, b: best.b, p: best.p, betType: best.type,
     homeSpread: best.homeSpread ?? null, line: best.line ?? null,
     units: best.units,
-    sub: `model ${pct(best.p)} vs implied ${pct(best.imp)}` };
+    sub: `model ${pct(best.p)} vs implied ${pct(best.imp)}${tilt ? ' · half stakes (drawdown guard)' : ''}` };
 }
 
 function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
@@ -2424,7 +2430,7 @@ function renderBrain() {
     if (series.length >= 10) {
       const dd = Math.max(0, ...series) - series[series.length - 1];
       if (dd >= 8) {
-        items += `<span class="b-item" title="The pick ledger is ${dd.toFixed(1)}u below its peak. Cold stretches are normal — the discipline that survives them is smaller stakes, never bigger ones. Consider half units until the line turns.">⚠️ <b class="bad">drawdown −${dd.toFixed(1)}u — half stakes advised</b></span>`;
+        items += `<span class="b-item" title="The pick ledger is ${dd.toFixed(1)}u below its peak. Cold stretches are normal — the discipline that survives them is smaller stakes, never bigger ones. Suggested stakes are automatically halved until the line turns.">⚠️ <b class="bad">drawdown −${dd.toFixed(1)}u — half stakes active</b></span>`;
       }
     }
   }
