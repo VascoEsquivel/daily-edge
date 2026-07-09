@@ -564,6 +564,7 @@
   <div id="brainbar"></div>
   <div id="histpanel"></div>
   <div id="pmpanel"></div>
+  <div id="calibpanel"></div>
   <div id="ledgerpanel"></div>
   <div id="mybetspanel"></div>
   <div id="content"></div>
@@ -589,7 +590,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v10.7';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v10.8';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -617,7 +618,7 @@ const state = {
   cache: new Map(),            // key: sportId|yyyymmdd -> { events, fetchedAt }
   liveTimer: null,
   openCards: new Set(),        // expanded bet boards, kept open across refreshes
-  showHistory: false, showPM: false, showMyBets: false, showLedger: false,
+  showHistory: false, showPM: false, showMyBets: false, showLedger: false, showCalib: false,
   filter: 'all', sort: 'time', query: '',
   slip: [], slipOpen: false,
   lastEntries: new Map(), activeEntry: null,
@@ -2659,6 +2660,7 @@ function renderBrain() {
     <button class="b-btn" id="histbtn">📜 ${state.showHistory ? 'hide' : 'history'}</button>
     <button class="b-btn" id="ledgerbtn" title="Every ⭐ suggested pick with its result — the tail-everything record">⭐ ${state.showLedger ? 'hide' : 'pick ledger'}</button>
     <button class="b-btn" id="pmbtn" title="Why the losing ⭐ bets missed">🔍 ${state.showPM ? 'hide' : 'post-mortems'}${Brain.postmortems().length ? ' (' + Brain.postmortems().length + ')' : ''}</button>
+    <button class="b-btn" id="calibbtn" title="Reliability: when the model says X%, does it hit X%?">📊 ${state.showCalib ? 'hide' : 'calibration'}</button>
     <button class="b-btn" id="mybtn" title="Track the bets you actually place">🎯 ${state.showMyBets ? 'hide' : 'my bets'}${mb.open ? ' (' + mb.open + ' open)' : ''}</button>
     <button class="b-btn" id="exportbtn" title="Copy this trained brain to the clipboard">⬆ export</button>
     <button class="b-btn" id="importbtn" title="Paste a brain export from another device">⬇ import</button>
@@ -2666,6 +2668,7 @@ function renderBrain() {
   </div>`;
   renderHistory();
   renderPostmortems();
+  renderCalibration();
   renderMyBets();
   renderPickLedger();
 }
@@ -2821,6 +2824,61 @@ function renderHistory() {
       <span class="${r.ok ? 'ok' : 'bad'}">${r.ok ? '✓' : '✗'}</span></div>`;
   });
   el.innerHTML = `<div class="hist">${html}</div>`;
+}
+
+// 📊 Reliability chart: bucket every finished pick by the confidence the model claimed,
+// then compare that claim to the rate it actually hit. The single most important honesty
+// check — a model that says 70% but wins 60% is quietly torching the bankroll.
+function renderCalibration() {
+  const el = $('#calibpanel');
+  if (!state.showCalib) { el.innerHTML = ''; return; }
+  const log = (Brain.history() || []).filter(r => typeof r.p === 'number' && (r.ok === true || r.ok === false));
+  if (log.length < 30) {
+    el.innerHTML = `<div class="hist"><div class="h-date">📊 CALIBRATION — is the model honest about its confidence?</div>
+      <div class="h-empty">Need ~30 finished picks to chart this reliably (have ${log.length}). It fills in as finals land.</div></div>`;
+    return;
+  }
+  const edges = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 1.01];
+  const buckets = edges.slice(0, -1).map((lo, i) => ({ lo, hi: edges[i + 1], n: 0, hit: 0, psum: 0 }));
+  let brier = 0, pSum = 0, hitSum = 0;
+  log.forEach(r => {
+    const p = Math.min(0.999, Math.max(0.5, r.p / 100)), y = r.ok ? 1 : 0;
+    brier += (p - y) ** 2; pSum += p; hitSum += y;
+    const b = buckets.find(b => p >= b.lo && p < b.hi) || buckets[buckets.length - 1];
+    b.n++; b.hit += y; b.psum += p;
+  });
+  brier /= log.length;
+  const meanPred = pSum / log.length, actual = hitSum / log.length, gap = actual - meanPred;
+  // reliability diagram: model-said (x) vs actually-hit (y); dashed diagonal = perfect
+  const X = p => ((p - 0.5) / 0.5) * 100, Y = a => 100 - ((a - 0.5) / 0.5) * 100;
+  const dots = buckets.filter(b => b.n > 0).map(b => {
+    const pred = b.psum / b.n, act = b.hit / b.n, rad = Math.min(6, 1.6 + Math.sqrt(b.n) * 0.7);
+    return `<circle cx="${X(pred).toFixed(1)}" cy="${Y(act).toFixed(1)}" r="${rad.toFixed(1)}" fill="${act >= pred - 0.03 ? 'var(--accent)' : 'var(--hot)'}" opacity="0.85"/>`;
+  }).join('');
+  const verdict = Math.abs(gap) <= 0.02
+    ? `<span class="chip hit">✅ well-calibrated</span> when it says a number, it hits it`
+    : gap < 0
+      ? `<span class="chip miss">⚠️ overconfident by ${(Math.abs(gap) * 100).toFixed(1)}pts</span> shade its win-probs down a touch before betting`
+      : `<span class="chip lean">↑ underconfident by ${(gap * 100).toFixed(1)}pts</span> it's sharper than it claims — there's edge left on the table`;
+  const rows = buckets.filter(b => b.n >= 5).map(b => {
+    const pred = b.psum / b.n, act = b.hit / b.n, d = act - pred;
+    const hi = Math.min(100, Math.round(b.hi * 100));
+    return `<div class="h-row"><span class="h-match">${Math.round(b.lo * 100)}–${hi}% confidence</span>
+      <span class="h-pick">${b.n} picks · predicted ${(pred * 100).toFixed(0)}% → hit ${(act * 100).toFixed(0)}%</span>
+      <span class="${d >= -0.03 ? 'ok' : 'bad'}">${d >= 0 ? '+' : ''}${(d * 100).toFixed(0)}</span></div>`;
+  }).join('');
+  el.innerHTML = `<div class="hist">
+    <div class="h-date">📊 CALIBRATION — does the model's confidence match reality?</div>
+    <div class="bo-fair">Across ${log.length} finished picks it claims <b>${(meanPred * 100).toFixed(1)}%</b> on average and actually hits <b>${(actual * 100).toFixed(1)}%</b> · Brier <b>${brier.toFixed(3)}</b>. ${verdict}</div>
+    <svg viewBox="-8 -8 116 122" style="width:100%;max-width:340px;height:230px;margin:8px 0">
+      <line x1="0" y1="100" x2="100" y2="0" stroke="var(--muted)" stroke-dasharray="3 3" stroke-width="0.8"/>
+      ${dots}
+      <text x="50" y="113" text-anchor="middle" font-size="5.5" fill="var(--muted)">model says →  (dots above the line = it wins more than it claims)</text>
+      <text x="-4" y="50" text-anchor="middle" font-size="5.5" fill="var(--muted)" transform="rotate(-90 -4 50)">actually hits →</text>
+    </svg>
+    ${rows}
+    <div class="bo-fair">Green dots sit on or above the dashed line (honest or better); red dots below it mean that confidence band loses more than it should.</div>
+  </div>`;
 }
 
 function renderContent(sport, entry) {
@@ -3631,6 +3689,7 @@ $('#content').addEventListener('input', e => {
 $('#brainbar').addEventListener('click', e => {
   if (e.target.closest('#histbtn')) { state.showHistory = !state.showHistory; renderBrain(); return; }
   if (e.target.closest('#pmbtn')) { state.showPM = !state.showPM; renderBrain(); return; }
+  if (e.target.closest('#calibbtn')) { state.showCalib = !state.showCalib; renderBrain(); return; }
   if (e.target.closest('#ledgerbtn')) { state.showLedger = !state.showLedger; renderBrain(); return; }
   if (e.target.closest('#mybtn')) { state.showMyBets = !state.showMyBets; renderBrain(); return; }
   if (e.target.closest('#exportbtn')) {
