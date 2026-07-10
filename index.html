@@ -590,7 +590,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v11.0';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v11.1';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1019,6 +1019,7 @@ const Brain = (() => {
     // full pick record: fuels the bankroll sparkline AND the ⭐ pick ledger display
     db.stats.betlog.push({ c: +db.stats.pnl.toFixed(2), w: !!won,
       gid: String(g.id), k: key.split('|')[0], rec: bet.rec || undefined,
+      gr: bet.grade || undefined,
       d: ymd(g.start), t: bet.text || `${bet.side} ${bet.type}`, m: bet.m || '',
       u: bet.units, b: bet.b, p: bet.p ?? null,
       pnl: +(won ? bet.units * bet.b : -bet.units).toFixed(2),
@@ -1120,6 +1121,7 @@ const Brain = (() => {
       db.pending[key] = { side: g.bp.side, b: g.bp.b, units: g.bp.units, p: g.bp.p ?? null,
                           type: g.bp.betType, homeSpread: g.bp.homeSpread ?? null, line: g.bp.line ?? null,
                           text: g.bp.text, why: g.why || [], m: `${g.away.abbr} @ ${g.home.abbr}`,
+                          grade: g.bp.grade ?? null,
                           marketP: taken, takenImplied: taken, closeImplied: taken };
       changed = true;
     });
@@ -1710,6 +1712,7 @@ function reconstructPicks(sport, events) {
     Brain.reconstruct(sport, g, { side: bp.side, b: bp.b, units: bp.units, p: bp.p ?? null,
       type: bp.betType, homeSpread: bp.homeSpread ?? null, line: bp.line ?? null,
       text: bp.text, why: g.why || [], m: `${g.away.abbr} @ ${g.home.abbr}`,
+      grade: bp.grade ?? null,
       marketP: 1 / (bp.b + 1), rec: true });
   });
 }
@@ -1989,12 +1992,33 @@ function computeBestPick(g, sport) {
   const best = cands[0];
   if (best.ev < MIN_EV) return { kind: 'pass', text: 'PASS', ev: best.ev, board: cands,
     sub: `best side ${best.text} · EV ${(best.ev * 100).toFixed(1)}% — not worth the vig` };
+  const grade = pickGrade(g, best);
   return { kind: 'ev', text: best.text, ev: best.ev, board: cands,
     side: best.side, b: best.b, p: best.p, betType: best.type,
     homeSpread: best.homeSpread ?? null, line: best.line ?? null,
-    units: best.units,
+    units: best.units, grade,
     sub: `model ${pct(best.p)} vs implied ${pct(best.imp)}` };
 }
+
+// 🎓 pick quality grade: how many independent signals back this play. A = concentrate,
+// B = solid, C = thin edge (fine to skip). Honest by construction: the grade is logged
+// with every pick, so the ledger's grade line shows how each tier ACTUALLY performs —
+// the data decides whether tailing only A-grades beats tailing everything.
+function pickGrade(g, best) {
+  let s = 0;
+  if (best.p >= 0.58 && best.p <= 0.75) s++;            // the calibration sweet band (overperforms historically)
+  if ((g.why || []).length >= 2) s++;                   // two or more independent drivers agree
+  if (best.p - best.imp < 0.08) s++;                    // not a monster model-vs-market gap (the fade zone)
+  if (best.ev >= 0.03 && best.ev <= 0.25) s++;          // real but PLAUSIBLE edge — 30%+ EV usually means a stale/estimated price
+  if (!/\(est\.\)/.test(best.text)) s++;                // priced off a real listed line, not an estimate
+  return s >= 4 ? 'A' : s >= 3 ? 'B' : 'C';
+}
+const GRADE_CHIP = {
+  A: ['hit', 'A-grade: 4+ confirming signals (sweet-band confidence, multiple drivers, sane market gap, plausible EV, real price). The concentrate-your-units tier.'],
+  B: ['lean', 'B-grade: 3 confirming signals — solid, standard stake.'],
+  C: ['mkt', 'C-grade: thin edge with few confirming signals — smallest stakes, or skip. The ledger tracks every grade so the data shows if C-grades are worth playing at all.'],
+};
+const gradeChip = gr => gr ? `<span class="chip ${GRADE_CHIP[gr][0]}" title="${esc(GRADE_CHIP[gr][1])}">🎓 ${gr}</span>` : '';
 
 function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
   const games = (json.events || []).map(ev => {
@@ -2384,7 +2408,7 @@ function bestPickStrip(g) {
   return `<div class="bestpick ${bp.kind}">
     <span class="bp-tag">${icon} ${tag}</span>
     <span class="bp-main">${esc(bp.text)}</span>
-    ${ev}${units}${steam}${slipBtn}
+    ${bp.kind === 'ev' ? gradeChip(bp.grade) : ''}${ev}${units}${steam}${slipBtn}
     <span class="bp-sub">${esc(bp.sub)}</span>
   </div>`;
 }
@@ -2853,6 +2877,14 @@ function renderPickLedger() {
   const perSport = !sportsSeen.length ? '' :
     `<div class="bo-fair" style="margin-top:6px">${sportsSeen.map(([k, r]) =>
       `<span class="chip ${r.pnl >= 0 ? 'hit' : 'miss'}" style="margin-right:6px">${SPORT_ICON[k] || k} ${r.w}–${r.l} · ${r.pnl >= 0 ? '+' : ''}${r.pnl.toFixed(1)}u</span>`).join('')}</div>`;
+  // 🎓 record by pick grade — the receipt that shows whether A-grades actually earn their name
+  const byGr = {};
+  log.forEach(x => { if (!x.gr) return; const r = byGr[x.gr] = byGr[x.gr] || { w: 0, n: 0, pnl: 0 }; r.n++; if (x.w) r.w++; r.pnl += x.pnl || 0; });
+  const grLine = !Object.keys(byGr).length ? '' :
+    `<div class="bo-fair" style="margin-top:6px">🎓 by grade: ${['A', 'B', 'C'].filter(k => byGr[k]).map(k => {
+      const r = byGr[k];
+      return `<span class="${r.pnl >= 0 ? 'ok' : 'bad'}">${k}: ${r.w}–${r.n - r.w} (${Math.round(r.w / r.n * 100)}%) ${r.pnl >= 0 ? '+' : ''}${r.pnl.toFixed(1)}u</span>`;
+    }).join(' · ')} — if the A's outperform, concentrate there</div>`;
   // per-day record, shown on each date header
   const byDay = {};
   log.forEach(x => { const r = byDay[x.d] = byDay[x.d] || { w: 0, n: 0, pnl: 0 }; r.n++; if (x.w) r.w++; r.pnl += x.pnl || 0; });
@@ -2870,7 +2902,7 @@ function renderPickLedger() {
   });
   // explicit total under the day-by-day list — same numbers as TAIL-EVERYTHING above
   const totalRow = `<div class="h-date" style="margin-top:10px">TOTAL: ${w}–${l} (${Math.round(w / log.length * 100)}%) · <span class="${pnl >= 0 ? 'ok' : 'bad'}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}u</span></div>`;
-  el.innerHTML = `<div class="hist">${head}${summary}${perSport}${rows}${totalRow}</div>`;
+  el.innerHTML = `<div class="hist">${head}${summary}${perSport}${grLine}${rows}${totalRow}</div>`;
 }
 
 // 🎯 My Bets panel: log, view, settle, and audit your real tickets
@@ -3233,8 +3265,11 @@ function slateSimSection(evs) {
 
 function renderCard(allEvents) {
   const bySport = Object.fromEntries(SPORTS.map(s => [s.id, s]));
+  // A-grades first: a plausible, multi-confirmed edge beats a giant EV number
+  // computed off an estimated or stale price (those are usually the C's)
+  const GRANK = { A: 0, B: 1, C: 2 };
   const evs = allEvents.filter(g => g.state === 'pre' && g.bp?.kind === 'ev')
-    .sort((a, b) => b.bp.ev - a.bp.ev);
+    .sort((a, b) => ((GRANK[a.bp.grade] ?? 3) - (GRANK[b.bp.grade] ?? 3)) || b.bp.ev - a.bp.ev);
   const live = allEvents.filter(g => g.state === 'in');
   const locks = allEvents.filter(g => g.state === 'pre' && g.bp?.kind !== 'ev' && g.pick !== 'draw' && g.pickProb >= 0.62)
     .sort((a, b) => b.pickProb - a.pickProb).slice(0, 6);
@@ -3243,7 +3278,7 @@ function renderCard(allEvents) {
     .sort((a, b) => b.start - a.start);
   const sec = (title, arr) => arr.length
     ? `<div class="section-h">${title}</div><div class="games" style="margin-bottom:24px">${arr.map((g, i) => gameCard(g, i, bySport[g.sportId])).join('')}</div>` : '';
-  const body = sec('💰 +EV plays — every sport, ranked', evs)
+  const body = sec('💰 +EV plays — 🎓 A-grades first, then by edge', evs)
     + sec('● Live right now', live)
     + sec('⭐ Settled — the day\'s receipts', settled)
     + sec('🔒 Confidence board — big favorites, no priced edge', locks);
