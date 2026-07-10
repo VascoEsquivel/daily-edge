@@ -590,7 +590,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v10.9';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v11.0';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1525,6 +1525,10 @@ async function getWinds(json) {
 const CORE_API = 'https://sports.core.api.espn.com/v2/sports';
 const V3_API = 'https://site.web.api.espn.com/apis/common/v3/sports';
 // ESPN milestone prop type -> our PROP_STATS id + the v3 average label to read
+// ESPN's prop feed switches market style by provider/day: "X Milestones" (integer
+// thresholds, "2+") some days, "Total X" (half-point O/U lines, "6.5") others.
+// Both carry current.target + an american price for the over/yes side, so one map
+// covers them — the threshold format is normalized at grade time.
 const PROP_TYPE_MAP = {
   'Points Milestones': { stat: 'pts', label: 'PTS' },
   'Rebounds Milestones': { stat: 'reb', label: 'REB' },
@@ -1534,7 +1538,23 @@ const PROP_TYPE_MAP = {
   'Hits Milestones': { stat: 'hits', label: 'H' },
   'Total Bases Milestones': { stat: 'tb', label: 'TB' },
   'RBIs Milestones': { stat: 'rbi', label: 'RBI' },
+  'Total Points': { stat: 'pts', label: 'PTS' },
+  'Total Rebounds': { stat: 'reb', label: 'REB' },
+  'Total Assists': { stat: 'ast', label: 'AST' },
+  'Total Made Threes': { stat: 'threes', label: '3PT' },
+  'Total 3-Point Field Goals': { stat: 'threes', label: '3PT' },
+  'Total Strikeouts': { stat: 'ks', label: 'K' },
+  'Total Hits': { stat: 'hits', label: 'H' },
+  'Total Bases': { stat: 'tb', label: 'TB' },
+  'Total RBIs': { stat: 'rbi', label: 'RBI' },
+  'Total Runs Batted In': { stat: 'rbi', label: 'RBI' },
+  'Total Shots on Goal': { stat: 'sog', label: 'SOG' },
+  'Total Goals': { stat: 'goals', label: 'G' },
 };
+// "2+ hits" (milestone) vs "o6.5 Ks" (total line) — one display helper for both
+const thrTxt = t => Number.isInteger(t) ? `${t}+` : `o${t}`;
+// P(over) needs the exclusive line: milestones "2+" mean ≥2 → line 1.5; "6.5" is already a line
+const effLine = t => Number.isInteger(t) ? t - 0.5 : t;
 function coreBase(sport) { const [grp, lg] = sport.path.split('/'); return `${grp}/leagues/${lg}`; }
 
 // current-season per-game average for a stat label from a v3 athlete-stats payload
@@ -1575,6 +1595,47 @@ function mlbSeasonRate(v3, statId) {
   return null;   // pitcher Ks etc. not derived here
 }
 
+// ── Player game logs (rotobot-style L10 hit rates) ──────────────────────
+// ESPN's per-athlete gamelog is CORS-open and returns each game's stat line.
+// From it we compute (a) the L10 hit rate for a prop's exact threshold — the
+// "did he actually clear this line lately" signal — and (b) a recent per-game
+// rate that fixes the season-total dilution for part-time starters.
+const gameLogCache = new Map();
+function fetchGameLog(sport, athleteId) {
+  const key = sport.id + '|' + athleteId;
+  if (!gameLogCache.has(key)) {
+    gameLogCache.set(key, fetch(`${V3_API}/${sport.path}/athletes/${athleteId}/gamelog`)
+      .then(r => r.json())
+      .then(j => {
+        if (!j?.labels || !j?.seasonTypes) return null;
+        const rows = [];
+        (j.seasonTypes || []).forEach(st => (st.categories || []).forEach(c =>
+          (c.events || []).forEach(e => {
+            const meta = j.events?.[e.eventId];
+            if (meta?.gameDate && Array.isArray(e.stats)) rows.push({ d: meta.gameDate, stats: e.stats });
+          })));
+        rows.sort((a, b) => new Date(b.d) - new Date(a.d));   // newest first
+        return { labels: j.labels, rows };
+      }).catch(() => null));
+  }
+  return gameLogCache.get(key);
+}
+
+// one game's value for a prop stat from a gamelog row ("10-19" style → made count)
+function gamelogVal(statId, labels, stats) {
+  if (statId === 'tb') {   // total bases synthesized from the hit breakdown
+    const g = k => { const i = labels.indexOf(k); const v = i >= 0 ? parseFloat(stats[i]) : NaN; return isNaN(v) ? null : v; };
+    const h = g('H'), d = g('2B'), t = g('3B'), hr = g('HR');
+    return [h, d, t, hr].some(x => x == null) ? null : h + d + 2 * t + 3 * hr;
+  }
+  const LBL = { pts: ['PTS'], reb: ['REB'], ast: ['AST'], threes: ['3PT'],
+                hits: ['H'], rbi: ['RBI'], ks: ['K', 'SO'], sog: ['SOG', 'S'], goals: ['G'] };
+  const idx = (LBL[statId] || []).map(k => labels.indexOf(k)).find(i => i >= 0);
+  if (idx == null) return null;
+  const v = parseFloat(String(stats[idx] ?? '').split('-')[0]);
+  return isNaN(v) ? null : v;
+}
+
 const gamePropsCache = new Map();
 function fetchGameProps(sport, ev) {
   if (sport.soccer || sport.tennis) return Promise.resolve([]);
@@ -1592,9 +1653,12 @@ function fetchGameProps(sport, ev) {
     await Promise.all(refs.map(async r => {
       try {
         const a = await fetch(r.replace('http://', 'https://')).then(x => x.json());
-        const v3 = await fetch(`${V3_API}/${sport.path}/athletes/${a.id}/stats`).then(x => x.json()).catch(() => null);
-        info.set(r, { name: a.displayName || a.shortName || '?', v3 });
-      } catch { info.set(r, { name: '?', v3: null }); }
+        const [v3, gl] = await Promise.all([
+          fetch(`${V3_API}/${sport.path}/athletes/${a.id}/stats`).then(x => x.json()).catch(() => null),
+          fetchGameLog(sport, a.id),
+        ]);
+        info.set(r, { name: a.displayName || a.shortName || '?', v3, gl });
+      } catch { info.set(r, { name: '?', v3: null, gl: null }); }
     }));
     return items.map(it => {
       const m = PROP_TYPE_MAP[it.type.name];
@@ -1603,8 +1667,20 @@ function fetchGameProps(sport, ev) {
       const threshold = parseFloat(it.current.target.displayValue);
       if (isNaN(american) || isNaN(threshold)) return null;
       const avg = meta.v3 ? (sport.id === 'mlb' ? mlbSeasonRate(meta.v3, m.stat) : seasonAvg(meta.v3, m.label)) : null;
-      return { player: meta.name, statId: m.stat, threshold, american, imp: mlToProb(american), avg };
-    }).filter(Boolean);
+      // L10 reality check: how often did he actually clear THIS line lately?
+      let l10 = null, recent = null;
+      if (meta.gl) {
+        const vals = meta.gl.rows.map(row => gamelogVal(m.stat, meta.gl.labels, row.stats))
+          .filter(v => v != null).slice(0, 10);
+        if (vals.length >= 5) {
+          l10 = { hit: vals.filter(v => v >= threshold).length, n: vals.length };
+          recent = vals.reduce((s, v) => s + v, 0) / vals.length;
+        }
+      }
+      return { player: meta.name, statId: m.stat, threshold, american, imp: mlToProb(american), avg, recent, l10 };
+    }).filter(Boolean)
+      // the feed can list the same line twice (multiple providers) — keep the first
+      .filter((x, i, arr) => arr.findIndex(y => y.player === x.player && y.statId === x.statId && y.threshold === x.threshold) === i);
   })().catch(() => []);
   gamePropsCache.set(key, p);
   return p;
@@ -2411,29 +2487,34 @@ function renderCardProps(g, items, pg) {
     || { key: g.sportId + '|' + g.id, label: `${SPORT_ICON[g.sportId]} ${g.away.abbr} @ ${g.home.abbr}` };
   if (!items || !items.length)
     return '<div class="bo-fair">no player-prop markets are posted for this game yet — check back closer to game time. (Each side\'s season leaders show under PROP ANGLES above.)</div>';
-  const sideTxt = x => x.side === 'under' ? `under ${x.threshold}` : `${x.threshold}+`;
+  const sideTxt = x => x.side === 'under' ? `under ${x.threshold}` : thrTxt(x.threshold);
+  // rotobot-style L10 reality chip: how often he ACTUALLY cleared this line lately
+  const l10chip = x => x.l10
+    ? `<span class="chip ${x.l10.hit / x.l10.n >= 0.6 ? 'hit' : x.l10.hit / x.l10.n <= 0.4 ? 'miss' : 'lean'}" title="cleared this line in ${x.l10.hit} of his last ${x.l10.n} games">L10 ${x.l10.hit}/${x.l10.n}</span>` : '';
   const gaps = items.filter(x => x.ev != null).map(x => ({ ...x, gap: Math.abs(x.over - x.imp) }))
     .filter(x => x.gap >= 0.06).sort((a, b) => b.gap - a.gap).slice(0, 5);
   const top = gaps.length
     ? gaps.map(x => `<div class="bo-row bet"><span class="bo-bet">${esc(x.player)} lean ${sideTxt(x)} ${esc(x.statId)}</span>
-        <span>mkt ${pct(x.imp)}</span><span>model ${pct(x.over)}</span>
+        <span>mkt ${pct(x.imp)}</span><span>model ${pct(x.over)}</span>${l10chip(x)}
         <span class="bo-ev ${x.side === 'under' ? 'neg' : 'pos'}">${x.side === 'under' ? '↓' : '↑'} ${Math.round(x.gap * 100)}pt</span>
         <button class="addleg" data-leg="${esc(JSON.stringify(propToLeg(pg, x)))}">+ slip</button></div>`).join('')
     : '<div class="bo-fair">the model lines up with the market on this game\'s central lines — nothing to flag.</div>';
-  // per-player: season rate + each posted line (with the model's read), players by best EV
+  // per-player: season + recent rate, each posted line with the model's read + L10 record
   const byPlayer = new Map();
   items.forEach(x => { if (!byPlayer.has(x.player)) byPlayer.set(x.player, []); byPlayer.get(x.player).push(x); });
   const players = [...byPlayer.entries()].map(([name, arr]) => ({ name, arr, best: Math.max(...arr.map(x => x.ev ?? -9)) }))
     .sort((a, b) => b.best - a.best).slice(0, 8);
   const plHtml = players.map(pl => {
     const a0 = pl.arr[0];
+    const rateStr = a0.avg != null ? ` · ${a0.avg.toFixed(1)} ${esc(a0.statId)}/g` : '';
+    const recStr = a0.recent != null ? ` · L10 ${a0.recent.toFixed(1)}/g${a0.avg ? (a0.recent >= a0.avg * 1.15 ? ' 🔥' : a0.recent <= a0.avg * 0.85 ? ' 🥶' : '') : ''}` : '';
     const chips = pl.arr.sort((a, b) => a.threshold - b.threshold).map(x =>
-      `<span class="prop-chip" title="market ${pct(x.imp)}${x.over != null ? ' · model ' + pct(x.over) : ''}">${x.threshold}+ ${esc(x.statId)}${x.over != null ? ' · ' + pct(x.over) : ''}</span>`).join('');
-    return `<div class="prop-row"><b>${esc(pl.name)}${a0.avg != null ? ` · ${a0.avg.toFixed(1)} ${esc(a0.statId)}/g` : ''}</b>${chips}</div>`;
+      `<span class="prop-chip" title="market ${pct(x.imp)}${x.over != null ? ' · model ' + pct(x.over) : ''}${x.l10 ? ` · cleared in ${x.l10.hit}/${x.l10.n} recent games` : ''}">${thrTxt(x.threshold)} ${esc(x.statId)}${x.over != null ? ' · ' + pct(x.over) : ''}${x.l10 ? ` · L10 ${Math.round(x.l10.hit / x.l10.n * 100)}%` : ''}</span>`).join('');
+    return `<div class="prop-row"><b>${esc(pl.name)}${rateStr}${recStr}</b>${chips}</div>`;
   }).join('');
   return `<div class="bo-fair" style="margin-bottom:4px">📊 biggest model-vs-market gaps — spots to <b>investigate</b>, not locks</div>${top}
-    <div class="bo-h" style="margin-top:10px;color:var(--text)">player lines &amp; season rates</div>${plHtml}
-    <div class="bo-fair">Real milestone lines ("X+" = reach X). The season-rate model is a second opinion — verify recent form/matchup via the 🎯 Props lab. "+ slip" adds a vetted leg.</div>`;
+    <div class="bo-h" style="margin-top:10px;color:var(--text)">player lines · season &amp; recent rates · L10 = games he actually cleared it</div>${plHtml}
+    <div class="bo-fair">Real milestone lines ("X+" = reach X). Model = season + last-10 blend from his real game log; L10 = how often he cleared that exact line. Verify matchup context via the 🎯 Props lab. "+ slip" adds a vetted leg.</div>`;
 }
 
 // Full bet board: every priced side with model %, market %, EV, and stake — plus fair prices
@@ -3551,7 +3632,7 @@ function propToLeg(pg, x) {
   const yes = x.imp * 100, cents = under ? OVERROUND_PROP * 100 - yes : yes;
   const b = (100 - cents) / cents;
   return { gid: `prop|${pg.key}|${x.player}|${x.statId}|${x.threshold}|${x.side || 'over'}`,
-    t: under ? `${x.player} u${x.threshold} ${label}` : `${x.player} ${x.threshold}+ ${label}`,
+    t: under ? `${x.player} u${x.threshold} ${label}` : `${x.player} ${thrTxt(x.threshold)} ${label}`,
     p: +prob.toFixed(3), b: +b.toFixed(3), m: pg.label.replace(/^\S+\s/, ''), k: 'props', tm: '', ev: x.ev };
 }
 
@@ -3560,9 +3641,13 @@ function propToLeg(pg, x) {
 function gradeGameProps(pg, items) {
   return items.map(x => {
     const stat = PROP_STATS.find(s => s.id === x.statId);
+    // blend season rate with the L10 per-game rate (gamelog only counts games actually
+    // played, so this also un-dilutes part-time starters). 50/50 once both exist.
+    const rate = x.avg != null && x.recent != null ? 0.5 * x.avg + 0.5 * x.recent
+      : x.recent ?? x.avg;
     let over = null, side = null, ev = null;
-    if (stat && x.avg != null && x.avg > 0) {
-      over = propOver(stat, x.avg, x.threshold - 0.5);   // "15+" = P(X ≥ 15)
+    if (stat && rate != null && rate > 0) {
+      over = propOver(stat, rate, effLine(x.threshold));   // "15+" = P(X ≥ 15); "o6.5" = P(X > 6.5)
       // only grade near-median lines: a season-rate model is informative around the middle,
       // but unreliable deep in the tails (where milestone juice is also highest)
       if (over >= 0.28 && over <= 0.72) {
@@ -3633,23 +3718,28 @@ function renderLiveProps() {
   // shortlist to INVESTIGATE, not auto-bets. A season-rate model can't out-sharp a prop market.
   const gaps = lp.items.filter(x => x.ev != null).map(x => ({ ...x, gap: Math.abs(x.over - x.imp) }))
     .filter(x => x.gap >= 0.06).sort((a, b) => b.gap - a.gap);
-  const sideTxt = x => x.side === 'under' ? `under ${x.threshold}` : `${x.threshold}+`;
+  const sideTxt = x => x.side === 'under' ? `under ${x.threshold}` : thrTxt(x.threshold);
   const top = gaps.length
     ? `<div class="bo-h" style="margin-top:8px">📊 MODEL vs MARKET — biggest gaps to investigate</div>` + gaps.slice(0, 6).map(x =>
         `<div class="bo-row bet"><span class="bo-bet">${esc(x.player)} lean ${sideTxt(x)} ${esc(x.statId)}</span>
          <span>mkt ${pct(x.imp)}</span><span>model ${pct(x.over)}</span><span class="bo-ev ${x.side === 'under' ? 'neg' : 'pos'}">${x.side === 'under' ? '↓' : '↑'} ${Math.round(x.gap * 100)}pt</span>
          <button class="addleg" data-leg="${esc(JSON.stringify(propToLeg(pg, x)))}">+ slip</button></div>`).join('')
     : `<div class="bo-fair">the model lines up with the market on this game's central lines — no notable disagreements.</div>`;
-  const rows = players.map(pl => `<div class="bo-h" style="margin-top:11px;color:var(--text)">${esc(pl.name)}${pl.arr[0].avg != null ? ` · ${pl.arr[0].avg.toFixed(1)} ${esc(pl.arr[0].statId)}/g` : ''}</div>` +
+  const rows = players.map(pl => {
+    const a0 = pl.arr[0];
+    const recStr = a0.recent != null ? ` · L10 ${a0.recent.toFixed(1)}/g${a0.avg ? (a0.recent >= a0.avg * 1.15 ? ' 🔥' : a0.recent <= a0.avg * 0.85 ? ' 🥶' : '') : ''}` : '';
+    return `<div class="bo-h" style="margin-top:11px;color:var(--text)">${esc(pl.name)}${a0.avg != null ? ` · ${a0.avg.toFixed(1)} ${esc(a0.statId)}/g` : ''}${recStr}</div>` +
     pl.arr.sort((a, b) => a.threshold - b.threshold).map(x => {
       const evStr = x.ev == null ? '<span>—</span>'
         : `<span class="bo-ev ${x.ev >= 0 ? 'pos' : 'neg'}">${x.side === 'under' ? 'U' : 'O'} ${(x.ev * 100).toFixed(1)}%</span>`;
+      const l10Str = x.l10 ? `<span class="${x.l10.hit / x.l10.n >= 0.6 ? 'ok' : x.l10.hit / x.l10.n <= 0.4 ? 'bad' : ''}" title="cleared this line in ${x.l10.hit} of his last ${x.l10.n}">L10 ${x.l10.hit}/${x.l10.n}</span>` : '<span>—</span>';
       return `<div class="bo-row ${x.ev != null && x.ev >= PROP_MIN_EV ? 'bet' : 'skip'}">
-        <span class="bo-bet">${x.threshold}+ ${esc(x.statId)} ${fmtML(x.american)}</span>
-        <span>mkt ${pct(x.imp)}</span><span>${x.over != null ? 'model ' + pct(x.over) : 'no rate'}</span>${evStr}
-        <button class="prload" data-load="${esc(JSON.stringify({ player: x.player, stat: x.statId, avg: x.avg ?? '', line: x.threshold - 0.5, price: Math.round(x.imp * 100) }))}">grade ↑</button>
+        <span class="bo-bet">${thrTxt(x.threshold)} ${esc(x.statId)} ${fmtML(x.american)}</span>
+        <span>mkt ${pct(x.imp)}</span><span>${x.over != null ? 'model ' + pct(x.over) : 'no rate'}</span>${l10Str}${evStr}
+        <button class="prload" data-load="${esc(JSON.stringify({ player: x.player, stat: x.statId, avg: x.avg ?? '', recent: x.recent != null ? +x.recent.toFixed(2) : '', line: effLine(x.threshold), price: Math.round(x.imp * 100) }))}">grade ↑</button>
       </div>`;
-    }).join('')).join('');
+    }).join('');
+  }).join('');
   el.innerHTML = `<div class="betboard" style="display:block">${top}
     <div class="bo-h" style="margin-top:14px">ALL PROPS · ${esc(pg.label)} — real lines, model second-opinion</div>${rows}
     <div class="bo-fair">These are <b>real milestone lines</b> ("X+" = reach X). "mkt" is the line's implied %, "model" is my season-rate projection. Honest caveat: sharp prop markets are hard to beat and my model tends to read unders on high milestone lines — treat gaps as spots to <b>investigate</b> (check recent form &amp; matchup in the lab up top via "grade ↑"), not locks. "+ slip" adds a leg you've vetted; props combine into parlays in the slip.</div></div>`;
@@ -3746,9 +3836,12 @@ $('#content').addEventListener('click', e => {
   if (prl) {   // "grade ↑" — load a real prop into the manual lab up top
     try {
       const d = JSON.parse(prl.dataset.load);
-      // reset manual context so a freshly-loaded real prop starts clean at its season rate
+      // load the real prop with its real recent form (L10 rate from the game log) —
+      // the lab's role-change detector now starts from actual data, not a blank
       Object.assign(state.props, { player: d.player, stat: d.stat, avg: String(d.avg),
-        line: String(d.line), price: String(d.price), recent: '', matchup: 'neutral', pace: 'neutral' });
+        line: String(d.line), price: String(d.price),
+        recent: d.recent != null && d.recent !== '' ? String(d.recent) : '',
+        matchup: 'neutral', pace: 'neutral' });
       localStorage.setItem('de-props-v1', JSON.stringify(state.props));
       renderProps();
       document.querySelector('#content .section-h')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
