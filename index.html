@@ -590,7 +590,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v11.1';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v11.2';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -941,13 +941,12 @@ const Brain = (() => {
       ? Math.min(2, Math.log(1 + mov / ref) / Math.LN2) * (2.2 / (Math.abs(eH.r - eA.r) * 0.001 + 2.2))
       : 1;
     // dynamic K-factor: smooth low-sample boost (teams early in our lookback move fast to
-    // find their level) × a recency lift (recent games count a little more so ratings track
-    // current form). The whole multiplier is capped so no single game can swing a rating wildly.
+    // find their level), capped so no single game can swing a rating wildly.
+    // Deliberately NO wall-clock recency term: K must depend only on the game itself, so
+    // every device that learns the same game computes the same rating (cross-device sync).
     const nMin = Math.min(eH.n, eA.n);
     const sampleF = 1 + 1.4 / (1 + nMin / 6);
-    const today = Math.floor(Date.now() / 864e5);
-    const recencyF = day ? 0.8 + 0.4 * Math.max(0, Math.min(1, (day - (today - 120)) / 120)) : 1;
-    const kMult = Math.min(4, movM * sampleF * recencyF);
+    const kMult = Math.min(4, movM * sampleF);
     const delta = (ELO_K[sport] || 20) * kMult * (scoreH - pElo);
     eH.r += delta; eA.r -= delta;
     eH.n++; eA.n++;
@@ -1074,8 +1073,9 @@ const Brain = (() => {
         db.processed[key] = today;
         changed = true;
       }
-      // stage 2 — deterministic learning, only for games before today, exactly once
-      if (gday < today && !db.learned[key]) {
+      // stage 2 — deterministic learning, only for games before today, exactly once.
+      // The anchor guard skips anything the adopted canonical brain already learned.
+      if (gday < today && gday > (db.anchor || 0) && !db.learned[key]) {
         const hfaLogit = g.tennis || sport.hfaWin == null ? 0 : logit(sport.hfaWin);
         let mov;
         if (g.tennis) { const [th, ta] = setsTally(g.home.sets, g.away.sets); mov = Math.abs(th - ta); }
@@ -1158,6 +1158,31 @@ const Brain = (() => {
   }
 
   return { adjust, processResults, recordPending, stats, syncFingerprint, history: () => db.log,
+    // 🧬 one consistent base for every device: adopt the canonical pricing brain shipped
+    // with the site (brain.json). Canonical always wins on a new publish — personal state
+    // (tickets, ledger, my bets) is untouched. After adoption every device extends the
+    // same anchor deterministically, so suggested picks match across devices.
+    async adoptCanonical() {
+      try {
+        const r = await fetch('brain.json?x=' + Math.floor(Date.now() / 36e5)).then(x => x.ok ? x.json() : null);
+        if (!r?.through || !r.elo) return false;
+        if (db.canonId === r.id && (db.through || 0) >= r.through) return false;   // already on this base
+        db.elo = r.elo; db.calib = r.calib || {}; db.perf = r.perf || {};
+        db.totalsBias = r.totalsBias || {};
+        db.through = r.through; db.anchor = r.through; db.learned = {};
+        db.canonId = r.id;
+        // brain-level counters ride along so a fresh device shows the brain's real experience
+        ['absorbed', 'hits', 'misses'].forEach(k => db.stats[k] = Math.max(db.stats[k] || 0, r.stats?.[k] || 0));
+        save();
+        return true;
+      } catch { return false; }
+    },
+    // canonical export: everything that PRICES games (none of the personal state)
+    exportCanonical() {
+      return JSON.stringify({ id: syncFingerprint().id, through: db.through || 0,
+        elo: db.elo, calib: db.calib, perf: db.perf, totalsBias: db.totalsBias,
+        stats: { absorbed: db.stats.absorbed, hits: db.stats.hits, misses: db.stats.misses } });
+    },
     postmortems: () => db.postmortems,
     totalsBias: sportId => db.totalsBias[sportId] || null,
     pendingFor: (sportId, gid) => db.pending[sportId + '|' + gid] || null,
@@ -3345,7 +3370,11 @@ async function refresh(force = false) {
 // evolves in true chronological order. Progress is tracked in the brain db, so
 // each launch only studies days it hasn't seen — a fresh brain arrives
 // season-smart after one load, then stays current forever.
-const BACKFILL_DAYS = 120, BACKFILL_CHUNK = 4;
+// CHUNK=1: days are studied strictly one at a time, so every device learns the same
+// games in the same order and lands on identical Elo (order matters to Elo). Cold-start
+// speed is fine because devices adopt the shipped canonical brain.json first and only
+// ever study the few days since it was published.
+const BACKFILL_DAYS = 120, BACKFILL_CHUNK = 1;
 let absorbed = false;
 async function absorbYesterday() {
   if (absorbed) return;
@@ -4014,7 +4043,9 @@ document.addEventListener('keydown', e => {
 
 document.querySelector('.logo .sub').textContent += ' · ' + APP_VERSION;
 renderSlip();
-refresh();
+// adopt the canonical pricing brain BEFORE the first render, so every device
+// prices today's slate from the same base (then extends it deterministically)
+(async () => { await Brain.adoptCanonical(); refresh(); })();
 </script>
 </body>
 </html>
