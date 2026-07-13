@@ -697,7 +697,7 @@
     🔥🥶 Hot/cold: recent margin form gives a small, capped model shift (streaks are mostly noise — never more than ~3%) and chips flag teams 4-1 or better / 1-4 or worse in their last five. Player-level streaks aren't in free data feeds; prop angles show season rates.<br>
     Vegas comparison uses ESPN's published line; "VALUE" flags games where the model disagrees with the market by ≥4%.<br>
     ⭐ BEST PICK is the highest expected-value wager at the listed price (vig included; the unlisted dog price is estimated from a 4.5% book margin). Stake sizes are ¼-Kelly, in units of 1% of bankroll. ✋ NO BET means no side clears +2% EV — passing is a position.<br>
-    🧲 Every candidate probability is anchored toward the de-vigged market number before EV is computed — the closing line is the sharpest public forecast, so a pick only survives when the model's edge holds up against it. Elo confidence is scaled by a Glicko-style rating deviation: a thin or long-idle rating claims less, so it can't manufacture confident picks.<br>
+    🧭 TOP-DOWN BAYESIAN CORE: the de-vigged market line is the PRIOR — the sharpest public estimate there is. The whole bottom-up stack (Glicko-deviation Elo, Pythagorean, Statcast, park &amp; wind, injuries, fatigue, form) computes a likelihood that may nudge that prior by a hard-clamped ±5 points (the α you see on every pick strip). Posted spreads and totals are treated as the market's median: the sim only supplies a bounded α around 50/50. Rogue data is mathematically unable to manufacture a giant fake edge. ⚖️ Stakes are portfolio Kelly: the day's picks are priced as one correlated book (same game ρ=.35, same sport .12, cross-sport .05) and every stake scales down together whenever correlated exposure would top 12u.<br>
     🧠 The model learns: every final updates per-team Elo ratings (margin-of-victory weighted, faster for barely-seen teams) and a per-sport calibration layer (stored locally in your browser). On launch it studies the last 45 days of results in chronological order, then stays current. Predictions blend the record/ranking prior with learned Elo, and the Elo weight grows as the brain sees more of each team. ⭐ picks are logged at the pregame price and settled against the final score. The brain bar separates two records: <b>model picks · straight-up</b> (how often the who-wins pick is right) and <b>⭐ suggested-bet hit</b> (how often the +EV plays cash — usually lower, since value bets are often plus-money dogs, with ROI showing they still profit). "exp" is the rate the model expected; beating it means the edge is real. 📜 History keeps a match-by-match record. ⬆⬇ Export/import moves a trained brain between devices.<br>
     ⚡ Live win probability uses the Stern model — current margin + time remaining vs the pregame expectation — and updates each poll; the ▲▼ shows movement vs the opening number. Click any upcoming match for its full bet board with model vs market prices on every side.<br>
     🎟️ The slip combines legs assuming independence; parlays stack the book's vig, so most are −EV — the slip will tell you. 🎰 The Parlay Generator (top of The Card) auto-builds Safe / Value / Longshot parlays from the day's priced picks and labels each +EV or −EV honestly. 💵 Type your bankroll in the top bar (saves as you type) to see stakes in dollars. Keys: ← → dates · t today · r refresh · 1–9 tabs.<br>
@@ -710,7 +710,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v13.2';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v14.0';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -912,8 +912,8 @@ function negBinOver(line, mean, disp = 0.18) {
   for (let i = 1; i <= k; i++) { term *= (r + i - 1) / i * (1 - pp); cdf += term; }
   return Math.max(0, Math.min(1, 1 - cdf));
 }
-function propOver(stat, mean, line) {
-  if (stat.dist === 'poisson') return negBinOver(line, mean);
+function propOver(stat, mean, line, disp) {
+  if (stat.dist === 'poisson') return negBinOver(line, mean, disp ?? 0.18);
   return 1 - normalCdf((line - mean) / Math.max(0.5, stat.sd(mean)));
 }
 
@@ -2122,7 +2122,7 @@ function parseVegas(comp, sport, home) {
   v.favIsHome = m[1] === home.abbr;
   if (Math.abs(line) >= 100) {
     v.mlFav = line;
-    const favProb = mlToProb(line);
+    const favProb = Math.min(0.97, mlToProb(line) / OVERROUND);   // strip the assumed margin — prior must be FAIR
     v.homeProb = v.favIsHome ? favProb : 1 - favProb;
   } else {
     v.spread = line;
@@ -2241,6 +2241,14 @@ const MonteCarlo = (() => {
 const KELLY_FRACTION = 0.25;   // fraction of full Kelly for stake sizing
 const MIN_EV = 0.02;           // minimum EV to recommend a bet
 const OVERROUND = 1.045;       // assumed two-way book margin when only one price is listed
+// ══ TOP-DOWN BAYESIAN CORE (v14) ══ the de-vigged market line is the PRIOR; the whole
+// bottom-up stack (Elo/Glicko, Pythagorean, xwOBA, park & wind, injuries, fatigue, form)
+// is demoted to a bounded ALPHA that may nudge that prior by at most this much. A liquid
+// line is the sharpest public estimate there is — our features earn small deviations,
+// never a parallel universe. This is the clamp that makes rogue data physically unable
+// to manufacture a giant fake edge.
+const ALPHA_CAP = 0.05;
+const PORTFOLIO_CAP = 12;      // max correlated units at risk simultaneously (12% bankroll)
 
 function computeBestPick(g, sport) {
   if (g.state !== 'pre') return null;
@@ -2278,6 +2286,8 @@ function computeBestPick(g, sport) {
     let pHome;
     if (g.sim && sport.id === 'mlb') pHome = g.sim.pHomeCover(homeSpread);
     else { const sigma = sport.spreadSigma; pHome = normalCdf((invNorm(g.model.home) * sigma + homeSpread) / sigma); }
+    // the posted spread IS the market's median margin — cover prob = 0.5 + clamped alpha
+    pHome = 0.5 + Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, pHome - 0.5));
     const b = 100 / 110, imp = 0.524;                       // spread bets priced -110
     const s = n => (n > 0 ? '+' : '') + n;
     cands.push({ side: 'home', type: 'spread', homeSpread, p: pHome, b, imp, text: `${g.home.abbr} ${s(homeSpread)}` });
@@ -2289,25 +2299,10 @@ function computeBestPick(g, sport) {
     cands.push({ side: 'under', type: 'total', line: g.total.line, p: 1 - g.total.pOver, b, imp, text: `Under ${g.total.line}` });
   }
   if (!cands.length) return { kind: 'model', text: `${pickName} to win`, sub: 'model lean · line not parseable' };
-  // 🧲 market anchor: the betting line is the sharpest public forecast there is, so every
-  // candidate probability is shrunk toward the de-vigged market number before EV is
-  // computed (30% weight vs a real two-way price, 20% vs an estimated one; spread/total
-  // sides anchor toward the 50/50 the posted line implies). Phantom edges — model quirks
-  // the whole market disagrees with — shrink below the EV bar and never become picks;
-  // real edges survive slightly smaller. This is the shrink-to-the-closing-line prior
-  // from the market-efficiency literature, and it directly targets bad +EV days.
-  // λ is PERFORMANCE-WEIGHTED per sport: where the brain's rolling Brier beats its
-  // baseline it has earned more rope (lighter anchor); where it lags, the market gets
-  // more say. perf ships in the canonical brain, so this stays deterministic everywhere.
-  const perf = Brain.perfOf(sport?.id);
-  const pw = perf && perf.n >= 30 && perf.be + perf.bb > 0
-    ? Math.max(0.6, Math.min(1.4, 2 * perf.be / (perf.be + perf.bb))) : 1;
-  cands.forEach(c => {
-    const lam = Math.min(0.5, (c.type !== 'ml' ? 0.25 : c.est ? 0.20 : 0.30) * pw);
-    const mkt = c.type === 'ml' ? (c.fair ?? c.imp) : 0.5;
-    c.pm = c.p;   // raw model number, kept for display honesty
-    c.p = clamp(invlogit((1 - lam) * logit(clamp(c.p)) + lam * logit(clamp(mkt))));
-  });
+  // (v14) NO downstream anchor here anymore: every candidate probability arrives already
+  // market-anchored at the DISTRIBUTION level — ML sides carry prior+clamped-alpha from
+  // parseEvents, spread/total sides are clamped around the posted line's 50/50 above.
+  // Anchoring twice would double-count the prior.
   // canonical stake = quarter-Kelly, a pure function of price+edge → identical on every
   // device. The local drawdown guard is shown as ADVICE (see the pick strip / brain bar),
   // never silently baked into the number, so the suggested pick reads the same everywhere.
@@ -2335,11 +2330,16 @@ function computeBestPick(g, sport) {
     const m = -invNorm(clamp(g.model.home)) * sig;   // home line: favorites negative
     fairLine = ` · model line ${g.home.abbr} ${m > 0 ? '+' : ''}${m.toFixed(1)}`;
   }
+  // sub line speaks the new paradigm: market prior ± the alpha our features earned
+  const ai = g.alphaInfo;
+  const sub = best.type === 'ml' && ai
+    ? `mkt prior ${pct(ai.prior)} ${ai.alpha >= 0 ? '+' : '−'}${Math.abs(ai.alpha * 100).toFixed(1)}α vs implied ${pct(best.imp)}${fairLine}`
+    : `line prior 50% +${((best.p - 0.5) * 100).toFixed(1)}α vs implied ${pct(best.imp)}${fairLine}`;
   return { kind: 'ev', text: best.text, ev: best.ev, board: cands,
     side: best.side, b: best.b, p: best.p, betType: best.type,
     homeSpread: best.homeSpread ?? null, line: best.line ?? null,
     units: best.units, grade,
-    sub: `model ${pct(best.pm)} · 🧲 anchored ${pct(best.p)} vs implied ${pct(best.imp)}${fairLine}` };
+    sub };
 }
 
 // 🎓 pick quality grade: how many independent signals back this play. A = concentrate,
@@ -2350,7 +2350,9 @@ function pickGrade(g, best) {
   let s = 0;
   if (best.p >= 0.58 && best.p <= 0.75) s++;            // the calibration sweet band (overperforms historically)
   if ((g.why || []).length >= 2) s++;                   // two or more independent drivers agree
-  if (best.p - best.imp < 0.08) s++;                    // not a monster model-vs-market gap (the fade zone)
+  // (v14) trust signal: an alpha PINNED at the clamp means the raw model disagreed
+  // wildly with the market — historically the fade zone. Un-pinned alpha = healthy.
+  if (g.alphaInfo ? Math.abs(g.alphaInfo.alpha) < ALPHA_CAP * 0.98 : best.p - best.imp < 0.08) s++;
   if (best.ev >= 0.03 && best.ev <= 0.25) s++;          // real but PLAUSIBLE edge — 30%+ EV usually means a stale/estimated price
   if (!/\(est\.\)/.test(best.text)) s++;                // priced off a real listed line, not an estimate
   return s >= 4 ? 'A' : s >= 3 ? 'B' : 'C';
@@ -2547,6 +2549,17 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         model = { home: p2, away: 1 - p2, draw: 0 };
       }
       var whyDrivers = why;   // hoisted to the game object below
+      // ══ Bayesian conversion ══ everything above was the bottom-up LIKELIHOOD.
+      // When a real line exists, the de-vigged market number is the prior and the
+      // model's disagreement becomes a hard-clamped alpha on top of it. No line
+      // (tennis-style fallbacks, unpriced boards) → the bottom-up number stands alone.
+      if (vegas?.homeProb != null) {
+        const prior = clamp(vegas.homeProb);
+        const alpha = Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, model.home - prior));
+        var alphaInfo = { prior, alpha, raw: model.home };   // hoisted to the game object
+        const p2 = clamp(prior + alpha);
+        model = { home: p2, away: 1 - p2, draw: 0 };
+      }
     }
 
     // pick = highest-probability outcome
@@ -2609,14 +2622,18 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         if (sim) notes.push(`${sim.n / 1000}k-run sim · σ${sim.sdTotal.toFixed(1)}`);
       }
       if (vegas?.ou) {
-        const pOver = sim ? sim.pOver(vegas.ou) : clamp(normalCdf((exp - vegas.ou) / TOTAL_SIGMA[sport.id]));
-        total = { exp, line: vegas.ou, pOver: clamp(pOver), notes };
+        const pOverRaw = sim ? sim.pOver(vegas.ou) : clamp(normalCdf((exp - vegas.ou) / TOTAL_SIGMA[sport.id]));
+        // market-median prior: the posted total IS the market's 50/50 point — the
+        // simulation only supplies a bounded alpha around it
+        const pOver = clamp(0.5 + Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, pOverRaw - 0.5)));
+        total = { exp, line: vegas.ou, pOver, pOverRaw, notes };
       }
     }
 
     const st = ev.status?.type || {};
     return {
       id: ev.id, home, away, model, pick, pickProb, vegas, edge, marketPrior, noLearn,
+      alphaInfo: typeof alphaInfo !== 'undefined' ? alphaInfo : null,
       total, sim, wx, why: typeof whyDrivers !== 'undefined' ? whyDrivers : [],
       pRaw: typeof pRawHome !== 'undefined' ? pRawHome : null,
       state: st.state || 'pre',                       // pre | in | post
@@ -2681,8 +2698,7 @@ function parseMMA(json, sport) {
       const base = predictUS(regressedWinPct(home.rec.w, home.rec.l),
                              regressedWinPct(away.rec.w, away.rec.l), 0.5);
       const p = Brain.adjust('mma', home, away, base.home, 0, 0.6, true);
-      const model = { home: p, away: 1 - p, draw: 0 };
-      const pick = model.home >= model.away ? 'home' : 'away';
+      let model = { home: p, away: 1 - p, draw: 0 };
       // per-fight moneylines when the card is priced (pregame) — full EV engine engages
       const o = comp.odds?.[0];
       const hML = o?.homeTeamOdds?.moneyLine ?? o?.homeAthleteOdds?.moneyLine;
@@ -2690,11 +2706,20 @@ function parseMMA(json, sport) {
       const vegas = (hML && aML) ? { detail: o.details || '', ou: null, mlHome: hML, mlAway: aML,
         mlFav: null, spread: null, favIsHome: null,
         homeProb: powerDevig(mlToProb(hML), mlToProb(aML)) } : null;
+      // Bayesian conversion (same core as team sports): priced fight → market prior + clamped alpha
+      let alphaInfo = null;
+      if (vegas) {
+        const prior = clamp(vegas.homeProb);
+        const alpha = Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, model.home - prior));
+        alphaInfo = { prior, alpha, raw: model.home };
+        model = { home: clamp(prior + alpha), away: 1 - clamp(prior + alpha), draw: 0 };
+      }
+      const pick = model.home >= model.away ? 'home' : 'away';
       const st = comp.status?.type || {};
       const wclass = comp.type?.text || comp.type?.abbreviation || '';
       const g = {
         id: comp.id, home, away, model, pick, pickProb: model[pick],
-        vegas, edge: vegas ? model.home - vegas.homeProb : null, marketPrior: false,
+        vegas, edge: vegas ? model.home - vegas.homeProb : null, marketPrior: false, alphaInfo,
         total: null, sim: null, wx: null, why: [], pRaw: base.home,
         state: st.state || 'pre',
         statusText: [wclass, st.shortDetail || st.detail].filter(Boolean).join(' · '),
@@ -2833,13 +2858,51 @@ function valueChip(g) {
   return `<span class="chip value">💎 VALUE ${esc(side)} +${Math.round(Math.abs(g.edge) * 100)}%</span>`;
 }
 
+// ══ Portfolio Kelly (v14) ══ the day's ⭐ stakes are ONE book, not N islands.
+// Pairwise correlations (same game .35 · same sport same day .12 · cross-sport .05)
+// inflate the effective exposure beyond the naive sum; when that correlated exposure
+// tops PORTFOLIO_CAP units, every stake scales down by the same factor so the whole
+// portfolio respects the cap. The ledger still logs raw canonical units (cross-device
+// determinism); the SCALED number is the recommendation you actually bet.
+function portfolioScale() {
+  const evs = [...state.lastEntries.values()].flatMap(e => e.events)
+    .filter(g => g.state === 'pre' && g.bp?.kind === 'ev' && g.bp.units > 0);
+  const n = evs.length;
+  const tot = evs.reduce((s, g) => s + g.bp.units, 0);
+  if (!n || tot <= 0) return { s: 1, n: 0, tot: 0, eff: 0 };
+  // portfolio variance u'Ρu → correlation LOAD κ = off-diagonal share of variance
+  // relative to the squared naive sum; effective exposure = Σu · (1 + κ). Correlation
+  // can't change the worst case (all lose = Σu) but it raises the chance of joint
+  // losses — the surcharge prices that in before the cap is applied.
+  let pv = 0, sq = 0;
+  for (let i = 0; i < n; i++) {
+    sq += evs[i].bp.units ** 2;
+    for (let j = 0; j < n; j++) {
+      const rho = i === j ? 1
+        : String(evs[i].id) === String(evs[j].id) ? 0.35
+        : evs[i].sportId === evs[j].sportId ? 0.12 : 0.05;
+      pv += evs[i].bp.units * evs[j].bp.units * rho;
+    }
+  }
+  const kappa = Math.max(0, (pv - sq) / (tot * tot));
+  const eff = tot * (1 + kappa);
+  const s = Math.min(1, PORTFOLIO_CAP / eff);
+  return { s, n, tot, eff };
+}
+const scaledUnits = (u, s) => Math.max(0.5, Math.round(u * s * 10) / 10);
+
 function bestPickStrip(g) {
   const bp = g.bp;
   if (!bp) return '';
   const icon = bp.kind === 'ev' ? '⭐' : bp.kind === 'pass' ? '✋' : '🧠';
   const tag = bp.kind === 'ev' ? 'BEST PICK' : bp.kind === 'pass' ? 'NO BET' : 'MODEL LEAN';
   const ev = bp.kind === 'ev' ? `<span class="bp-ev">+${(bp.ev * 100).toFixed(1)}% EV</span>` : '';
-  const units = bp.units ? `<span class="bp-units">${fmtStake(bp.units)}</span>` : '';
+  // portfolio Kelly: on heavy correlated slates the RECOMMENDED stake is the scaled one
+  const ps = bp.kind === 'ev' && bp.units ? portfolioScale() : null;
+  const scaled = ps && ps.s < 0.999;
+  const units = bp.units
+    ? `<span class="bp-units" ${scaled ? `title="portfolio Kelly: ${ps.n} concurrent picks → ${ps.eff.toFixed(1)}u correlated exposure vs the ${PORTFOLIO_CAP}u cap — every stake scaled ×${ps.s.toFixed(2)} (raw ${bp.units}u)"` : ''}>${fmtStake(scaled ? scaledUnits(bp.units, ps.s) : bp.units)}${scaled ? ' ⚖️' : ''}</span>`
+    : '';
   const slipBtn = bp.kind === 'ev' && g.state === 'pre'
     ? `<button class="addleg" data-leg="${esc(JSON.stringify(legOf(g, bp.text, bp.p, bp.b, { side: bp.side, type: bp.betType, line: bp.line, homeSpread: bp.homeSpread })))}">🎟️ + slip</button>` : '';
   // steam: how far the market has moved on our side since the ⭐ ticket was logged
@@ -2993,7 +3056,7 @@ function renderCardProps(g, items, pg) {
   }).join('');
   return `<div class="bo-fair" style="margin-bottom:4px">📊 biggest model-vs-market gaps — spots to <b>investigate</b>, not locks</div>${top}
     <div class="bo-h" style="margin-top:10px;color:var(--text)">player lines · season &amp; recent rates · L10 = games he actually cleared it</div>${plHtml}
-    <div class="bo-fair">Real milestone lines ("X+" = reach X). Model = season + last-10 blend from his real game log, 🧲 anchored toward the listed price${items[0]?.env && Math.abs(items[0].env - 1) >= 0.02 ? ` · 🌡️ game environment ×${items[0].env.toFixed(2)} baked in` : ''}; L10 = how often he cleared that exact line. Verify matchup context via the 🎯 Props lab. "+ slip" adds a vetted leg.</div>`;
+    <div class="bo-fair">Real milestone lines ("X+" = reach X). Model % = the market's own price re-shaped by his form (EWMA last-10 vs season, mean capped ±10%, hot/cold widens the tail)${items[0]?.env && Math.abs(items[0].env - 1) >= 0.02 ? ` · 🌡️ game environment ×${items[0].env.toFixed(2)} baked in` : ''}; L10 = how often he actually cleared that exact line. "+ slip" adds a vetted leg.</div>`;
 }
 
 // Full bet board: every priced side with model %, market %, EV, and stake — plus fair prices
@@ -3202,12 +3265,10 @@ function summaryBar(events, sport) {
   if (live) html += stat(live, 'live now', 'bad');
   if (finals.length) html += stat(`${hits}–${finals.length - hits}`, 'model on finals', hits >= finals.length - hits ? 'good' : 'bad');
   if (evPlays) html += stat(evPlays, '+EV plays', 'gold');
-  // simultaneous-Kelly guard: Kelly math sizes each bet as if it settles alone, but a
-  // fat slate stacks same-day risk the per-bet formula can't see. Above 8u of combined
-  // exposure, advise scaling every stake by the shown factor. Advice only — the printed
-  // stakes stay canonical so every device reads the same numbers.
-  const exposure = evPicks.reduce((s, g) => s + (g.bp.units || 0), 0);
-  if (exposure > 8) html += stat(`×${(8 / exposure).toFixed(2)}`, `⚠️ ${exposure.toFixed(1)}u slate — scale stakes`, 'bad');
+  // portfolio Kelly (v14): correlated exposure across ALL sports' picks vs the cap —
+  // when it binds, the pick strips already show the scaled stake with the ⚖️ mark
+  const ps = portfolioScale();
+  if (ps.n && ps.s < 0.999) html += stat(`×${ps.s.toFixed(2)}`, `⚖️ portfolio Kelly · ${ps.eff.toFixed(1)}u corr. exposure vs ${PORTFOLIO_CAP}u cap`, 'gold');
   // this sport's all-time ⭐ suggested-pick record (every pick tailed, bet or not)
   if (sport) {
     const r = Brain.sportRecord(sport.id);
@@ -4175,19 +4236,29 @@ function propToLeg(pg, x) {
 function gradeGameProps(pg, items, envMult = 1) {
   return items.map(x => {
     const stat = PROP_STATS.find(s => s.id === x.statId);
-    // blend season rate with the L10 per-game rate (gamelog only counts games actually
-    // played, so this also un-dilutes part-time starters). 50/50 once both exist.
-    // envMult scales for the game environment (hot/slow expected total vs the slate).
     const rate0 = x.avg != null && x.recent != null ? 0.5 * x.avg + 0.5 * x.recent
       : x.recent ?? x.avg;
-    const rate = rate0 != null ? rate0 * envMult : rate0;
     let over = null, side = null, ev = null;
-    if (stat && rate != null && rate > 0) {
-      over = propOver(stat, rate, effLine(x.threshold));   // "15+" = P(X ≥ 15); "o6.5" = P(X > 6.5)
-      // 🧲 same market anchor as game picks: shrink the model number toward the
-      // de-vigged listed price before grading. Season-rate models lose to sharp prop
-      // markets straight-up, so an edge only counts when it survives the anchor.
-      over = clamp(invlogit(0.7 * logit(clamp(over)) + 0.3 * logit(clamp(x.imp / OVERROUND_PROP))));
+    if (stat && rate0 != null && rate0 > 0 && x.imp > 0.03 && x.imp < 0.97) {
+      // ══ market-median distribution (v14) ══ instead of projecting our own mean and
+      // comparing it to the price, we INVERT the market: bisection-solve the mean that
+      // makes our distribution reproduce the de-vigged listed price exactly. The market
+      // sets the distribution's center; our signals only reshape it.
+      const fairP = clamp(x.imp / OVERROUND_PROP);
+      const line = effLine(x.threshold);
+      let lo = 0.05, hi = Math.max(rate0 * 4, line * 4 + 2);
+      for (let i = 0; i < 24; i++) {
+        const mid = (lo + hi) / 2;
+        if (propOver(stat, mid, line) < fairP) lo = mid; else hi = mid;
+      }
+      const muMkt = (lo + hi) / 2;
+      // bounded shape alpha: recent form (EWMA vs season) and the game environment shift
+      // the market's mean by at most ±10%, and hot/cold form fattens the NB tail
+      // (dispersion up) — edges come from SHAPE, not from a parallel projection.
+      const form = x.avg > 0 && x.recent != null ? x.recent / x.avg : 1;
+      const alphaMu = Math.max(-0.10, Math.min(0.10, 0.5 * (form - 1) + (envMult - 1)));
+      const disp = stat.dist === 'poisson' ? 0.18 * (1 + Math.min(0.5, Math.abs(form - 1))) : undefined;
+      over = clamp(propOver(stat, muMkt * (1 + alphaMu), line, disp));
       // only grade near-median lines: a season-rate model is informative around the middle,
       // but unreliable deep in the tails (where milestone juice is also highest)
       if (over >= 0.28 && over <= 0.72) {
