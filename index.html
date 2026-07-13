@@ -629,7 +629,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v11.5';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v11.6';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1032,7 +1032,11 @@ const Brain = (() => {
     const hMargin = scoreH === 1 ? mov : scoreH === 0 ? -mov : 0;
     (eH.hist = eH.hist || []).push(hMargin); if (eH.hist.length > 10) eH.hist.shift();
     (eA.hist = eA.hist || []).push(-hMargin); if (eA.hist.length > 10) eA.hist.shift();
-    if (day) { eH.last = Math.max(eH.last || 0, day); eA.last = Math.max(eA.last || 0, day); }
+    if (day) {
+      eH.last = Math.max(eH.last || 0, day); eA.last = Math.max(eA.last || 0, day);
+      // rolling recent game days — fuel for the schedule-density fatigue model
+      [eH, eA].forEach(e => { (e.gd = e.gd || []).push(day); if (e.gd.length > 5) e.gd.shift(); });
+    }
     // surface-specific deltas learn at half speed, capped so one upset can't define a player
     if (surf) {
       const capped = v => Math.max(-200, Math.min(200, v));
@@ -2281,9 +2285,22 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
       // back-to-back fatigue, from the brain's last-played tracker
       if (B2B_PEN[sport.id]) {
         const day = Math.floor(new Date(ev.date).getTime() / 864e5);
-        [home, away].forEach(t => { t.b2b = Brain.rating(sport.id, t)?.last === day - 1; });
-        shift += (t => (away.b2b ? t : 0) - (home.b2b ? t : 0))(B2B_PEN[sport.id]);
-        if (home.b2b !== away.b2b) why.push(`${home.b2b ? home.abbr : away.abbr} on back-to-back`);
+        // schedule-density fatigue (538-style rest adjustment): back-to-back is the
+        // sharpest hit, but a 3rd game in 4 nights or a 4th in 6 wears a team down too —
+        // the units stack. Falls back to plain B2B until the brain has learned game days.
+        const load = t => {
+          const e = Brain.rating(sport.id, t);
+          const gd = e?.gd || (e?.last ? [e.last] : []);
+          t.b2b = gd.includes(day - 1);
+          let u = t.b2b ? 1 : 0;
+          if (gd.filter(d => day - d >= 1 && day - d <= 3).length >= 2) u += 0.6;   // 3rd game in 4 nights
+          if (gd.filter(d => day - d >= 1 && day - d <= 5).length >= 3) u += 0.5;   // 4th in 6
+          return u;
+        };
+        const lh = load(home), la = load(away);
+        shift += (la - lh) * B2B_PEN[sport.id];
+        if (Math.abs(la - lh) >= 1.4) why.push(`${lh > la ? home.abbr : away.abbr} schedule fatigue`);
+        else if (home.b2b !== away.b2b) why.push(`${home.b2b ? home.abbr : away.abbr} on back-to-back`);
       }
       if (shift) {
         const p2 = clamp(invlogit(logit(clamp(model.home)) + shift));
