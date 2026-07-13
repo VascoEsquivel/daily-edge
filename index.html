@@ -710,7 +710,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v14.0';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v14.1';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -2739,13 +2739,19 @@ function parseTennis(jsons, ranks, date) {
   const seen = new Set(), out = [];
   const ptsFromRank = r => 13450 * Math.pow(r, -0.72); // fallback fit of points vs rank
   jsons.forEach(json => (json?.events || []).forEach(ev => {
-    // tour-level only: slams / ATP / WTA / ITF. Exhibitions and team showcases are
-    // untrainable one-offs (nothing at stake, retired players) — filtered out entirely.
-    if (/exhibition|ultimate tennis|\buts\b|laver cup|hopman|kooyong|world tennis league|tie ?break tens/i.test(ev.name || ev.shortName || '')) return;
+    // sanctioned play only: slams / ATP (incl. Challenger) / WTA (incl. 125) / ITF.
+    // Unsanctioned exhibitions are untrainable one-offs (nothing at stake, retired
+    // players) — filtered out entirely. ITF team events (Davis/BJK/United/Hopman) pass.
+    if (/exhibition|invitational|legends|ultimate tennis|\buts\b|laver cup|kooyong|world tennis league|tie ?break tens|six kings|boodles|hurlingham|giorgio armani|battle of/i.test(ev.name || ev.shortName || '')) return;
     (ev.groupings || []).forEach(grp => {
       const gname = grp.grouping?.displayName || '';
       if (!/Singles/i.test(gname) || /Doubles/i.test(gname)) return;
       const tour = /Women/i.test(gname) ? 'WTA' : 'ATP';
+      const evName = ev.name || ev.shortName || '';
+      const tier = /davis cup|billie jean king cup|fed cup|united cup|hopman cup|\bitf\b/i.test(evName) ? 'ITF'
+        : /challenger/i.test(evName) ? `${tour} Challenger`
+        : /\b125\b/.test(evName) ? 'WTA 125'
+        : tour;
       (grp.competitions || []).forEach(comp => {
         if (seen.has(comp.id)) return;
         seen.add(comp.id);
@@ -2785,7 +2791,7 @@ function parseTennis(jsons, ranks, date) {
           state: st.state || 'pre',
           statusText: [round, st.shortDetail].filter(Boolean).join(' · '),
           start,
-          venue: [tour, ev.shortName || ev.name, { grass: '🌿 grass', clay: '🧱 clay', hard: '🏟️ hard' }[surf], round, comp.venue?.court].filter(Boolean).join(' · '),
+          venue: [tier, ev.shortName || ev.name, { grass: '🌿 grass', clay: '🧱 clay', hard: '🏟️ hard' }[surf], round, comp.venue?.court].filter(Boolean).join(' · '),
           tv: '',
           tennis: true,
           surface: surf,
