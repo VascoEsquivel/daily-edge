@@ -159,6 +159,13 @@
     border-right: 1px solid var(--border);
   }
   .summary .stat:last-child { border-right: none; }
+  .summary .statwide { flex: 2.5; min-width: 230px; }
+  .daychip {
+    font-family: 'JetBrains Mono', monospace; font-size: 10.5px; font-weight: 700;
+    padding: 2px 7px; border-radius: 6px; letter-spacing: 0;
+  }
+  .daychip.up { background: rgba(0,255,136,.1); color: var(--accent); }
+  .daychip.dn { background: rgba(255,77,109,.12); color: var(--hot); }
   .summary .stat .v {
     font-family: 'JetBrains Mono', monospace; font-size: 22px; font-weight: 700; display: block;
   }
@@ -704,7 +711,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v13.0';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v13.1';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -3206,11 +3213,16 @@ function summaryBar(events, sport) {
     if (r.n) {
       html += stat(`${r.w}–${r.l}`, `⭐ picks hit ${Math.round(r.w / r.n * 100)}%`, r.w >= r.l ? 'good' : 'bad');
       html += stat(`${r.pnl >= 0 ? '+' : ''}${r.pnl.toFixed(1)}u`, '⭐ P/L this sport', r.pnl >= 0 ? 'good' : 'bad');
-      // day-by-day P/L counters for this sport, newest first, beside the total
-      Brain.sportDaily(sport.id).slice(0, 7).forEach(([d, u]) => {
-        const ds = String(d);
-        html += stat(`${u >= 0 ? '+' : ''}${u.toFixed(1)}u`, `⭐ ${ds.slice(4, 6)}/${ds.slice(6)}`, u >= 0 ? 'good' : 'bad');
-      });
+      // day-by-day P/L for this sport, newest first — one compact tile of chips
+      // instead of seven full-width tiles (same numbers, quarter the space)
+      const days = Brain.sportDaily(sport.id).slice(0, 7);
+      if (days.length) {
+        const chips = days.map(([d, u]) => {
+          const ds = String(d);
+          return `<span class="daychip ${u >= 0 ? 'up' : 'dn'}" title="⭐ P/L on ${ds.slice(4, 6)}/${ds.slice(6)}">${ds.slice(4, 6)}/${ds.slice(6)} ${u >= 0 ? '+' : ''}${u.toFixed(1)}</span>`;
+        }).join('');
+        html += `<div class="stat statwide"><span class="v" style="display:flex;gap:5px;flex-wrap:wrap;justify-content:center;align-items:center">${chips}</span><span class="k">⭐ P/L by day (units)</span></div>`;
+      }
     }
   }
   return `<div class="summary">${html}</div>`;
