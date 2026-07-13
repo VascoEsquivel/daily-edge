@@ -656,7 +656,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v11.8';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v11.9';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1287,6 +1287,9 @@ const Brain = (() => {
   }
 
   return { adjust, processResults, recordPending, stats, syncFingerprint, history: () => db.log,
+    // canonical rolling Brier of Elo (be) vs baseline prior (bb) — read by the
+    // performance-weighted market anchor so it's deterministic on every device
+    perfOf: s => db.perf[s] || null,
     // 🧬 one consistent base for every device: adopt the canonical pricing brain shipped
     // with the site (brain.json). Canonical always wins on a new publish — personal state
     // (tickets, ledger, my bets) is untouched. After adoption every device extends the
@@ -2150,8 +2153,14 @@ function computeBestPick(g, sport) {
   // the whole market disagrees with — shrink below the EV bar and never become picks;
   // real edges survive slightly smaller. This is the shrink-to-the-closing-line prior
   // from the market-efficiency literature, and it directly targets bad +EV days.
+  // λ is PERFORMANCE-WEIGHTED per sport: where the brain's rolling Brier beats its
+  // baseline it has earned more rope (lighter anchor); where it lags, the market gets
+  // more say. perf ships in the canonical brain, so this stays deterministic everywhere.
+  const perf = Brain.perfOf(sport?.id);
+  const pw = perf && perf.n >= 30 && perf.be + perf.bb > 0
+    ? Math.max(0.6, Math.min(1.4, 2 * perf.be / (perf.be + perf.bb))) : 1;
   cands.forEach(c => {
-    const lam = c.type !== 'ml' ? 0.25 : c.est ? 0.20 : 0.30;
+    const lam = Math.min(0.5, (c.type !== 'ml' ? 0.25 : c.est ? 0.20 : 0.30) * pw);
     const mkt = c.type === 'ml' ? (c.fair ?? c.imp) : 0.5;
     c.pm = c.p;   // raw model number, kept for display honesty
     c.p = clamp(invlogit((1 - lam) * logit(clamp(c.p)) + lam * logit(clamp(mkt))));
