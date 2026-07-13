@@ -662,7 +662,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v12.1';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v12.2';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1689,6 +1689,41 @@ function windOutComponent(w, cf) {
   return w.speed * Math.cos(diff * Math.PI / 180);
 }
 
+// Statcast per-PITCHER xERA: deserved runs off exit velocity + launch angle — the
+// sabermetric upgrade over season ERA (which is famously luck-noisy). Same CORS-open
+// Savant leaderboard as the team feed, keyed by "lastname|firstinitial" (accent-safe).
+let pitcherXPromise = null;
+const pitcherKey = name => {
+  const t = (name || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase()
+    .replace(/[^a-z .]/g, '').trim().split(/[\s.]+/).filter(Boolean);
+  return t.length ? `${t[t.length - 1]}|${t[0][0]}` : '';
+};
+function getPitcherX() {
+  if (!pitcherXPromise) {
+    pitcherXPromise = fetch(`https://baseballsavant.mlb.com/leaderboard/expected_statistics?type=pitcher&year=${new Date().getFullYear()}&position=&team=&min=50&csv=true`)
+      .then(r => r.text()).then(csv => {
+        const lines = csv.trim().split('\n');
+        const head = lines[0].replace(/^﻿/, '').split(',').map(h => h.replace(/"/g, ''));
+        const iPa = head.indexOf('pa'), iXera = head.indexOf('xera');
+        const m = new Map();
+        lines.slice(1).forEach(l => {
+          // the quoted name contains a comma, but the header's name column does too —
+          // a naive split misaligns both by the SAME +1, so raw indexes line up
+          const nm = l.match(/^"([^"]+)"/)?.[1] || '';
+          const c = l.split(',').map(x => x.replace(/"/g, ''));
+          const xera = Number(c[iXera]), pa = Number(c[iPa]);
+          if (!nm || isNaN(xera)) return;
+          const [last, first] = nm.split(',').map(s => s.trim());
+          const k = pitcherKey(`${first} ${last}`);
+          const prev = m.get(k);
+          if (!prev || pa > prev.pa) m.set(k, { xera, pa });   // name collisions: keep the workhorse
+        });
+        return m.size ? m : null;
+      }).catch(() => null);
+  }
+  return pitcherXPromise;
+}
+
 // fetch winds for the pregame outdoor MLB games on a scoreboard → Map(eventId → {out, speed, cf})
 async function getWinds(json) {
   const map = new Map(), jobs = [];
@@ -1952,12 +1987,13 @@ async function fetchSport(sport, date, force = false) {
     ]);
     events = parseTennis(jsons, ranks, date);
   } else {
-    const [res, injuries, quality, savant, bullpen] = await Promise.all([
+    const [res, injuries, quality, savant, bullpen, pitcherX] = await Promise.all([
       fetch(`${API}/${sport.path}/scoreboard?dates=${ymd(date)}`),
       getInjuries(sport),
       getQuality(sport),
       sport.id === 'mlb' ? getSavant() : Promise.resolve(null),
       sport.id === 'mlb' ? getBullpen() : Promise.resolve(null),
+      sport.id === 'mlb' ? getPitcherX() : Promise.resolve(null),
     ]);
     if (!res.ok) throw new Error('ESPN API responded ' + res.status);
     const json = await res.json();
@@ -1975,7 +2011,7 @@ async function fetchSport(sport, date, force = false) {
       }));
     }
     const winds = sport.id === 'mlb' ? await getWinds(json) : null;
-    events = parseEvents(json, sport, injuries, quality, savant, bullpen, winds);
+    events = parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pitcherX);
     if (recent && !sport.soccer) reconstructPicks(sport, events);
   }
   events.forEach(g => { g.sportId = sport.id; });
@@ -2234,7 +2270,7 @@ const GRADE_CHIP = {
 };
 const gradeChip = gr => gr ? `<span class="chip ${GRADE_CHIP[gr][0]}" title="${esc(GRADE_CHIP[gr][1])}">🎓 ${gr}</span>` : '';
 
-function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
+function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pitcherX) {
   const games = (json.events || []).map(ev => {
     const comp = ev.competitions?.[0];
     if (!comp) return null;
@@ -2339,9 +2375,16 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
       let shift = 0;
       const why = [];
       if (sport.id === 'mlb' && home.probable?.era != null && away.probable?.era != null) {
-        const d = away.probable.era - home.probable.era;
-        shift += Math.max(-0.5, Math.min(0.5, d * 0.13));
-        if (Math.abs(d) >= 0.8) why.push(`SP edge ${d > 0 ? home.abbr : away.abbr}`);
+        // Statcast xERA (deserved runs off contact quality) beats season ERA as a
+        // forward-looking starter signal — swap it in whenever both starters are in
+        // the Savant leaderboard, at a slightly higher weight since it's less noisy
+        const px = t => pitcherX?.get(pitcherKey(t.probable.name))?.xera;
+        const xh = px(home), xa = px(away);
+        const useX = xh != null && xa != null;
+        if (useX) { home.probable.xera = xh; away.probable.xera = xa; }
+        const d = useX ? xa - xh : away.probable.era - home.probable.era;
+        shift += Math.max(-0.5, Math.min(0.5, d * (useX ? 0.16 : 0.13)));
+        if (Math.abs(d) >= 0.8) why.push(`SP ${useX ? 'xERA ' : ''}edge ${d > 0 ? home.abbr : away.abbr}`);
       }
       // Statcast: expected-wOBA quality gap (own hitting minus own pitching allowed)
       if (sport.id === 'mlb' && home.xw && away.xw) {
@@ -2435,7 +2478,10 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
           if (Math.abs(pf - 1) >= 0.05) notes.push(`park factor ×${pf.toFixed(2)} → ${pf > 1 ? 'over' : 'under'}`);
         }
         if (home.probable?.era != null && away.probable?.era != null) {
-          exp += ((home.probable.era + away.probable.era) / 2 - 4.2) * 0.8;
+          // totals prefer xERA too (stashed above when both starters were matched)
+          const eh = home.probable.xera ?? home.probable.era;
+          const ea = away.probable.xera ?? away.probable.era;
+          exp += ((eh + ea) / 2 - 4.2) * 0.8;
         }
         if (home.pen != null && away.pen != null) {
           exp += ((home.pen + away.pen) / 2 - 4.1) * 0.35;
