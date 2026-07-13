@@ -130,7 +130,7 @@
 
   /* ── Brain bar ── */
   .brain {
-    display: flex; flex-wrap: wrap; align-items: center; gap: 14px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px;
     background: linear-gradient(120deg, rgba(167,139,250,.09), rgba(18,26,48,.55) 60%);
     border: 1px solid rgba(167,139,250,.35); border-radius: 14px;
     padding: 11px 18px; margin-bottom: 20px; font-size: 12px;
@@ -235,11 +235,11 @@
   }
 
   /* ── Game cards ── */
-  .games { display: grid; grid-template-columns: repeat(auto-fill, minmax(355px, 1fr)); gap: 15px; }
+  .games { display: grid; grid-template-columns: repeat(auto-fill, minmax(355px, 1fr)); gap: 18px; }
   .game {
     background: var(--card); backdrop-filter: blur(12px);
-    border: 1px solid var(--border); border-radius: 16px;
-    padding: 17px; transition: all .18s; position: relative;
+    border: 1px solid var(--border); border-radius: 18px;
+    padding: 18px; transition: all .18s; position: relative;
     animation: fadeUp .5s ease both;
   }
   @keyframes fadeUp { from { opacity: 0; transform: translateY(14px); } }
@@ -613,6 +613,38 @@
     margin-top: 46px; padding-top: 22px; border-top: 1px solid var(--border);
     font-size: 11px; color: var(--muted); line-height: 1.8; text-align: center;
   }
+  /* the full methodology lives behind one calm pill instead of a wall of text */
+  footer details.explain summary {
+    cursor: pointer; list-style: none; display: inline-flex; align-items: center; gap: 8px;
+    font-size: 10.5px; font-weight: 800; letter-spacing: 2px; text-transform: uppercase;
+    color: var(--muted); padding: 9px 18px; border: 1px solid var(--border);
+    border-radius: 999px; transition: all .15s; backdrop-filter: blur(10px);
+  }
+  footer details.explain summary::-webkit-details-marker { display: none; }
+  footer details.explain summary:hover { color: var(--text); border-color: rgba(110,140,220,.4); }
+  footer details.explain[open] summary { color: var(--accent); border-color: var(--border-hi); }
+  footer .ex-body {
+    margin: 16px auto 0; max-width: 980px; text-align: left;
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 14px;
+    padding: 16px 20px; animation: fadeUp .25s ease both;
+  }
+  footer .ex-legal { margin-top: 16px; opacity: .85; }
+
+  /* 💵 inline bankroll — type it, it saves; no button, no popup */
+  .bankbox {
+    display: inline-flex; align-items: center; gap: 7px;
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
+    padding: 8px 12px; font-size: 13px; backdrop-filter: blur(10px);
+    transition: all .15s; cursor: text;
+  }
+  .bankbox:focus-within { border-color: var(--border-hi); box-shadow: 0 0 14px rgba(0,255,136,.15); }
+  .bankbox input {
+    width: 88px; background: none; border: none; outline: none; color: var(--text);
+    font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 700;
+  }
+  .bankbox input::placeholder { color: var(--muted); font-weight: 400; font-family: 'Sora', sans-serif; font-size: 12px; }
+  .bankbox input::-webkit-outer-spin-button, .bankbox input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  .bankbox input[type=number] { -moz-appearance: textfield; }
 </style>
 </head>
 <body>
@@ -630,7 +662,9 @@
       <button id="nextday" title="Next day">›</button>
       <button id="todaybtn" class="today-btn">Today</button>
     </div>
-    <button class="refresh" id="bankbtn" title="Set bankroll — stakes show in $">💵 Bankroll</button>
+    <label class="bankbox" title="Your bankroll in $ — type it and it saves instantly; stakes then show in dollars too (1u = 1% of bankroll). Clear it to go back to units only.">
+      💵 <input id="bankinput" type="number" min="0" inputmode="numeric" placeholder="bankroll $">
+    </label>
     <button class="refresh" id="refreshbtn">⟳ Refresh</button>
   </header>
 
@@ -645,6 +679,9 @@
   <div id="slipbox"></div>
 
   <footer>
+    <details class="explain">
+    <summary>ℹ️ how DAILY EDGE works — the model, the math, the honest limits</summary>
+    <div class="ex-body">
     Model: regressed win% → log5 matchup probability + sport-specific home advantage (logit space). Soccer uses points-per-game strength with a closeness-weighted draw share; tournament play (World Cup knockouts) falls back to a market-based prior. Tennis uses ATP/WTA ranking-points share. MLB factors the probable starters' ERA gap; team sports factor the live injury report weighted by player skill — an injured stat leader (⭐ in the 🏥 tooltip) counts 2-3x a rotation player, biggest impact in basketball. Day-to-day weighs less than out.<br>
     📐 Team strength blends the actual record with Pythagorean expectation from points scored/allowed (ESPN standings, all team sports). MLB additionally factors Baseball Savant Statcast expected-wOBA for hitting and pitching — contact-quality stats that lead results. See both in the expanded panel's form rows.<br>
     🎯 Totals: expected combined score from each team's scoring/allowing rates vs the posted O/U — Over/Under sides compete with moneyline/spread for the ⭐ best pick. MLB totals factor starters, bullpen relief ERA (MLB StatsAPI), game-time temperature/rain, and 💨 wind (Open-Meteo, computed as blowing-out/in relative to each park's center-field orientation — the Wrigley effect). Venue splits, 😴 back-to-back fatigue, and line movement vs the opener are all factored; "drivers" in the expanded panel says what's pushing each pick.<br>
@@ -657,15 +694,17 @@
     🧲 Every candidate probability is anchored toward the de-vigged market number before EV is computed — the closing line is the sharpest public forecast, so a pick only survives when the model's edge holds up against it. Elo confidence is scaled by a Glicko-style rating deviation: a thin or long-idle rating claims less, so it can't manufacture confident picks.<br>
     🧠 The model learns: every final updates per-team Elo ratings (margin-of-victory weighted, faster for barely-seen teams) and a per-sport calibration layer (stored locally in your browser). On launch it studies the last 45 days of results in chronological order, then stays current. Predictions blend the record/ranking prior with learned Elo, and the Elo weight grows as the brain sees more of each team. ⭐ picks are logged at the pregame price and settled against the final score. The brain bar separates two records: <b>model picks · straight-up</b> (how often the who-wins pick is right) and <b>⭐ suggested-bet hit</b> (how often the +EV plays cash — usually lower, since value bets are often plus-money dogs, with ROI showing they still profit). "exp" is the rate the model expected; beating it means the edge is real. 📜 History keeps a match-by-match record. ⬆⬇ Export/import moves a trained brain between devices.<br>
     ⚡ Live win probability uses the Stern model — current margin + time remaining vs the pregame expectation — and updates each poll; the ▲▼ shows movement vs the opening number. Click any upcoming match for its full bet board with model vs market prices on every side.<br>
-    🎟️ The slip combines legs assuming independence; parlays stack the book's vig, so most are −EV — the slip will tell you. 🎰 The Parlay Generator (top of The Card) auto-builds Safe / Value / Longshot parlays from the day's priced picks and labels each +EV or −EV honestly. 💵 Set a bankroll to see stakes in dollars. Keys: ← → dates · t today · r refresh · 1–9 tabs.<br>
-    ⚠️ Predictions are statistical estimates for entertainment and research — no model prints money. If you bet, bet what you can afford to lose.
+    🎟️ The slip combines legs assuming independence; parlays stack the book's vig, so most are −EV — the slip will tell you. 🎰 The Parlay Generator (top of The Card) auto-builds Safe / Value / Longshot parlays from the day's priced picks and labels each +EV or −EV honestly. 💵 Type your bankroll in the top bar (saves as you type) to see stakes in dollars. Keys: ← → dates · t today · r refresh · 1–9 tabs.<br>
+    </div>
+    </details>
+    <div class="ex-legal">⚠️ Predictions are statistical estimates for entertainment and research — no model prints money. If you bet, bet what you can afford to lose.</div>
   </footer>
 </div>
 
 <script>
 'use strict';
 
-const APP_VERSION = 'v12.9';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v13.0';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -3195,7 +3234,7 @@ function renderBrain() {
   const st = Brain.stats();
   const lvl = Math.floor(Math.sqrt(st.absorbed / 5)) + 1;
   const item = (label, val, cls = '') => `<span class="b-item">${label} <b class="${cls}">${val}</b></span>`;
-  let items;
+  let items, extra = '';
   if (!st.absorbed) {
     items = `<span class="b-item">fresh brain — it absorbs every final and studies yesterday's slate automatically</span>`;
   } else {
@@ -3214,8 +3253,6 @@ function renderBrain() {
           '⭐ +EV plays are often plus-money underdogs, so a hit% below the straight-up rate is normal and still profitable. "exp" is the rate the model expected — beating it means the edge is real.') : '')
       + (st.bets ? itemT('bet ROI', `${roi >= 0 ? '+' : ''}${roi.toFixed(1)}%`, roi >= 0 ? 'good' : 'bad',
           'Return on amount staked across all settled ⭐ bets — the number that actually matters.') : '')
-      + (st.clvN ? itemT('📈 CLV', `${clvAvg >= 0 ? '+' : ''}${clvAvg.toFixed(1)}% · beat close ${clvBeat}%`, clvAvg >= 0 ? 'good' : 'bad',
-          'Closing Line Value: how much the market moved toward our side between the pick and the game start (vs the last line seen). Positive CLV is the strongest sign the model is genuinely sharp — it means we consistently beat where the market closed, which predicts long-run profit better than win rate.') : '')
       + (st.bets ? (() => {
           // running total plus a separate counter for today's settled picks alone
           const tlog = (st.betlog || []).filter(x => x.d === ymd(new Date()));
@@ -3226,6 +3263,13 @@ function renderBrain() {
             + lineSparkline((st.betlog || []).map(x => x.c));
         })()
         : st.pendingN ? `<span class="b-item" title="The P/L number and its graph appear here after the first ⭐ picks settle — every suggested pick is tailed automatically, bet or not.">P/L <b>graph appears once tonight's ${st.pendingN} open picks settle</b></span>` : '')
+      ;
+    // deep-cut stats live behind the "more ▾" toggle so the bar stays readable
+    const sync = Brain.syncFingerprint();
+    const st2 = String(sync.through);
+    const thruStr = st2.length === 8 ? `${st2.slice(0, 4)}-${st2.slice(4, 6)}-${st2.slice(6)}` : '—';
+    extra = (st.clvN ? itemT('📈 CLV', `${clvAvg >= 0 ? '+' : ''}${clvAvg.toFixed(1)}% · beat close ${clvBeat}%`, clvAvg >= 0 ? 'good' : 'bad',
+        'Closing Line Value: how much the market moved toward our side between the pick and the game start (vs the last line seen). Positive CLV is the strongest sign the model is genuinely sharp — it means we consistently beat where the market closed, which predicts long-run profit better than win rate.') : '')
       + (st.betlog && st.betlog.length >= 3 ? (() => {
           const l10 = st.betlog.slice(-10); const w10 = l10.filter(x => x.w).length;
           const seq = l10.map(x => x.w ? 'W' : 'L').join('');
@@ -3233,12 +3277,8 @@ function renderBrain() {
             w10 >= l10.length - w10 ? 'good' : 'bad', 'Your last 10 settled ⭐ bets — recent form (heating up or cooling off).');
         })() : '')
       + item('teams & players rated', st.tracked, 'gold')
-      + (st.pendingN ? item('open tickets', st.pendingN) : '');
-    // deterministic sync id — same on every device that studied the same history
-    const sync = Brain.syncFingerprint();
-    const st2 = String(sync.through);
-    const thruStr = st2.length === 8 ? `${st2.slice(0, 4)}-${st2.slice(4, 6)}-${st2.slice(6)}` : '—';
-    items += `<span class="b-item" title="A fingerprint of the pricing brain (Elo + calibration). Open the site on another device and check this matches — if the id and 'studied through' date are the same, both devices are working from the identical history and will suggest the same picks. It only changes when a new day of results is studied, not per-device.">🧬 sync <b class="gold">#${sync.id}</b> · studied through ${thruStr}</span>`;
+      + (st.pendingN ? item('open tickets', st.pendingN) : '')
+      + `<span class="b-item" title="A fingerprint of the pricing brain (Elo + calibration). Open the site on another device and check this matches — if the id and 'studied through' date are the same, both devices are working from the identical history and will suggest the same picks. It only changes when a new day of results is studied, not per-device.">🧬 sync <b class="gold">#${sync.id}</b> · studied through ${thruStr}</span>`;
   }
   // tilt guard: a real drawdown is ADVICE now (stakes are no longer silently changed,
   // so the suggested pick reads the same on every device) — bet smaller by choice.
@@ -3260,14 +3300,18 @@ function renderBrain() {
     <span class="b-title">🧠 MODEL BRAIN</span><span class="lvl">LVL ${lvl}</span>
     ${items}
     <span class="b-item" id="brainprog"></span>
-    <button class="b-btn" id="histbtn">📜 ${state.showHistory ? 'hide' : 'history'}</button>
     <button class="b-btn" id="ledgerbtn" title="Every ⭐ suggested pick with its result — the tail-everything record">⭐ ${state.showLedger ? 'hide' : 'pick ledger'}</button>
-    <button class="b-btn" id="pmbtn" title="Why the losing ⭐ bets missed">🔍 ${state.showPM ? 'hide' : 'post-mortems'}${Brain.postmortems().length ? ' (' + Brain.postmortems().length + ')' : ''}</button>
-    <button class="b-btn" id="calibbtn" title="Reliability: when the model says X%, does it hit X%?">📊 ${state.showCalib ? 'hide' : 'calibration'}</button>
     <button class="b-btn" id="mybtn" title="Track the bets you actually place">🎯 ${state.showMyBets ? 'hide' : 'my bets'}${mb.open ? ' (' + mb.open + ' open)' : ''}</button>
-    <button class="b-btn" id="exportbtn" title="Copy this trained brain to the clipboard">⬆ export</button>
-    <button class="b-btn" id="importbtn" title="Paste a brain export from another device">⬇ import</button>
-    <span class="b-note">studies the last ${BACKFILL_DAYS} days automatically · margin-weighted Elo · statcast + pythagorean priors</span>
+    <span class="b-extra" style="display:${state.brainMore ? 'contents' : 'none'}">
+      ${extra}
+      <button class="b-btn" id="histbtn">📜 ${state.showHistory ? 'hide' : 'history'}</button>
+      <button class="b-btn" id="pmbtn" title="Why the losing ⭐ bets missed">🔍 ${state.showPM ? 'hide' : 'post-mortems'}${Brain.postmortems().length ? ' (' + Brain.postmortems().length + ')' : ''}</button>
+      <button class="b-btn" id="calibbtn" title="Reliability: when the model says X%, does it hit X%?">📊 ${state.showCalib ? 'hide' : 'calibration'}</button>
+      <button class="b-btn" id="exportbtn" title="Copy this trained brain to the clipboard">⬆ export</button>
+      <button class="b-btn" id="importbtn" title="Paste a brain export from another device">⬇ import</button>
+      <span class="b-note">studies the last ${BACKFILL_DAYS} days automatically · margin-weighted Elo · statcast + pythagorean priors</span>
+    </span>
+    <button class="b-btn" id="bmore" title="CLV, L10 form, sync fingerprint, calibration, history, export/import">${state.brainMore ? 'less ▴' : 'more ▾'}</button>
   </div>`;
   renderHistory();
   renderPostmortems();
@@ -4317,14 +4361,20 @@ $('#nextday').addEventListener('click', () => shiftDate(1));
 $('#todaybtn').addEventListener('click', () => { state.date = new Date(); refresh(); });
 $('#refreshbtn').addEventListener('click', () => refresh(true));
 
-$('#bankbtn').addEventListener('click', () => {
-  const cur = Number(localStorage.getItem('de-bank')) || '';
-  const v = prompt('Bankroll in $ — stakes will also show in dollars (1u = 1% of bankroll). Leave empty to clear.', cur);
-  if (v === null) return;
-  const nv = Number(v);
-  if (nv > 0) localStorage.setItem('de-bank', String(nv)); else localStorage.removeItem('de-bank');
-  renderSlip(); renderActive();
-});
+// bankroll: live inline edit — type it in the header, it saves as you go (no button)
+{
+  const bi = $('#bankinput');
+  bi.value = localStorage.getItem('de-bank') || '';
+  let bankT = null;
+  bi.addEventListener('input', () => {
+    clearTimeout(bankT);
+    bankT = setTimeout(() => {
+      const nv = Number(bi.value);
+      if (nv > 0) localStorage.setItem('de-bank', String(nv)); else localStorage.removeItem('de-bank');
+      renderSlip(); renderActive();
+    }, 450);
+  });
+}
 
 // content clicks: add-to-slip, filter buttons, or expand a card's bet board
 $('#content').addEventListener('click', e => {
@@ -4415,6 +4465,7 @@ $('#content').addEventListener('input', e => {
   }
 });
 $('#brainbar').addEventListener('click', e => {
+  if (e.target.closest('#bmore')) { state.brainMore = !state.brainMore; renderBrain(); return; }
   if (e.target.closest('#histbtn')) { state.showHistory = !state.showHistory; renderBrain(); return; }
   if (e.target.closest('#pmbtn')) { state.showPM = !state.showPM; renderBrain(); return; }
   if (e.target.closest('#calibbtn')) { state.showCalib = !state.showCalib; renderBrain(); return; }
