@@ -421,6 +421,12 @@
     border-color: var(--border-hi); color: var(--accent);
   }
 
+  /* 🧠 plain-English pick reasons on the card face */
+  .whyline {
+    font-size: 10.5px; color: var(--muted); margin-top: 7px;
+    font-family: 'JetBrains Mono', monospace; letter-spacing: .3px;
+  }
+
   /* skeleton shimmer while slates load */
   .skel {
     border-radius: 16px; height: 104px; border: 1px solid var(--border); margin-bottom: 14px;
@@ -656,7 +662,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v12.0';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v12.1';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1855,7 +1861,12 @@ function fetchGameProps(sport, ev) {
           .filter(v => v != null).slice(0, 10);
         if (vals.length >= 5) {
           l10 = { hit: vals.filter(v => v >= threshold).length, n: vals.length };
-          recent = vals.reduce((s, v) => s + v, 0) / vals.length;
+          // EWMA recency: last night says more than three weeks ago — serious projection
+          // systems all weight the log this way (0.85/game decay ≈ 4-game half-life).
+          // vals[0] is the most recent game (fetchGameLog sorts newest-first).
+          let s = 0, sw = 0;
+          vals.forEach((v, age) => { const w = Math.pow(0.85, age); s += w * v; sw += w; });
+          recent = s / sw;
         }
       }
       return { player: meta.name, statId: m.stat, threshold, american, imp: mlToProb(american), avg, recent, l10 };
@@ -2901,6 +2912,8 @@ function gameCard(g, i, sport) {
     ${liveLine}
     <div class="g-verdict">${verdict}${vegasStr}</div>
     ${suggestedStrip(g)}
+    ${g.state === 'pre' && g.bp?.kind === 'ev' && g.why?.length
+      ? `<div class="whyline">🧠 why: ${esc(g.why.slice(0, 3).join(' · '))}</div>` : ''}
     ${hint}
     ${panel}
   </div>`;
