@@ -665,7 +665,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v12.7';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v12.8';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -3620,7 +3620,7 @@ function renderCard(allEvents) {
   const gchip = (id, label) => `<button class="gfilter ${gf === id ? 'on' : ''}" data-gfilter="${id}">${label}</button>`;
   const nA = evsAll.filter(g => g.bp.grade === 'A').length, nAB = evsAll.filter(g => g.bp.grade !== 'C').length;
   const filterRow = evsAll.length
-    ? `<div class="gfilter-row">${gchip('all', `all plays · ${evsAll.length}`)}${gchip('A', `🎓 A only · ${nA}`)}${gchip('AB', `A + B · ${nAB}`)}</div>` : '';
+    ? `<div class="gfilter-row">${gchip('all', `all plays · ${evsAll.length}`)}${gchip('A', `🎓 A only · ${nA}`)}${gchip('AB', `A + B · ${nAB}`)}<button class="gfilter" data-copycard>📋 copy card</button></div>` : '';
   const live = allEvents.filter(g => g.state === 'in');
   const locks = allEvents.filter(g => g.state === 'pre' && g.bp?.kind !== 'ev' && g.pick !== 'draw' && g.pickProb >= 0.62)
     .sort((a, b) => b.pickProb - a.pickProb).slice(0, 6);
@@ -4242,6 +4242,22 @@ $('#bankbtn').addEventListener('click', () => {
 
 // content clicks: add-to-slip, filter buttons, or expand a card's bet board
 $('#content').addEventListener('click', e => {
+  const ccBtn = e.target.closest('[data-copycard]');
+  if (ccBtn) {   // share the day's card: graded +EV picks, honoring the active filter
+    const gf = state.gradeFilter || 'all';
+    const GR = { A: 0, B: 1, C: 2 };
+    const evs = [...state.lastEntries.values()].flatMap(en => en.events)
+      .filter(g => g.state === 'pre' && g.bp?.kind === 'ev')
+      .filter(g => gf === 'all' || gf.includes(g.bp.grade))
+      .sort((a, b) => ((GR[a.bp.grade] ?? 3) - (GR[b.bp.grade] ?? 3)) || b.bp.ev - a.bp.ev);
+    const txt = `⚡ DAILY EDGE card — ${fmtDate(state.date)}\n`
+      + evs.map(g => `${SPORT_ICON[g.sportId] || '🎯'} ${g.bp.text} · 🎓${g.bp.grade} · +${(g.bp.ev * 100).toFixed(1)}% EV · ${g.bp.units}u (${g.away.abbr} @ ${g.home.abbr})`).join('\n')
+      + `\n${location.origin}${location.pathname}`;
+    navigator.clipboard?.writeText(txt);
+    ccBtn.textContent = '✓ copied';
+    setTimeout(() => { ccBtn.textContent = '📋 copy card'; }, 1200);
+    return;
+  }
   const gfBtn = e.target.closest('[data-gfilter]');
   if (gfBtn) {   // Card grade filter: all / A only / A+B
     state.gradeFilter = gfBtn.dataset.gfilter;
