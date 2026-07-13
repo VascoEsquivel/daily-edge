@@ -665,7 +665,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v12.6';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v12.7';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1156,8 +1156,9 @@ const Brain = (() => {
     db.stats.betsStaked += bet.units || 0;          // for ROI
     db.stats.betsExpWon += bet.p || 0;              // sum of model probs = expected wins
     // closing-line value: did our side's price shorten (market moved toward us) by close?
+    let clv = null;
     if (bet.takenImplied != null && bet.closeImplied != null) {
-      const clv = bet.closeImplied - bet.takenImplied;
+      clv = bet.closeImplied - bet.takenImplied;
       db.stats.clvSum += clv; db.stats.clvN++;
       if (clv > 0.002) db.stats.clvBeat++;
     }
@@ -1176,6 +1177,7 @@ const Brain = (() => {
       gr: bet.grade || undefined,
       d: ymd(g.start), t: bet.text || `${bet.side} ${bet.type}`, m: bet.m || '',
       u: bet.units, b: bet.b, p: bet.p ?? null,
+      clv: clv != null ? +clv.toFixed(4) : undefined,
       pnl: +(won ? bet.units * bet.b : -bet.units).toFixed(2),
       res: `${g.away.abbr} ${g.away.score ?? ''}–${g.home.score ?? ''} ${g.home.abbr}` });
     if (db.stats.betlog.length > 250) db.stats.betlog.shift();
@@ -3234,7 +3236,10 @@ function renderPickLedger() {
       const r = byDay[x.d];
       rows += `<div class="h-date" style="margin-top:8px">${ds.slice(0, 4)}-${ds.slice(4, 6)}-${ds.slice(6)} · <span class="${r.pnl >= 0 ? 'ok' : 'bad'}">${r.w}–${r.n - r.w} · ${r.pnl >= 0 ? '+' : ''}${r.pnl.toFixed(2)}u</span></div>`;
     }
-    rows += `<div class="h-row"><span class="h-match">${esc(x.t)}</span>
+    // per-pick CLV receipt: did the market move toward our side by close? (📈 = beat it)
+    const clvChip = x.clv != null && Math.abs(x.clv) > 0.002
+      ? ` <span title="closing line value: the market moved ${(x.clv * 100).toFixed(1)} pts ${x.clv > 0 ? 'toward' : 'against'} our side by game time">${x.clv > 0 ? '📈' : '📉'}</span>` : '';
+    rows += `<div class="h-row"><span class="h-match">${esc(x.t)}${clvChip}</span>
       <span class="h-pick">${esc(x.m)}${x.res ? ' · ' + esc(x.res) : ''} · ${x.u}u${x.p != null ? ' · model ' + Math.round(x.p * 100) + '%' : ''}${x.rec ? ' · CL' : ''}</span>
       <span class="${x.w ? 'ok' : 'bad'}">${x.w ? 'WON +' + x.pnl.toFixed(2) : 'LOST ' + x.pnl.toFixed(2)}u</span></div>`;
   });
@@ -3756,8 +3761,16 @@ function addLeg(leg) {
 
 function slipMath() {
   const D = state.slip.reduce((d, l) => d * (1 + l.b), 1);  // combined decimal odds
-  const P = state.slip.reduce((p, l) => p * l.p, 1);        // model prob (assumes independence)
-  return { D, P, ev: P * D - 1 };
+  let P = state.slip.reduce((p, l) => p * l.p, 1);          // model prob (assumes independence)
+  // same-game legs are CORRELATED — a flat independence product overstates the combo.
+  // We can't sign the correlation cheaply, so take the conservative 5%-per-pairing
+  // haircut on the combined probability (the bookmaker-style treatment).
+  const gameOf = l => String(l.gid || '').startsWith('prop|') ? String(l.gid).split('|')[2] : String(l.gid);
+  const counts = {};
+  state.slip.forEach(l => { const g = gameOf(l); counts[g] = (counts[g] || 0) + 1; });
+  const sgPairs = Object.values(counts).reduce((s, n) => s + n * (n - 1) / 2, 0);
+  if (sgPairs) P *= Math.pow(0.95, sgPairs);
+  return { D, P, ev: P * D - 1, sgPairs };
 }
 
 function handleParlay(btn) {
@@ -3790,14 +3803,14 @@ function renderSlip() {
   const legs = state.slip.map(l => `<div class="s-leg"><span>${SPORT_ICON[l.k] || '🎯'}</span>
     <span><b>${esc(l.t)}</b><div class="lg-m">${esc(l.m)} · ${esc(l.tm)} · model ${pct(l.p)}</div></span>
     <button class="rmleg" data-gid="${esc(l.gid)}">✕</button></div>`).join('');
-  const { D, P, ev } = slipMath();
+  const { D, P, ev, sgPairs } = slipMath();
   // singles use the same 5u cap as the cards; multi-leg parlays stay conservative at 2u
   const kelly = ev > 0 ? Math.min(n === 1 ? 5 : 2, Math.max(0.5, Math.round((D * P - 1) / (D - 1) * 0.25 * 1000) / 10)) : 0;
   const evStr = `<b class="${ev >= 0 ? 'pos' : 'neg'}">${(ev * 100).toFixed(1)}%</b>`;
   const math = n === 1
     ? `<div class="s-math">model ${pct(P)} to hit · EV ${evStr}${kelly ? ` · stake <b>${fmtStake(kelly)}</b>` : ''}</div>`
     : `<div class="s-math">${n}-leg parlay ≈ <b>${fmtML(probToAmerican(clamp(1 / D)))}</b> · model <b>${pct(P)}</b> to hit<br>
-       EV ${evStr}${kelly ? ` · stake <b>${fmtStake(kelly)}</b>` : ' · <span class="neg">−EV — parlays stack vig, skip it</span>'}</div>`;
+       EV ${evStr}${kelly ? ` · stake <b>${fmtStake(kelly)}</b>` : ' · <span class="neg">−EV — parlays stack vig, skip it</span>'}${sgPairs ? '<br><span class="neg">⚠️ same-game legs are correlated — hit prob discounted 5%/pairing</span>' : ''}</div>`;
   box.innerHTML = `<div class="slip">
     <div class="s-head" id="sliphead">🎟️ BET SLIP · ${n}<span class="x">— minimize</span></div>
     ${legs}${math}
