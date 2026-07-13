@@ -629,7 +629,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v11.4';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v11.5';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -735,6 +735,21 @@ function parseRecord(summary, soccer) {
   const n = (summary || '').split('-').map(Number);
   if (soccer) return { w: n[0] || 0, d: n[1] || 0, l: n[2] || 0 };
   return { w: n[0] || 0, l: n[1] || 0, d: 0 };
+}
+
+// power de-vig: proportional de-vig spreads the book's margin evenly, which overstates
+// longshot fair chances — the documented favorite-longshot bias. Solving iH^k + iA^k = 1
+// (Newton, 6 steps) pushes the vig correction mostly onto the longshot, matching how
+// books actually shade prices. Returns the HOME/first side's fair probability.
+function powerDevig(iH, iA) {
+  let k = 1;
+  for (let i = 0; i < 6; i++) {
+    const f = iH ** k + iA ** k - 1;
+    const df = iH ** k * Math.log(iH) + iA ** k * Math.log(iA);
+    if (!df || !isFinite(df)) break;
+    k -= f / df;
+  }
+  return clamp(iH ** k);
 }
 
 // Implied probability from an American moneyline
@@ -1899,7 +1914,7 @@ function parseVegas(comp, sport, home) {
   if (hML && aML) {
     v.mlHome = hML; v.mlAway = aML;
     const ph = mlToProb(hML), pa = mlToProb(aML);
-    v.homeProb = ph / (ph + pa);
+    v.homeProb = powerDevig(ph, pa);   // favorite-longshot-aware de-vig
     return v;
   }
   if (!v.detail) return null;
@@ -2048,8 +2063,9 @@ function computeBestPick(g, sport) {
   };
   if (v.mlHome && v.mlAway) {
     const iH = mlToProb(v.mlHome), iA = mlToProb(v.mlAway);
-    addML('home', v.mlHome, false, iH / (iH + iA));   // de-vigged fair market probability
-    addML('away', v.mlAway, false, iA / (iH + iA));
+    const fairH = powerDevig(iH, iA);   // favorite-longshot-aware fair market probability
+    addML('home', v.mlHome, false, fairH);
+    addML('away', v.mlAway, false, 1 - fairH);
   }
   else if (v.mlFav != null) {
     addML(v.favIsHome ? 'home' : 'away', v.mlFav, false, mlToProb(v.mlFav) / OVERROUND);
