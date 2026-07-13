@@ -692,8 +692,7 @@
     Model: regressed win% → log5 matchup probability + sport-specific home advantage (logit space). Soccer uses points-per-game strength with a closeness-weighted draw share; tournament play (World Cup knockouts) falls back to a market-based prior. Tennis uses ATP/WTA ranking-points share. MLB factors the probable starters' ERA gap; team sports factor the live injury report weighted by player skill — an injured stat leader (⭐ in the 🏥 tooltip) counts 2-3x a rotation player, biggest impact in basketball. Day-to-day weighs less than out.<br>
     📐 Team strength blends the actual record with Pythagorean expectation from points scored/allowed (ESPN standings, all team sports). MLB additionally factors Baseball Savant Statcast expected-wOBA for hitting and pitching — contact-quality stats that lead results. See both in the expanded panel's form rows.<br>
     🎯 Totals: expected combined score from each team's scoring/allowing rates vs the posted O/U — Over/Under sides compete with moneyline/spread for the ⭐ best pick. MLB totals factor starters, bullpen relief ERA (MLB StatsAPI), game-time temperature/rain, and 💨 wind (Open-Meteo, computed as blowing-out/in relative to each park's center-field orientation — the Wrigley effect). Venue splits, 😴 back-to-back fatigue, and line movement vs the opener are all factored; "drivers" in the expanded panel says what's pushing each pick.<br>
-    🎮 Esports EV Lab: live Valorant/League feeds require paid keys and are CORS-locked from a static site, so the tab is a manual EV engine — your odds and your read in, the +EV side, ¼-Kelly stake, and slip integration out. No fake data, real math.<br>
-    ⚡ Live Props (Props tab): pulls real milestone prop lines from ESPN's odds feed for any game, resolves player names + current-season averages, and shows each line's implied % beside the model's projection. Player names autocomplete from the day's stat leaders. Honest limit: a season-rate model can't reliably out-sharp a prop market, so gaps are flagged to <b>investigate</b> (verify in the lab), not as locks; props join parlays through the slip once you've vetted them.<br>
+    🎯 Player props: every expandable game card has a PLAYER PROPS section that pulls the real posted milestone lines, grades them against a season + last-10 game-log blend (🧲 anchored toward the listed price), and shows each player's L10 hit-rate meters. Honest limit: a season-rate model can't reliably out-sharp a prop market, so gaps are flagged to <b>investigate</b>, not as locks; props join parlays through the slip once you've vetted them.<br>
     🎯 Player Prop Lab: a contextual projection engine — starts from the season rate, blends recent form (with a role/usage-change detector when recent diverges ≥20% from season), then scales by matchup and pace. Projects the over/under curve (Poisson for counting stats, Normal for high-count) and prints an alternate-line ladder with fair Kalshi prices in cents, built for spotting mispriced alt lines. Enter a price to grade the bet and add it to your slip. Matchup/pace are your read (or a defense-vs-stat rank); still a shortlist tool, not gospel.<br>
     🔥🥶 Hot/cold: recent margin form gives a small, capped model shift (streaks are mostly noise — never more than ~3%) and chips flag teams 4-1 or better / 1-4 or worse in their last five. Player-level streaks aren't in free data feeds; prop angles show season rates.<br>
     Vegas comparison uses ESPN's published line; "VALUE" flags games where the model disagrees with the market by ≥4%.<br>
@@ -711,7 +710,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v13.1';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v13.2';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -738,7 +737,9 @@ const STATE_ORDER = { in: 0, pre: 1, post: 2 };
 // ── State ──────────────────────────────────────────────────────────────
 const state = {
   date: new Date(),
-  tab: localStorage.getItem('de-tab') || 'mlb',
+  // retired tabs (props/esports) saved on a device before July 2026 fall back to the Card
+  tab: ['props', 'esports'].includes(localStorage.getItem('de-tab')) ? 'card'
+    : localStorage.getItem('de-tab') || 'mlb',
   cache: new Map(),            // key: sportId|yyyymmdd -> { events, fetchedAt }
   liveTimer: null,
   openCards: new Set(),        // expanded bet boards, kept open across refreshes
@@ -3230,8 +3231,7 @@ function summaryBar(events, sport) {
 
 function renderTabs(counts, evTotal = 0) {
   const cardTab = `<button class="tab ${state.tab === 'card' ? 'active' : ''}" data-sport="card">💰 The Card${evTotal ? `<span class="cnt">⭐ ${evTotal}</span>` : ''}</button>`;
-  const extraTabs = `<button class="tab ${state.tab === 'props' ? 'active' : ''}" data-sport="props">🎯 Props</button>`
-    + `<button class="tab ${state.tab === 'esports' ? 'active' : ''}" data-sport="esports">🎮 Esports</button>`;
+  const extraTabs = '';   // Props lab + Esports tabs retired (July 2026) — inline card props cover the props need
   $('#tabs').innerHTML = cardTab + SPORTS.map(s => {
     const c = counts.get(s.id);
     const cnt = c == null ? '' : `<span class="cnt ${c.live ? 'live' : ''}">${c.live ? '● ' : ''}${c.n}</span>`;
@@ -3812,13 +3812,7 @@ async function refresh(force = false) {
   renderTabs(counts, evTotal);
   renderBrain();
 
-  if (state.tab === 'esports') {
-    renderEsports();
-    clearTimeout(state.liveTimer);
-  } else if (state.tab === 'props') {
-    renderProps();
-    clearTimeout(state.liveTimer);
-  } else if (state.tab === 'card') {
+  if (state.tab === 'card') {
     renderCard(allEvents);
     scheduleLivePoll(allEvents);
   } else {
@@ -3961,9 +3955,7 @@ function renderSlip() {
 }
 
 function renderActive() {
-  if (state.tab === 'esports') renderEsports();
-  else if (state.tab === 'props') renderProps();
-  else if (state.tab === 'card') renderCard([...state.lastEntries.values()].flatMap(e => e.events));
+  if (state.tab === 'card') renderCard([...state.lastEntries.values()].flatMap(e => e.events));
   else if (state.activeEntry) renderContent(SPORTS.find(s => s.id === state.tab), state.activeEntry);
 }
 
@@ -4555,7 +4547,7 @@ $('#mybetspanel').addEventListener('click', e => {
 // keyboard: ←/→ dates · t today · r refresh · 1-9 tabs (1 = The Card)
 document.addEventListener('keydown', e => {
   if (e.target.matches('input,textarea') || e.ctrlKey || e.metaKey || e.altKey) return;
-  const ids = ['card', ...SPORTS.map(s => s.id), 'props', 'esports'];
+  const ids = ['card', ...SPORTS.map(s => s.id)];
   if (e.key === 'ArrowLeft') shiftDate(-1);
   else if (e.key === 'ArrowRight') shiftDate(1);
   else if (e.key === 't') { state.date = new Date(); refresh(); }
