@@ -662,7 +662,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v12.3';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v12.4';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -2841,7 +2841,7 @@ function renderCardProps(g, items, pg) {
   }).join('');
   return `<div class="bo-fair" style="margin-bottom:4px">📊 biggest model-vs-market gaps — spots to <b>investigate</b>, not locks</div>${top}
     <div class="bo-h" style="margin-top:10px;color:var(--text)">player lines · season &amp; recent rates · L10 = games he actually cleared it</div>${plHtml}
-    <div class="bo-fair">Real milestone lines ("X+" = reach X). Model = season + last-10 blend from his real game log, 🧲 anchored toward the listed price; L10 = how often he cleared that exact line. Verify matchup context via the 🎯 Props lab. "+ slip" adds a vetted leg.</div>`;
+    <div class="bo-fair">Real milestone lines ("X+" = reach X). Model = season + last-10 blend from his real game log, 🧲 anchored toward the listed price${items[0]?.env && Math.abs(items[0].env - 1) >= 0.02 ? ` · 🌡️ game environment ×${items[0].env.toFixed(2)} baked in` : ''}; L10 = how often he cleared that exact line. Verify matchup context via the 🎯 Props lab. "+ slip" adds a vetted leg.</div>`;
 }
 
 // Full bet board: every priced side with model %, market %, EV, and stake — plus fair prices
@@ -4008,13 +4008,15 @@ function propToLeg(pg, x) {
 
 // grade raw prop items against the season-rate model → over prob, best side, EV.
 // Shared by the Props tab (loadLiveProps) and the inline per-game card section.
-function gradeGameProps(pg, items) {
+function gradeGameProps(pg, items, envMult = 1) {
   return items.map(x => {
     const stat = PROP_STATS.find(s => s.id === x.statId);
     // blend season rate with the L10 per-game rate (gamelog only counts games actually
     // played, so this also un-dilutes part-time starters). 50/50 once both exist.
-    const rate = x.avg != null && x.recent != null ? 0.5 * x.avg + 0.5 * x.recent
+    // envMult scales for the game environment (hot/slow expected total vs the slate).
+    const rate0 = x.avg != null && x.recent != null ? 0.5 * x.avg + 0.5 * x.recent
       : x.recent ?? x.avg;
+    const rate = rate0 != null ? rate0 * envMult : rate0;
     let over = null, side = null, ev = null;
     if (stat && rate != null && rate > 0) {
       over = propOver(stat, rate, effLine(x.threshold));   // "15+" = P(X ≥ 15); "o6.5" = P(X > 6.5)
@@ -4032,11 +4034,23 @@ function gradeGameProps(pg, items) {
         side = best.side; ev = best.ev;
       }
     }
-    return { ...x, stat, over, side, ev, pg };
+    return { ...x, stat, over, side, ev, pg, env: envMult };
   });
 }
 
 // fetch + grade a single game's real props and paint them into its inline card container
+// game-environment factor: a game the model expects to run hot lifts every counting
+// stat in it (and vice versa) — the props-model standard "game environment" adjustment.
+// Ratio of this game's expected total to the slate median, gently clamped.
+function propEnvMult(sid, g) {
+  if (!g || g.total?.exp == null) return 1;
+  const evs = state.lastEntries.get(sid)?.events || [];
+  const totals = evs.map(x => x.total?.exp).filter(v => v != null).sort((a, b) => a - b);
+  if (totals.length < 3) return 1;
+  const med = totals[Math.floor(totals.length / 2)];
+  return med > 0 ? Math.max(0.9, Math.min(1.1, g.total.exp / med)) : 1;
+}
+
 function loadCardProps(sid, gid, container) {
   const key = sid + '|' + gid;
   const cached = cardPropsCache.get(key);
@@ -4047,7 +4061,7 @@ function loadCardProps(sid, gid, container) {
   const g = (state.lastEntries.get(sid)?.events || []).find(x => String(x.id) === String(gid));
   const pg = { sport, ev: { id: gid }, key, label: `${SPORT_ICON[sid]} ${g ? g.away.abbr + ' @ ' + g.home.abbr : ''}` };
   fetchGameProps(sport, { id: gid }).then(items => {
-    const graded = gradeGameProps(pg, items);
+    const graded = gradeGameProps(pg, items, propEnvMult(sid, g));
     cardPropsCache.set(key, { loading: false, items: graded });
     // the card may have been re-rendered by a refresh mid-fetch → re-query the container
     const cont = (container && document.body.contains(container)) ? container
