@@ -629,7 +629,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v11.6';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v11.7';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -708,6 +708,26 @@ function predictSoccer(home, away, hfaWin) {
   const pHomeShare = invlogit(diff * 1.6);
   const rest = 1 - pDraw;
   return { home: clamp(rest * pHomeShare), away: clamp(rest * (1 - pHomeShare)), draw: pDraw };
+}
+
+// Dixon-Coles bivariate Poisson: exact 3-way probabilities from a Poisson score grid.
+// rho < 0 applies the DC low-score correction — it inflates 0-0 and 1-1 and deflates
+// 1-0 / 0-1, fixing independent-Poisson's systematic draw underrate. The classic
+// soccer-modeling result (Dixon & Coles 1997), still the backbone of most goal models.
+function poissonSoccer(lh, la, rho = -0.13) {
+  const F = [1, 1, 2, 6, 24, 120, 720, 5040];
+  const pois = (l, k) => Math.exp(-l) * Math.pow(l, k) / F[k];
+  let home = 0, draw = 0, away = 0;
+  for (let i = 0; i <= 7; i++) for (let j = 0; j <= 7; j++) {
+    let p = pois(lh, i) * pois(la, j);
+    if (i === 0 && j === 0) p *= 1 - lh * la * rho;
+    else if (i === 0 && j === 1) p *= 1 + lh * rho;
+    else if (i === 1 && j === 0) p *= 1 + la * rho;
+    else if (i === 1 && j === 1) p *= 1 - rho;
+    if (i > j) home += p; else if (i === j) draw += p; else away += p;
+  }
+  const s = home + draw + away;
+  return { home: home / s, draw: draw / s, away: away / s };
 }
 
 // Soccer with no season records (tournament knockouts): expand the market's
@@ -2218,6 +2238,20 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
         const share = clamp(invlogit(logit(clamp(model.home / (model.home + model.away))) + sh));
         const rest = 1 - model.draw;
         model = { home: clamp(rest * share), away: clamp(rest * (1 - share)), draw: model.draw };
+      }
+      // Dixon-Coles pass: expected goals per side from scoring/conceding rates with the
+      // home-goal advantage, exact 3-way result off the corrected Poisson grid —
+      // especially sharper on the DRAW than any record-based heuristic. 50/50 blend
+      // with the prior above, renormalized.
+      if (home.pfg != null && away.pfg != null && home.pag != null && away.pag != null) {
+        const lh = Math.max(0.15, ((home.pfg + away.pag) / 2) * 1.12);
+        const la = Math.max(0.15, ((away.pfg + home.pag) / 2) * 0.90);
+        const dc = poissonSoccer(lh, la);
+        let m = { home: 0.5 * model.home + 0.5 * dc.home,
+                  away: 0.5 * model.away + 0.5 * dc.away,
+                  draw: 0.5 * model.draw + 0.5 * dc.draw };
+        const s = m.home + m.away + m.draw;
+        model = { home: clamp(m.home / s), away: clamp(m.away / s), draw: m.draw / s };
       }
     } else {
       model = predictUS(teamStrength(home), teamStrength(away), sport.hfaWin);
