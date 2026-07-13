@@ -3,6 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#070b14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>DAILY EDGE — Sports Prediction Engine</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>⚡</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -662,7 +665,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v12.4';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v12.5';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -2243,6 +2246,12 @@ function computeBestPick(g, sport) {
   if (best.ev < MIN_EV) return { kind: 'pass', text: 'PASS', ev: best.ev, board: cands,
     sub: `best side ${best.text} · EV ${(best.ev * 100).toFixed(1)}% — not worth the vig` };
   const grade = pickGrade(g, best);
+  // stake follows signal QUALITY, not just edge size: Kelly can't see that a price is
+  // estimated or that only one driver backs the play — the grade can. B-grades take
+  // 0.8×, C-grades 0.6×. Pure function of the pick → still identical on every device.
+  if (grade !== 'A' && best.units) {
+    best.units = Math.max(0.5, Math.round(best.units * (grade === 'B' ? 0.8 : 0.6) * 10) / 10);
+  }
   // spread picks also show the model's FAIR line (expected margin off the win prob) so
   // the size of the disagreement with the posted number is visible at a glance
   let fairLine = '';
@@ -2272,9 +2281,9 @@ function pickGrade(g, best) {
   return s >= 4 ? 'A' : s >= 3 ? 'B' : 'C';
 }
 const GRADE_CHIP = {
-  A: ['hit', 'A-grade: 4+ confirming signals (sweet-band confidence, multiple drivers, sane market gap, plausible EV, real price). The concentrate-your-units tier.'],
-  B: ['lean', 'B-grade: 3 confirming signals — solid, standard stake.'],
-  C: ['mkt', 'C-grade: thin edge with few confirming signals — smallest stakes, or skip. The ledger tracks every grade so the data shows if C-grades are worth playing at all.'],
+  A: ['hit', 'A-grade: 4+ confirming signals (sweet-band confidence, multiple drivers, sane market gap, plausible EV, real price). Full Kelly stake — the concentrate-your-units tier.'],
+  B: ['lean', 'B-grade: 3 confirming signals — solid. Stake auto-scaled to 0.8× Kelly.'],
+  C: ['mkt', 'C-grade: thin edge with few confirming signals — stake auto-scaled to 0.6× Kelly, or skip entirely. The ledger tracks every grade so the data shows if C-grades are worth playing at all.'],
 };
 const gradeChip = gr => gr ? `<span class="chip ${GRADE_CHIP[gr][0]}" title="${esc(GRADE_CHIP[gr][1])}">🎓 ${gr}</span>` : '';
 
