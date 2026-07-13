@@ -364,6 +364,44 @@
   }
   .injchip { font-size: 10px; color: var(--hot); margin-left: 6px; cursor: help; font-family: 'JetBrains Mono', monospace; }
 
+  /* 🎯 player-prop cards (v11.4): one tidy card per player, mini L10 meter per line */
+  .pp-player {
+    background: rgba(18,26,48,.45); border: 1px solid var(--border); border-radius: 10px;
+    padding: 8px 10px; margin: 6px 0; transition: border-color .15s;
+  }
+  .pp-player:hover { border-color: rgba(0,200,255,.4); }
+  .pp-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 5px; }
+  .pp-name { font-weight: 800; font-size: 12px; }
+  .pp-form { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--muted); }
+  .pp-lines { display: flex; flex-wrap: wrap; gap: 5px; }
+  .pp-line {
+    display: inline-flex; align-items: center; gap: 6px; cursor: help;
+    background: rgba(0,200,255,.07); border: 1px solid rgba(0,200,255,.22); border-radius: 8px;
+    padding: 3px 8px; font-family: 'JetBrains Mono', monospace; font-size: 10.5px;
+  }
+  .pp-line b { color: var(--text); font-weight: 700; }
+  .pp-model { color: var(--accent2); }
+  .l10bar { width: 34px; height: 5px; border-radius: 3px; background: rgba(132,148,184,.25); overflow: hidden; display: inline-block; }
+  .l10bar i { display: block; height: 100%; border-radius: 3px; background: var(--accent); }
+  .l10bar i.mid { background: var(--gold); }
+  .l10bar i.low { background: var(--hot); }
+  .pp-l10 { color: var(--muted); font-size: 9.5px; }
+
+  /* 👋 first-visit guide: three plain-English pointers, dismissed once, gone forever */
+  .howto {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px;
+    background: linear-gradient(90deg, rgba(0,255,136,.08), rgba(0,200,255,.08));
+    border: 1px solid var(--border-hi); border-radius: 12px; padding: 10px 14px;
+    margin-bottom: 16px; font-size: 12px; animation: fadeUp .3s ease both;
+  }
+  .howto .ht-t { font-weight: 800; letter-spacing: 1px; }
+  .howto b { color: var(--accent); }
+  .howto .ht-x {
+    margin-left: auto; background: none; border: 1px solid var(--border); color: var(--muted);
+    border-radius: 8px; padding: 4px 10px; cursor: pointer; font-family: inherit; font-size: 11px;
+  }
+  .howto .ht-x:hover { color: var(--text); border-color: var(--accent); }
+
   /* ── History panel ── */
   .brain .b-btn {
     background: rgba(167,139,250,.12); border: 1px solid rgba(167,139,250,.4); color: #c4b5fd;
@@ -591,7 +629,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v11.3';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v11.4';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1439,9 +1477,13 @@ function getQuality(sport) {
           (e.stats || []).forEach(x => { s[x.name] = x.value; });
           const pf = s.pointsFor, pa = s.pointsAgainst;
           if (pf == null || pa == null || !(pf + pa)) return;
-          const ex = PYTH_EXP[sport.id];
-          const pyth = Math.pow(pf, ex) / (Math.pow(pf, ex) + Math.pow(pa, ex));
           const g = s.gamesPlayed || (s.wins || 0) + (s.losses || 0) + (s.ties || 0) || 1;
+          // Pythagenpat (MLB): the right exponent tracks the scoring environment —
+          // ((RS+RA)/G)^0.287 — so a team living in extreme run contexts (Coors, dead
+          // ball) gets the exponent its games actually play to. Other sports keep the
+          // standard fixed exponents.
+          const ex = sport.id === 'mlb' ? Math.max(1.4, Math.pow((pf + pa) / g, 0.287)) : PYTH_EXP[sport.id];
+          const pyth = Math.pow(pf, ex) / (Math.pow(pf, ex) + Math.pow(pa, ex));
           map.set(String(e.team?.id), { pyth, g,
             pfg: pf / g, pag: pa / g,
             hw: s.homeWins ?? null, hl: s.homeLosses ?? null,
@@ -2597,15 +2639,21 @@ function renderCardProps(g, items, pg) {
     .sort((a, b) => b.best - a.best).slice(0, 8);
   const plHtml = players.map(pl => {
     const a0 = pl.arr[0];
-    const rateStr = a0.avg != null ? ` · ${a0.avg.toFixed(1)} ${esc(a0.statId)}/g` : '';
-    const recStr = a0.recent != null ? ` · L10 ${a0.recent.toFixed(1)}/g${a0.avg ? (a0.recent >= a0.avg * 1.15 ? ' 🔥' : a0.recent <= a0.avg * 0.85 ? ' 🥶' : '') : ''}` : '';
-    const chips = pl.arr.sort((a, b) => a.threshold - b.threshold).map(x =>
-      `<span class="prop-chip" title="market ${pct(x.imp)}${x.over != null ? ' · model ' + pct(x.over) : ''}${x.l10 ? ` · cleared in ${x.l10.hit}/${x.l10.n} recent games` : ''}">${thrTxt(x.threshold)} ${esc(x.statId)}${x.over != null ? ' · ' + pct(x.over) : ''}${x.l10 ? ` · L10 ${Math.round(x.l10.hit / x.l10.n * 100)}%` : ''}</span>`).join('');
-    return `<div class="prop-row"><b>${esc(pl.name)}${rateStr}${recStr}</b>${chips}</div>`;
+    const rateStr = a0.avg != null ? `${a0.avg.toFixed(1)} ${esc(a0.statId)}/g season` : '';
+    const recStr = a0.recent != null ? `L10 ${a0.recent.toFixed(1)}/g${a0.avg ? (a0.recent >= a0.avg * 1.15 ? ' 🔥' : a0.recent <= a0.avg * 0.85 ? ' 🥶' : '') : ''}` : '';
+    const form = [rateStr, recStr].filter(Boolean).join(' · ');
+    const chips = pl.arr.sort((a, b) => a.threshold - b.threshold).map(x => {
+      const rate = x.l10 ? x.l10.hit / x.l10.n : null;
+      const barCls = rate == null ? '' : rate >= 0.6 ? '' : rate >= 0.4 ? 'mid' : 'low';
+      const bar = rate == null ? ''
+        : `<span class="l10bar"><i class="${barCls}" style="width:${Math.round(rate * 100)}%"></i></span><span class="pp-l10">${x.l10.hit}/${x.l10.n}</span>`;
+      return `<span class="pp-line" title="market ${pct(x.imp)}${x.over != null ? ' · model ' + pct(x.over) : ''}${x.l10 ? ` · cleared this line in ${x.l10.hit} of his last ${x.l10.n} games` : ''}"><b>${thrTxt(x.threshold)} ${esc(x.statId)}</b>${x.over != null ? `<span class="pp-model">${pct(x.over)}</span>` : ''}${bar}</span>`;
+    }).join('');
+    return `<div class="pp-player"><div class="pp-head"><span class="pp-name">${esc(pl.name)}</span><span class="pp-form">${form}</span></div><div class="pp-lines">${chips}</div></div>`;
   }).join('');
   return `<div class="bo-fair" style="margin-bottom:4px">📊 biggest model-vs-market gaps — spots to <b>investigate</b>, not locks</div>${top}
     <div class="bo-h" style="margin-top:10px;color:var(--text)">player lines · season &amp; recent rates · L10 = games he actually cleared it</div>${plHtml}
-    <div class="bo-fair">Real milestone lines ("X+" = reach X). Model = season + last-10 blend from his real game log; L10 = how often he cleared that exact line. Verify matchup context via the 🎯 Props lab. "+ slip" adds a vetted leg.</div>`;
+    <div class="bo-fair">Real milestone lines ("X+" = reach X). Model = season + last-10 blend from his real game log, 🧲 anchored toward the listed price; L10 = how often he cleared that exact line. Verify matchup context via the 🎯 Props lab. "+ slip" adds a vetted leg.</div>`;
 }
 
 // Full bet board: every priced side with model %, market %, EV, and stake — plus fair prices
@@ -3761,6 +3809,10 @@ function gradeGameProps(pg, items) {
     let over = null, side = null, ev = null;
     if (stat && rate != null && rate > 0) {
       over = propOver(stat, rate, effLine(x.threshold));   // "15+" = P(X ≥ 15); "o6.5" = P(X > 6.5)
+      // 🧲 same market anchor as game picks: shrink the model number toward the
+      // de-vigged listed price before grading. Season-rate models lose to sharp prop
+      // markets straight-up, so an edge only counts when it survives the anchor.
+      over = clamp(invlogit(0.7 * logit(clamp(over)) + 0.3 * logit(clamp(x.imp / OVERROUND_PROP))));
       // only grade near-median lines: a season-rate model is informative around the middle,
       // but unreliable deep in the tails (where milestone juice is also highest)
       if (over >= 0.28 && over <= 0.72) {
@@ -4091,6 +4143,20 @@ document.addEventListener('keydown', e => {
 });
 
 document.querySelector('.logo .sub').textContent += ' · ' + APP_VERSION;
+// 👋 first-visit guide — three plain-English pointers for people who don't speak betting.
+// Dismissed once, never shown again.
+if (!localStorage.getItem('de-howto')) {
+  const g = document.createElement('div');
+  g.className = 'howto';
+  g.innerHTML = `<span class="ht-t">👋 NEW HERE?</span>
+    <span>💰 <b>The Card</b> shows today's best plays, strongest first</span>
+    <span>🎓 <b>A / B / C</b> = how many signals back a pick (A = strongest)</span>
+    <span>💵 stakes are in <b>units</b> — 1u = 1% of whatever you'd bet with</span>
+    <button class="ht-x">got it ✕</button>`;
+  const tabs = $('#tabs');
+  tabs.parentNode.insertBefore(g, tabs);
+  g.querySelector('.ht-x').onclick = () => { try { localStorage.setItem('de-howto', '1'); } catch {} g.remove(); };
+}
 renderSlip();
 // adopt the canonical pricing brain BEFORE the first render, so every device
 // prices today's slate from the same base (then extends it deterministically)
