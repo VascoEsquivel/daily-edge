@@ -662,7 +662,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v12.2';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v12.3';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -2243,11 +2243,19 @@ function computeBestPick(g, sport) {
   if (best.ev < MIN_EV) return { kind: 'pass', text: 'PASS', ev: best.ev, board: cands,
     sub: `best side ${best.text} · EV ${(best.ev * 100).toFixed(1)}% — not worth the vig` };
   const grade = pickGrade(g, best);
+  // spread picks also show the model's FAIR line (expected margin off the win prob) so
+  // the size of the disagreement with the posted number is visible at a glance
+  let fairLine = '';
+  if (best.type === 'spread') {
+    const sig = sport.spreadSigma || 10;
+    const m = -invNorm(clamp(g.model.home)) * sig;   // home line: favorites negative
+    fairLine = ` · model line ${g.home.abbr} ${m > 0 ? '+' : ''}${m.toFixed(1)}`;
+  }
   return { kind: 'ev', text: best.text, ev: best.ev, board: cands,
     side: best.side, b: best.b, p: best.p, betType: best.type,
     homeSpread: best.homeSpread ?? null, line: best.line ?? null,
     units: best.units, grade,
-    sub: `model ${pct(best.pm)} · 🧲 anchored ${pct(best.p)} vs implied ${pct(best.imp)}` };
+    sub: `model ${pct(best.pm)} · 🧲 anchored ${pct(best.p)} vs implied ${pct(best.imp)}${fairLine}` };
 }
 
 // 🎓 pick quality grade: how many independent signals back this play. A = concentrate,
@@ -2936,7 +2944,16 @@ function gameCard(g, i, sport) {
     const delta = Math.round((lp.home - base) * 100);
     const arrow = delta >= 0
       ? `<span class="up">▲${delta}</span>` : `<span class="down">▼${Math.abs(delta)}</span>`;
-    liveLine = `<div class="liveline">⚡ LIVE <b>${esc(g.home.abbr)} ${pct(lp.home)}</b> ${arrow} vs open ${pct(base)}
+    // live total pace: actual runs/points so far + the model's expected rest-of-game —
+    // the standard live-totals projection, read against the posted line
+    let pace = '';
+    if (g.total?.line && g.total.exp != null) {
+      const cur = (Number(g.home.score) || 0) + (Number(g.away.score) || 0);
+      const f = gameFraction(g, sport);
+      const proj = cur + g.total.exp * (1 - f);
+      pace = ` · 📈 pace ${proj.toFixed(1)} vs O/U ${g.total.line} ${proj > g.total.line ? '→ over' : '→ under'}`;
+    }
+    liveLine = `<div class="liveline">⚡ LIVE <b>${esc(g.home.abbr)} ${pct(lp.home)}</b> ${arrow} vs open ${pct(base)}${pace}
       <span class="open-ref">${open?.d ? 'opened ' + esc(open.d) : 'model preline'}</span></div>`;
   }
 
