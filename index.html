@@ -665,7 +665,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v12.8';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v12.9';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -675,8 +675,11 @@ const SPORTS = [
   { id: 'wnba', label: '🏀 WNBA', path: 'basketball/wnba', hfaWin: 0.590, spreadSigma: 12,   offMsg: 'No WNBA games on this date.' },
   { id: 'wc',   label: '🏆 World Cup', path: 'soccer/fifa.world', hfaWin: 0.500, offMsg: 'No World Cup matches on this date.', soccer: true },
   { id: 'tennis', label: '🎾 Tennis', paths: ['tennis/atp', 'tennis/wta'], tennis: true, offMsg: 'No tour-level tennis on this date.' },
+  { id: 'mma',  label: '🥊 MMA',  path: 'mma/ufc', mma: true, offMsg: 'No fight card on this date.' },
   { id: 'mls',  label: '⚽ MLS',  path: 'soccer/usa.1',    hfaWin: 0.600, offMsg: 'No MLS matches on this date.', soccer: true },
-  { id: 'nba',  label: '🏀 NBA',  path: 'basketball/nba',  hfaWin: 0.600, spreadSigma: 12,   offMsg: 'Off-season — tip-off returns in October.' },
+  { id: 'nba',  label: '🏀 NBA',  path: 'basketball/nba',  hfaWin: 0.600, spreadSigma: 12,
+    extraPaths: ['basketball/nba-summer-las-vegas'],   // Summer League rides in the NBA tab (never trains the real Elo)
+    offMsg: 'No NBA or Summer League games on this date.' },
   { id: 'nhl',  label: '🏒 NHL',  path: 'hockey/nhl',      hfaWin: 0.550, spreadSigma: 2.7,  offMsg: 'Off-season — puck drops again in October.' },
   { id: 'nfl',  label: '🏈 NFL',  path: 'football/nfl',    hfaWin: 0.565, spreadSigma: 13.5, offMsg: 'Off-season — kickoff returns in September.' },
 ];
@@ -1232,7 +1235,8 @@ const Brain = (() => {
       }
       // stage 2 — deterministic learning, only for games before today, exactly once.
       // The anchor guard skips anything the adopted canonical brain already learned.
-      if (gday < today && gday > (db.anchor || 0) && !db.learned[key]) {
+      // noLearn events (Summer League) settle picks above but never touch the Elo.
+      if (!g.noLearn && gday < today && gday > (db.anchor || 0) && !db.learned[key]) {
         const hfaLogit = g.tennis || sport.hfaWin == null ? 0 : logit(effHfa(sport.id, sport.hfaWin));
         let mov;
         if (g.tennis) { const [th, ta] = setsTally(g.home.sets, g.away.sets); mov = Math.abs(th - ta); }
@@ -1999,6 +2003,9 @@ async function fetchSport(sport, date, force = false) {
       getRankings(),
     ]);
     events = parseTennis(jsons, ranks, date);
+  } else if (sport.mma) {
+    const res = await fetchRetry(`${API}/${sport.path}/scoreboard?dates=${ymd(date)}`);
+    events = parseMMA(await res.json(), sport);
   } else {
     const [res, injuries, quality, savant, bullpen, pitcherX] = await Promise.all([
       fetchRetry(`${API}/${sport.path}/scoreboard?dates=${ymd(date)}`),
@@ -2010,6 +2017,17 @@ async function fetchSport(sport, date, force = false) {
     ]);
     if (!res.ok) throw new Error('ESPN API responded ' + res.status);
     const json = await res.json();
+    // bolt-on scoreboards (NBA Summer League): merged into the tab, flagged so the
+    // results never train the real-season Elo — summer squads are rookies and bench
+    // units, and their games say nothing about October basketball
+    if (sport.extraPaths) {
+      const extras = await Promise.allSettled(sport.extraPaths.map(p =>
+        fetchRetry(`${API}/${p}/scoreboard?dates=${ymd(date)}`).then(r => r.json())));
+      extras.forEach(x => x.status === 'fulfilled' && (x.value.events || []).forEach(e => {
+        e.__noLearn = true;
+        (json.events = json.events || []).push(e);
+      }));
+    }
     // recent finished/live games with stripped odds: re-inject the retained
     // closing line from the core API so they can still be graded
     const recent = Date.now() - date.getTime() < RECON_WINDOW_MS;
@@ -2301,6 +2319,9 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
   const games = (json.events || []).map(ev => {
     const comp = ev.competitions?.[0];
     if (!comp) return null;
+    // Summer League flag: these squads are NOT the real franchise, so every real-team
+    // signal (Pythagorean, Elo, form, injuries) is withheld — record + market only
+    const noLearn = !!ev.__noLearn;
     const side = ha => {
       const c = comp.competitors.find(x => x.homeAway === ha) || {};
       const recSummary = (c.records || []).find(r => r.type === 'total' || r.name === 'overall')?.summary
@@ -2315,7 +2336,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         name: L.leaders?.[0]?.athlete?.shortName || '',
         val: L.leaders?.[0]?.displayValue || '',
       })).filter(x => x.name);
-      const q = quality?.get(String(c.team?.id));
+      const q = noLearn ? null : quality?.get(String(c.team?.id));
       const xwBat = savant?.bat.get(c.team?.abbreviation) ?? savant?.bat.get((c.team?.shortDisplayName || '').toLowerCase());
       const xwPit = savant?.pit.get(c.team?.abbreviation) ?? savant?.pit.get((c.team?.shortDisplayName || '').toLowerCase());
       let pen = null;
@@ -2337,7 +2358,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         pfg: q?.pfg ?? null, pag: q?.pag ?? null,
         hw: q?.hw ?? null, hl: q?.hl ?? null, rw: q?.rw ?? null, rl: q?.rl ?? null,
         xw: (xwBat != null && xwPit != null) ? { bat: xwBat, pit: xwPit } : null,
-        inj: injuries?.get(String(c.team?.id)) || null,
+        inj: noLearn ? null : injuries?.get(String(c.team?.id)) || null,
       };
     };
     const home = side('home'), away = side('away');
@@ -2396,7 +2417,8 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
       model = { home: clamp(rest * share2), away: clamp(rest * (1 - share2)), draw: model.draw };
     } else {
       var pRawHome = model.home;   // baseline (record/Pythagorean) prior, kept for Brier tracking
-      const p = Brain.adjust(sport.id, home, away, model.home, hfaL, 0.65, true);
+      const p = noLearn ? clamp(model.home)   // summer squads: real-team Elo means nothing
+        : Brain.adjust(sport.id, home, away, model.home, hfaL, 0.65, true);
       model = { home: p, away: 1 - p, draw: 0 };
       // pregame intel the record can't see: starting pitchers (MLB) + injury report
       let shift = 0;
@@ -2440,7 +2462,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         const l5 = h.slice(-5);
         return (l5.reduce((a, b) => a + b, 0) / l5.length) / (LIVE_SIGMA[sport.id] || 10);
       };
-      const fd = formF(home) - formF(away);
+      const fd = noLearn ? 0 : formF(home) - formF(away);
       shift += Math.max(-0.12, Math.min(0.12, fd * 0.10));
       if (Math.abs(fd) >= 0.5) why.push(`form edge ${fd > 0 ? home.abbr : away.abbr}`);
       // venue personality: deviation from the expected home/road performance
@@ -2454,7 +2476,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
       const vd = venueDev(home, true) - venueDev(away, false);
       shift += Math.max(-0.25, Math.min(0.25, vd * 1.2));
       // back-to-back fatigue, from the brain's last-played tracker
-      if (B2B_PEN[sport.id]) {
+      if (B2B_PEN[sport.id] && !noLearn) {
         const day = Math.floor(new Date(ev.date).getTime() / 864e5);
         // schedule-density fatigue (538-style rest adjustment): back-to-back is the
         // sharpest hit, but a 3rd game in 4 nights or a 4th in 6 wears a team down too —
@@ -2547,15 +2569,15 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
 
     const st = ev.status?.type || {};
     return {
-      id: ev.id, home, away, model, pick, pickProb, vegas, edge, marketPrior,
+      id: ev.id, home, away, model, pick, pickProb, vegas, edge, marketPrior, noLearn,
       total, sim, wx, why: typeof whyDrivers !== 'undefined' ? whyDrivers : [],
       pRaw: typeof pRawHome !== 'undefined' ? pRawHome : null,
       state: st.state || 'pre',                       // pre | in | post
       statusText: st.shortDetail || st.detail || '',
       period: ev.status?.period, clock: ev.status?.displayClock || '',
       start: new Date(ev.date),
-      venue: comp.venue?.fullName || '',
-      tv: comp.broadcasts?.[0]?.names?.[0] || '',
+      venue: (noLearn ? '🌴 Summer League · ' : '') + (comp.venue?.fullName || ''),
+      tv: (noLearn ? '🌴 Summer League' : '') + (comp.broadcasts?.[0]?.names?.[0] ? (noLearn ? ' · ' : '') + comp.broadcasts[0].names[0] : ''),
       correct: null,
     };
   }).filter(Boolean).map(g => {
@@ -2581,10 +2603,73 @@ function tennisSurface(name) {
 
 // Tennis scoreboards nest matches inside event groupings (singles only, doubles skipped).
 // ATP and WTA endpoints both return combined Grand Slam draws, so dedupe by match id.
+// ── MMA (UFC) ────────────────────────────────────────────────────────────
+// Each scoreboard event is a CARD; its competitions are the individual fights.
+// Fighters carry W-L-D records and winner flags but no homeAway — order 1 is the
+// primary listing (mapped to "home"; zero home advantage, hfa stays 0). Records
+// span careers, so the log5 prior is regressed hard and the Elo brain (with its
+// Glicko deviation — perfect for fighters' long layoffs) does the real work.
+function parseMMA(json, sport) {
+  const out = [];
+  (json.events || []).forEach(ev => {
+    (ev.competitions || []).forEach(comp => {
+      const cs = comp.competitors || [];
+      if (cs.length !== 2) return;
+      const side = c => {
+        const ath = c.athlete || {};
+        return {
+          name: ath.displayName || '?',
+          abbr: (ath.shortName || ath.displayName || '?').split(' ').pop().toUpperCase(),
+          logo: ath.headshot?.href || ath.flag?.href || '',
+          flagLogo: true,                       // Elo keys by full NAME (last names collide)
+          recSummary: c.records?.[0]?.summary || '',
+          rec: parseRecord(c.records?.[0]?.summary || '', false),
+          score: '',
+          winner: c.winner === true,
+        };
+      };
+      const home = side(cs.find(c => c.order === 1) || cs[1]);
+      const away = side(cs.find(c => c.order === 2) || cs[0]);
+      // regressed record log5 with zero cage advantage, then the Elo brain on top
+      const base = predictUS(regressedWinPct(home.rec.w, home.rec.l),
+                             regressedWinPct(away.rec.w, away.rec.l), 0.5);
+      const p = Brain.adjust('mma', home, away, base.home, 0, 0.6, true);
+      const model = { home: p, away: 1 - p, draw: 0 };
+      const pick = model.home >= model.away ? 'home' : 'away';
+      // per-fight moneylines when the card is priced (pregame) — full EV engine engages
+      const o = comp.odds?.[0];
+      const hML = o?.homeTeamOdds?.moneyLine ?? o?.homeAthleteOdds?.moneyLine;
+      const aML = o?.awayTeamOdds?.moneyLine ?? o?.awayAthleteOdds?.moneyLine;
+      const vegas = (hML && aML) ? { detail: o.details || '', ou: null, mlHome: hML, mlAway: aML,
+        mlFav: null, spread: null, favIsHome: null,
+        homeProb: powerDevig(mlToProb(hML), mlToProb(aML)) } : null;
+      const st = comp.status?.type || {};
+      const wclass = comp.type?.text || comp.type?.abbreviation || '';
+      const g = {
+        id: comp.id, home, away, model, pick, pickProb: model[pick],
+        vegas, edge: vegas ? model.home - vegas.homeProb : null, marketPrior: false,
+        total: null, sim: null, wx: null, why: [], pRaw: base.home,
+        state: st.state || 'pre',
+        statusText: [wclass, st.shortDetail || st.detail].filter(Boolean).join(' · '),
+        start: new Date(comp.date || ev.date),
+        venue: [ev.shortName || ev.name, wclass].filter(Boolean).join(' · '),
+        tv: '', mma: true, correct: null,
+      };
+      if (g.state === 'post') g.correct = g.pick === (home.winner ? 'home' : 'away');
+      g.bp = computeBestPick(g, sport);
+      out.push(g);
+    });
+  });
+  return out.sort((a, b) => (STATE_ORDER[a.state] - STATE_ORDER[b.state]) || (a.start - b.start));
+}
+
 function parseTennis(jsons, ranks, date) {
   const seen = new Set(), out = [];
   const ptsFromRank = r => 13450 * Math.pow(r, -0.72); // fallback fit of points vs rank
   jsons.forEach(json => (json?.events || []).forEach(ev => {
+    // tour-level only: slams / ATP / WTA / ITF. Exhibitions and team showcases are
+    // untrainable one-offs (nothing at stake, retired players) — filtered out entirely.
+    if (/exhibition|ultimate tennis|\buts\b|laver cup|hopman|kooyong|world tennis league|tie ?break tens/i.test(ev.name || ev.shortName || '')) return;
     (ev.groupings || []).forEach(grp => {
       const gname = grp.grouping?.displayName || '';
       if (!/Singles/i.test(gname) || /Doubles/i.test(gname)) return;
@@ -2628,7 +2713,7 @@ function parseTennis(jsons, ranks, date) {
           state: st.state || 'pre',
           statusText: [round, st.shortDetail].filter(Boolean).join(' · '),
           start,
-          venue: [ev.shortName || ev.name, { grass: '🌿 grass', clay: '🧱 clay', hard: '🏟️ hard' }[surf], round, comp.venue?.court].filter(Boolean).join(' · '),
+          venue: [tour, ev.shortName || ev.name, { grass: '🌿 grass', clay: '🧱 clay', hard: '🏟️ hard' }[surf], round, comp.venue?.court].filter(Boolean).join(' · '),
           tv: '',
           tennis: true,
           surface: surf,
@@ -2756,6 +2841,7 @@ function sparkline(hist) {
 }
 
 function formSection(g) {
+  if (g.noLearn) return '';   // summer squads: the real franchise's form is irrelevant
   const eA = Brain.rating(g.sportId, g.away), eH = Brain.rating(g.sportId, g.home);
   if (!eA?.hist?.length && !eH?.hist?.length) return '';
   const row = (t, e) => {
@@ -2915,7 +3001,7 @@ function teamRow(t, g, side) {
   const isWinner = g.state === 'post' && t.winner;
   const isPicked = g.pick === side && g.state !== 'post';
   const score = g.state !== 'pre' ? `<span class="tscore${g.tennis ? ' sets' : ''}">${esc(t.score ?? '')}</span>` : '';
-  const e = Brain.rating(g.sportId, t);
+  const e = g.noLearn ? null : Brain.rating(g.sportId, t);   // summer squads ≠ the real franchise
   const eloStr = e && e.n >= 3 ? ` · ⚡${Math.round(e.r)}` : '';
   const pit = t.probable?.name
     ? ` · P: ${t.probable.name}${t.probable.era != null ? ` (${t.probable.era.toFixed(2)})` : ''}` : '';
