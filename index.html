@@ -656,7 +656,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v11.9';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v12.0';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -989,6 +989,7 @@ const Brain = (() => {
   // not be re-learned (which would double-count) when yesterday is re-fetched.
   db.learned = db.learned || { ...db.processed };
   db.perf = db.perf || {};   // per-sport rolling Brier of Elo (be) vs baseline prior (bb)
+  db.hfa = db.hfa || {};     // per-sport learned home-advantage EMA {w, n}
   const cutoff = ymd(new Date(Date.now() - 60 * 864e5));
   for (const k in db.processed) if (db.processed[k] < cutoff) delete db.processed[k];
   for (const k in db.learned) if (db.learned[k] < cutoff) delete db.learned[k];
@@ -1049,6 +1050,17 @@ const Brain = (() => {
     return clamp(invlogit(x));
   }
 
+  // learned home-field advantage: a slow EMA of the home side's actual result share.
+  // HFA drifts (the NBA's has fallen for a decade) — a fixed constant goes stale, so
+  // the effective HFA blends the static prior with what this season's results say,
+  // trusting the data more as it accumulates. Ships in the canonical brain.
+  const effHfa = (s, base) => {
+    const h = db.hfa[s];
+    if (!h || !h.n) return base;
+    const mix = h.n / (h.n + 150);
+    return Math.max(0.45, Math.min(0.68, (1 - mix) * base + mix * h.w));
+  };
+
   function learn(sport, kH, kA, hfaLogit, scoreH, mov = 1, day = null, surf = null, pRaw = null) {
     const { p: pElo, eH, eA } = eloProb(sport, kH, kA, hfaLogit, surf, day);
     // MOV multiplier — logarithmic diminishing returns scaled to the sport's typical
@@ -1075,6 +1087,11 @@ const Brain = (() => {
     const info = 1 / (RD_Q * RD_Q * Math.max(0.05, pElo * (1 - pElo)));
     eH.d = Math.max(RD_MIN, Math.sqrt(1 / (1 / (dH * dH) + 1 / info)));
     eA.d = Math.max(RD_MIN, Math.sqrt(1 / (1 / (dA * dA) + 1 / info)));
+    // home-advantage tracker: slow EMA (~last 100 games) of the home result share.
+    // Updated AFTER this game's Elo math so it never self-influences.
+    const hf = db.hfa[sport] = db.hfa[sport] || { w: 0.55, n: 0 };
+    hf.w += 0.01 * (scoreH - hf.w);
+    hf.n++;
     // rolling last-10 signed margins, fuel for the form sparklines
     const hMargin = scoreH === 1 ? mov : scoreH === 0 ? -mov : 0;
     (eH.hist = eH.hist || []).push(hMargin); if (eH.hist.length > 10) eH.hist.shift();
@@ -1205,7 +1222,7 @@ const Brain = (() => {
       // stage 2 — deterministic learning, only for games before today, exactly once.
       // The anchor guard skips anything the adopted canonical brain already learned.
       if (gday < today && gday > (db.anchor || 0) && !db.learned[key]) {
-        const hfaLogit = g.tennis || sport.hfaWin == null ? 0 : logit(sport.hfaWin);
+        const hfaLogit = g.tennis || sport.hfaWin == null ? 0 : logit(effHfa(sport.id, sport.hfaWin));
         let mov;
         if (g.tennis) { const [th, ta] = setsTally(g.home.sets, g.away.sets); mov = Math.abs(th - ta); }
         else mov = Math.abs((Number(g.home.score) || 0) - (Number(g.away.score) || 0));
@@ -1290,6 +1307,7 @@ const Brain = (() => {
     // canonical rolling Brier of Elo (be) vs baseline prior (bb) — read by the
     // performance-weighted market anchor so it's deterministic on every device
     perfOf: s => db.perf[s] || null,
+    effHfa,
     // 🧬 one consistent base for every device: adopt the canonical pricing brain shipped
     // with the site (brain.json). Canonical always wins on a new publish — personal state
     // (tickets, ledger, my bets) is untouched. After adoption every device extends the
@@ -1300,7 +1318,7 @@ const Brain = (() => {
         if (!r?.through || !r.elo) return false;
         if (db.canonId === r.id && (db.through || 0) >= r.through) return false;   // already on this base
         db.elo = r.elo; db.calib = r.calib || {}; db.perf = r.perf || {};
-        db.totalsBias = r.totalsBias || {};
+        db.totalsBias = r.totalsBias || {}; db.hfa = r.hfa || {};
         db.through = r.through; db.anchor = r.through; db.learned = {};
         db.canonId = r.id;
         // brain-level counters ride along so a fresh device shows the brain's real experience
@@ -1312,7 +1330,7 @@ const Brain = (() => {
     // canonical export: everything that PRICES games (none of the personal state)
     exportCanonical() {
       return JSON.stringify({ id: syncFingerprint().id, through: db.through || 0,
-        elo: db.elo, calib: db.calib, perf: db.perf, totalsBias: db.totalsBias,
+        elo: db.elo, calib: db.calib, perf: db.perf, totalsBias: db.totalsBias, hfa: db.hfa,
         stats: { absorbed: db.stats.absorbed, hits: db.stats.hits, misses: db.stats.misses } });
     },
     postmortems: () => db.postmortems,
@@ -2261,13 +2279,15 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
 
     // model — soccer without season records (World Cup knockouts) leans on the market
     const played = r => r.w + r.d + r.l;
-    const hfaL = logit(sport.hfaWin);
+    // effective HFA = static prior blended with the learned per-sport home EMA
+    const hfaWinEff = Brain.effHfa(sport.id, sport.hfaWin);
+    const hfaL = logit(hfaWinEff);
     let model, marketPrior = false;
     if (sport.soccer && (!played(home.rec) || !played(away.rec))) {
       if (vegas?.homeProb != null) { model = predictFromMarket(vegas.homeProb); marketPrior = true; }
       else model = { home: 0.37, away: 0.37, draw: 0.26 };
     } else if (sport.soccer) {
-      model = predictSoccer(home.rec, away.rec, sport.hfaWin);
+      model = predictSoccer(home.rec, away.rec, hfaWinEff);
       // goal-differential quality (Pythagorean) sharpens the points-based prior
       if (home.pyth != null && away.pyth != null) {
         const sh = (logit(clamp(home.pyth)) - logit(clamp(away.pyth))) * 0.35;
@@ -2290,7 +2310,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds) {
         model = { home: clamp(m.home / s), away: clamp(m.away / s), draw: m.draw / s };
       }
     } else {
-      model = predictUS(teamStrength(home), teamStrength(away), sport.hfaWin);
+      model = predictUS(teamStrength(home), teamStrength(away), hfaWinEff);
     }
     // brain pass: blend the prior with learned Elo, then recalibrate.
     // Soccer keeps its draw share and blends only the home-vs-away split;
