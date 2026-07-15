@@ -715,7 +715,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v14.4';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v14.5';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -856,9 +856,18 @@ const MMA_CLASS = {
 const MMA_DEFAULT = { fin: 0.47, ko: 0.58 };
 function mmaOutcome(g) {
   const base = MMA_CLASS[g.wclass] || MMA_DEFAULT;
+  let finBase = base.fin, koShare = base.ko;
+  // drift off the hardcoded base toward this division's ACTUAL finish mix as fights accrue
+  const m = typeof Brain !== 'undefined' ? Brain.mmaMethod(g.wclass) : null;
+  if (m && m.n >= 8) {
+    const mix = m.n / (m.n + 12);
+    const fins = m.ko + m.sub;
+    finBase = (1 - mix) * finBase + mix * (fins / m.n);
+    if (fins > 0) koShare = (1 - mix) * koShare + mix * (m.ko / fins);
+  }
   const edge = Math.abs(g.model.home - 0.5) * 2;                 // 0 (pick-em) → 1 (lock)
-  const fin = clamp(base.fin + edge * 0.18, 0.10, 0.92);        // mismatch raises finish rate
-  const ko = fin * base.ko, sub = fin * (1 - base.ko), dec = 1 - fin;
+  const fin = clamp(finBase + edge * 0.18, 0.10, 0.92);        // mismatch raises finish rate
+  const ko = fin * koShare, sub = fin * (1 - koShare), dec = 1 - fin;
   const sched = g.rounds || 3;
   // decisions go the full distance; finishes cluster near the middle of the fight
   const expRounds = dec * sched + fin * (sched * 0.45);
@@ -1111,6 +1120,7 @@ const Brain = (() => {
   db.perf = db.perf || {};   // per-sport rolling Brier of Elo (be) vs baseline prior (bb)
   db.hfa = db.hfa || {};     // per-sport learned home-advantage EMA {w, n}
   db.edge = db.edge || {};   // per-sport Brier of market prior (mkt) vs our posterior (mdl) — edge trust
+  db.mmaMethod = db.mmaMethod || {};   // per-weight-class actual finish mix {ko, sub, dec, n}
   const cutoff = ymd(new Date(Date.now() - 60 * 864e5));
   for (const k in db.processed) if (db.processed[k] < cutoff) delete db.processed[k];
   for (const k in db.learned) if (db.learned[k] < cutoff) delete db.learned[k];
@@ -1380,6 +1390,16 @@ const Brain = (() => {
           e.mdl += (post - scoreH) ** 2;
           e.n++;
         }
+        // self-learning UFC finish mix: fold the actual method (parsed from the fight's
+        // play-by-play) into a per-weight-class tally so mmaOutcome() drifts off the
+        // hardcoded base rates toward what this division really does. Canonical.
+        if (sport.id === 'mma' && g.result) {
+          const m = db.mmaMethod[g.wclass || '?'] = db.mmaMethod[g.wclass || '?'] || { ko: 0, sub: 0, dec: 0, n: 0 };
+          if (g.result.method === 'KO/TKO') m.ko++;
+          else if (g.result.method === 'Submission') m.sub++;
+          else m.dec++;
+          m.n++;
+        }
         db.learned[key] = today;
         changed = true;
       }
@@ -1457,6 +1477,7 @@ const Brain = (() => {
       const gain = (e.mkt - e.mdl) / e.n;   // avg Brier improvement of full-alpha posterior over market
       return Math.max(0.3, Math.min(1.3, 1 + gain * 25));
     },
+    mmaMethod: wc => db.mmaMethod[wc] || null,   // learned finish mix for a weight class
     effHfa,
     // 🧬 one consistent base for every device: adopt the canonical pricing brain shipped
     // with the site (brain.json). Canonical always wins on a new publish — personal state
@@ -1469,6 +1490,7 @@ const Brain = (() => {
         if (db.canonId === r.id && (db.through || 0) >= r.through) return false;   // already on this base
         db.elo = r.elo; db.calib = r.calib || {}; db.perf = r.perf || {};
         db.totalsBias = r.totalsBias || {}; db.hfa = r.hfa || {}; db.edge = r.edge || {};
+        db.mmaMethod = r.mmaMethod || {};
         db.through = r.through; db.anchor = r.through; db.learned = {};
         db.canonId = r.id;
         // brain-level counters ride along so a fresh device shows the brain's real experience
@@ -1481,6 +1503,7 @@ const Brain = (() => {
     exportCanonical() {
       return JSON.stringify({ id: syncFingerprint().id, through: db.through || 0,
         elo: db.elo, calib: db.calib, perf: db.perf, totalsBias: db.totalsBias, hfa: db.hfa, edge: db.edge,
+        mmaMethod: db.mmaMethod,
         stats: { absorbed: db.stats.absorbed, hits: db.stats.hits, misses: db.stats.misses } });
     },
     postmortems: () => db.postmortems,
