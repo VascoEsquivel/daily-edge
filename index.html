@@ -722,6 +722,7 @@
     🧭 TOP-DOWN BAYESIAN CORE: the de-vigged market line is the PRIOR — the sharpest public estimate there is. The whole bottom-up stack (Glicko-deviation Elo, Pythagorean, Statcast, park &amp; wind, injuries, fatigue, form) computes a likelihood that may nudge that prior by a hard-clamped ±5 points (the α you see on every pick strip). Posted spreads and totals are treated as the market's median: the sim only supplies a bounded α around 50/50. Rogue data is mathematically unable to manufacture a giant fake edge. ⚖️ Stakes are portfolio Kelly: the day's picks are priced as one correlated book (same game ρ=.35, same sport .12, cross-sport .05) and every stake scales down together whenever correlated exposure would top 12u.<br>
     🧠 The model learns: every final updates per-team Elo ratings (margin-of-victory weighted, faster for barely-seen teams) and a per-sport calibration layer (stored locally in your browser). On launch it studies the last 45 days of results in chronological order, then stays current. Predictions blend the record/ranking prior with learned Elo, and the Elo weight grows as the brain sees more of each team. ⭐ picks are logged at the pregame price and settled against the final score. The brain bar separates two records: <b>model picks · straight-up</b> (how often the who-wins pick is right) and <b>⭐ suggested-bet hit</b> (how often the +EV plays cash — usually lower, since value bets are often plus-money dogs, with ROI showing they still profit). "exp" is the rate the model expected; beating it means the edge is real. 📜 History keeps a match-by-match record. ⬆⬇ Export/import moves a trained brain between devices.<br>
     ⚡ Live win probability uses the Stern model — current margin + time remaining vs the pregame expectation — and updates each poll; the ▲▼ shows movement vs the opening number. Click any upcoming match for its full bet board with model vs market prices on every side.<br>
+    🟢 Kalshi user? Every model % <b>is its fair cent price</b> (68% = 68¢), so read it straight against the live contract. On a live game where you hold an open moneyline ticket, the ⚖️ HEDGE / CASH-OUT panel reads your live win probability and sizes the exact profit-locking hedge — type the opposing side's live Kalshi cents (1–99) or book odds and it returns the hedge stake, guaranteed locked profit, whether the price beats fair, and how much edge your side still has vs the market.<br>
     🎟️ The slip combines legs assuming independence; parlays stack the book's vig, so most are −EV — the slip will tell you. 🎰 The Parlay Generator (top of The Card) auto-builds Safe / Value / Longshot parlays from the day's priced picks and labels each +EV or −EV honestly. 💵 Type your bankroll in the top bar (saves as you type) to see stakes in dollars. Keys: ← → dates · t today · r refresh · 1–9 tabs.<br>
     </div>
     </details>
@@ -732,7 +733,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v14.6';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v14.7';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -3380,13 +3381,13 @@ function hedgePanel(g, sport) {
     const pSide = clamp(l.side === 'home' ? lp.home : lp.away, 0.01, 0.99);
     const opp = l.side === 'home' ? g.away.abbr : g.home.abbr;
     const S = bet.stake, payout = S * (1 + l.b);
-    const Hfair = payout * (1 - pSide);      // = payout / fair opposing decimal odds
     const locked = payout * pSide - S;       // locked profit at fair odds = position's current fair value
+    const fairCents = Math.round((1 - pSide) * 100);   // fair price to BUY the opposing side on Kalshi
     const fairAm = probToAmerican(clamp(1 - pSide));
     return `<div class="h-ttl">⚖️ HEDGE / CASH-OUT · ${esc(l.t)}</div>
-      <div>live win prob <b>${pct(pSide)}</b> (Stern) · position fair value <b class="${locked >= 0 ? 'ok' : 'bad'}">${locked >= 0 ? '+' : ''}${locked.toFixed(2)}u</b>${money(locked)}</div>
-      <div>to fully lock: bet <b>${Hfair.toFixed(2)}u</b>${money(Hfair)} on <b>${esc(opp)}</b> @ fair ${fmtML(fairAm)} → guarantees <b class="${locked >= 0 ? 'ok' : 'bad'}">${locked >= 0 ? '+' : ''}${locked.toFixed(2)}u</b> either way</div>
-      <div class="hedge-calc" data-payout="${payout.toFixed(4)}" data-stake="${S}" data-p="${pSide.toFixed(4)}">book's live ${esc(opp)} price: <input class="hedge-odds" type="text" inputmode="numeric" placeholder="${fmtML(fairAm)}"><span class="hedge-out"></span></div>`;
+      <div>live model <b>${pct(pSide)}</b> (Stern) = fair <b>${Math.round(pSide * 100)}¢</b> your side · position fair value <b class="${locked >= 0 ? 'ok' : 'bad'}">${locked >= 0 ? '+' : ''}${locked.toFixed(2)}u</b>${money(locked)}</div>
+      <div>fair exit: hedge <b>${esc(opp)}</b> at ≤<b>${fairCents}¢</b> (Kalshi) / ${fmtML(fairAm)} (book) → locks <b class="${locked >= 0 ? 'ok' : 'bad'}">${locked >= 0 ? '+' : ''}${locked.toFixed(2)}u</b> either way</div>
+      <div class="hedge-calc" data-payout="${payout.toFixed(4)}" data-stake="${S}" data-p="${pSide.toFixed(4)}" data-opp="${esc(opp)}">live ${esc(opp)} price (Kalshi ¢ or book odds): <input class="hedge-odds" type="text" inputmode="numeric" placeholder="${fairCents}¢"><span class="hedge-out"></span></div>`;
   }).join('<div style="height:9px"></div>');
   return `<div class="hedge">${blocks}</div>`;
 }
@@ -4924,22 +4925,36 @@ $('#mybetspanel').addEventListener('click', e => {
   }
 });
 
-// live hedge calculator: type the book's live opposing American odds → exact hedge stake,
-// guaranteed locked profit, and whether the book's price beats the model's fair exit.
+// live hedge calculator: type the opposing side's live price — Kalshi cents (1–99, the
+// price to BUY that contract) OR American book odds (signed / |x|≥100, auto-detected) —
+// and get the exact hedge stake, guaranteed locked profit, whether it beats the model's
+// fair exit, and how much edge your original side still has vs where the market prices it.
 document.addEventListener('input', e => {
   const inp = e.target.closest('.hedge-odds');
   if (!inp) return;
   const box = inp.closest('.hedge-calc'), out = box.querySelector('.hedge-out');
-  const payout = +box.dataset.payout, S = +box.dataset.stake, p = +box.dataset.p;
-  const am = parseFloat((inp.value || '').replace(/[^0-9.+-]/g, ''));
-  if (!am || Math.abs(am) < 100) { out.innerHTML = ''; return; }
-  const dOpp = am > 0 ? 1 + am / 100 : 1 + 100 / -am;   // book's opposing decimal odds
+  const payout = +box.dataset.payout, S = +box.dataset.stake, p = +box.dataset.p, opp = box.dataset.opp || 'the other side';
+  const raw = (inp.value || '').trim();
+  const num = parseFloat(raw.replace(/[^0-9.+-]/g, ''));
+  if (!num) { out.innerHTML = ''; return; }
+  const isAmerican = /[+-]/.test(raw) || Math.abs(num) >= 100;   // signed or ≥100 → American; else Kalshi ¢
+  let dOpp, oppImp, priceLabel;
+  if (isAmerican) {
+    if (Math.abs(num) < 100) { out.innerHTML = ''; return; }
+    dOpp = num > 0 ? 1 + num / 100 : 1 + 100 / -num;
+    oppImp = 1 / dOpp; priceLabel = fmtML(num);
+  } else {
+    if (num < 1 || num > 99) { out.innerHTML = ''; return; }
+    dOpp = 100 / num;              // buy the opposing Kalshi contract at num¢ → 100¢ back if it hits
+    oppImp = num / 100; priceLabel = num + '¢';
+  }
   const H = payout / dOpp;                               // full-equalizing hedge stake
   const locked = payout - S - H;                         // guaranteed profit either way
   const bank = Number(localStorage.getItem('de-bank')) || 0;
   const money = u => bank ? ` ($${(u * bank / 100).toFixed(0)})` : '';
-  const good = dOpp >= 1 / (1 - p);                      // book opposing odds beat the model-fair price?
-  out.innerHTML = ` → hedge <b>${H.toFixed(2)}u</b>${money(H)}, locks <b class="${locked >= 0 ? 'ok' : 'bad'}">${locked >= 0 ? '+' : ''}${locked.toFixed(2)}u</b>${money(locked)} <span class="${good ? 'ok' : 'bad'}">${good ? '✓ beats fair' : '✗ below fair'}</span>`;
+  const good = oppImp <= (1 - p) + 1e-9;                 // opposing price at/below fair → cheap hedge
+  const edge = p - (1 - oppImp);                         // your side model prob vs its market implied
+  out.innerHTML = ` → hedge <b>${H.toFixed(2)}u</b>${money(H)} on ${esc(opp)} @ ${priceLabel}, locks <b class="${locked >= 0 ? 'ok' : 'bad'}">${locked >= 0 ? '+' : ''}${locked.toFixed(2)}u</b>${money(locked)} · <span class="${good ? 'ok' : 'bad'}">${good ? '✓ beats fair' : '✗ below fair'}</span> · your side <span class="${edge >= 0 ? 'ok' : 'bad'}">${edge >= 0 ? '+' : ''}${(edge * 100).toFixed(0)}%</span> vs mkt`;
 });
 
 // keyboard: ←/→ dates · t today · r refresh · 1-9 tabs (1 = The Card)
