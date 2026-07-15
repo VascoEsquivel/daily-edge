@@ -733,7 +733,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v14.7';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v14.8';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1051,11 +1051,26 @@ function gameFraction(g, sport) {
   return cap((p - remFrac) / cfg.n);
 }
 
-function sternLive(margin, f, pPre, sigma) {
-  const rem = 1 - f;
+function sternLive(margin, f, pPre, sigma, paceMult = 1) {
+  const rem = (1 - f) * paceMult;   // effective remaining time, pace-scaled (see livePaceMult)
   if (rem <= 0.02) return margin > 0 ? 0.97 : margin < 0 ? 0.03 : 0.5;
   const mu = invNorm(clamp(pPre)) * sigma;
   return clamp(normalCdf((margin + mu * rem) / (sigma * Math.sqrt(rem))));
+}
+
+// Dynamic pace-decay: the Stern model assumes points arrive at the pregame rate, but live
+// games drift. If the score is running BELOW the expected pace (stall-ball, intentional
+// fouling that eats clock, a low-block soccer lockdown), fewer scoring chances remain than
+// the raw clock implies → compress the effective remaining time → the current margin is
+// more decisive and the leader is safer. A track-meet overpace stretches it the other way.
+// Needs a projected total and enough elapsed game for the pace read to be stable; bounded.
+function livePaceMult(g, sport, f) {
+  const exp = g.total?.exp;
+  if (!exp || f < 0.18 || f > 0.92) return 1;
+  const cur = (Number(g.home.score) || 0) + (Number(g.away.score) || 0);
+  const expBy = exp * f;            // points we'd expect by now at the pregame pace
+  if (expBy <= 0) return 1;
+  return Math.max(0.65, Math.min(1.5, cur / expBy));
 }
 
 // count sets won from linescores (excludeLast = skip the in-progress set)
@@ -1083,13 +1098,14 @@ function liveProbs(g, sport) {
   const margin = (Number(g.home.score) || 0) - (Number(g.away.score) || 0);
   const f = gameFraction(g, sport);
   const sigma = LIVE_SIGMA[sport.id] || 10;
+  const pace = livePaceMult(g, sport, f);
   if (!g.model.draw) {
-    const p = sternLive(margin, f, Open.get(sport, g)?.p ?? g.model.home, sigma);
+    const p = sternLive(margin, f, Open.get(sport, g)?.p ?? g.model.home, sigma, pace);
     return { home: p, away: 1 - p, draw: 0 };
   }
   // soccer: shrink the draw share as the clock runs (slower when level), split the rest
   const share = g.model.home / (g.model.home + g.model.away);
-  const p2 = sternLive(margin, f, share, sigma);
+  const p2 = sternLive(margin, f, share, sigma, pace);
   const d = Math.max(0.01, Math.min(0.45, g.model.draw * (1 - f) * (margin === 0 ? 1.6 : 0.5)));
   return { home: clamp(p2 * (1 - d)), away: clamp((1 - p2) * (1 - d)), draw: d };
 }
@@ -3462,6 +3478,8 @@ function gameCard(g, i, sport) {
       const f = gameFraction(g, sport);
       const proj = cur + g.total.exp * (1 - f);
       pace = ` · 📈 pace ${proj.toFixed(1)} vs O/U ${g.total.line} ${proj > g.total.line ? '→ over' : '→ under'}`;
+      const pm = livePaceMult(g, sport, f);
+      if (Math.abs(pm - 1) >= 0.08) pace += ` · ⏱ clock ×${pm.toFixed(2)} ${pm < 1 ? 'slow — leader safer' : 'fast — swingier'}`;
     }
     liveLine = `<div class="liveline">⚡ LIVE <b>${esc(g.home.abbr)} ${pct(lp.home)}</b> ${arrow} vs open ${pct(base)}${pace}
       <span class="open-ref">${open?.d ? 'opened ' + esc(open.d) : 'model preline'}</span></div>`;
