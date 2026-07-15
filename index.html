@@ -459,6 +459,16 @@
   }
   .hedge .hedge-out { margin-left: 6px; }
   /* ⌘K / "/" command omnibar */
+  .omni-btn {
+    background: var(--bg2); border: 1px solid var(--border); color: var(--muted);
+    border-radius: 999px; padding: 7px 12px; font-size: 12px; cursor: pointer; transition: all .15s;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .omni-btn:hover { color: var(--text); border-color: rgba(110,140,220,.4); }
+  .omni-btn kbd {
+    background: rgba(10,16,32,.6); border: 1px solid var(--border); border-radius: 5px;
+    padding: 0 6px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text);
+  }
   #omnibar {
     position: fixed; inset: 0; z-index: 1000; display: none;
     background: rgba(4, 8, 18, .55); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
@@ -740,6 +750,7 @@
     <label class="bankbox" title="Your bankroll in $ — type it and it saves instantly; stakes then show in dollars too (1u = 1% of bankroll). Clear it to go back to units only.">
       💵 <input id="bankinput" type="number" min="0" inputmode="numeric" placeholder="bankroll $">
     </label>
+    <button class="omni-btn" id="omnibtn" title="Command bar — jump to a team, switch sports, queue a bet, open a panel. Press Ctrl/⌘+K or /">🔍 <kbd>/</kbd></button>
     <button class="refresh" id="refreshbtn">⟳ Refresh</button>
   </header>
 
@@ -779,7 +790,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v15.0';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v15.1';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -5148,6 +5159,14 @@ document.addEventListener('keydown', e => {
 // Global launcher: jump to any team's card, switch sports, or queue a slip bet by keyboard.
 const Omni = (() => {
   let el, input, list, items = [], sel = 0, isOpen = false;
+  // action commands — the omnibar doubles as a command palette
+  const ACTIONS = [
+    { type: 'action', label: '💰 The Card', sub: 'go to the best plays', kw: 'card best plays home', act: () => { state.tab = 'card'; localStorage.setItem('de-tab', 'card'); refresh(); } },
+    { type: 'action', label: '⭐ pick ledger', sub: 'the tail-everything record', kw: 'ledger picks record clv', act: () => { state.showLedger = true; renderPickLedger(); renderBrain(); setTimeout(() => $('#ledgerpanel')?.scrollIntoView({ behavior: 'smooth' }), 60); } },
+    { type: 'action', label: '🎯 my bets', sub: 'your logged tickets + CLV', kw: 'my bets tickets clv', act: () => { state.showMyBets = true; renderMyBets(); renderBrain(); setTimeout(() => $('#mybetspanel')?.scrollIntoView({ behavior: 'smooth' }), 60); } },
+    { type: 'action', label: '📋 copy card', sub: "copy today's +EV picks", kw: 'copy card share export', act: () => { document.querySelector('[data-copycard]')?.click(); } },
+    { type: 'action', label: '⟳ refresh', sub: 'reload the slate', kw: 'refresh reload update', act: () => refresh(true) },
+  ];
   function build() {
     el = document.createElement('div');
     el.id = 'omnibar';
@@ -5178,17 +5197,18 @@ const Omni = (() => {
   }
   function matches(q) {
     q = q.trim().toLowerCase();
-    if (!q) return [];
+    if (!q) return ACTIONS;   // empty bar = show the command palette as defaults
     const bare = q.replace(/^\//, '');
     const sportHits = SPORTS.filter(s => s.id.startsWith(bare) || s.label.toLowerCase().replace(/[^a-z]/g, '').includes(bare))
       .map(s => ({ type: 'sport', label: `/${s.id}`, sub: `switch to ${s.label}`, tab: s.id }));
     if (q.startsWith('/')) return sportHits.slice(0, 6);
+    const actionHits = ACTIONS.filter(a => a.label.toLowerCase().includes(q) || a.kw.includes(q));
     const seen = new Set(), teams = [];
     for (const t of index()) {
       if (!(t.label.toLowerCase().includes(q) || t.abbr.toLowerCase().includes(q))) continue;
       const k = t.gid + t.side; if (seen.has(k)) continue; seen.add(k); teams.push(t);
     }
-    return [...sportHits, ...teams].slice(0, 8);
+    return [...sportHits, ...actionHits, ...teams].slice(0, 8);
   }
   function render() {
     const q = input.value;
@@ -5220,6 +5240,7 @@ const Omni = (() => {
     if (!it) return;
     if (it.type === 'sport') { close(); state.tab = it.tab; localStorage.setItem('de-tab', it.tab); refresh(); }
     else if (it.type === 'team') { close(); await gotoGame(it.tab, it.gid); }
+    else if (it.type === 'action') { close(); it.act(); }
     else if (it.type === 'slipcmd') runSlip(input.value.trim());
   }
   async function gotoGame(tab, gid) {
@@ -5258,6 +5279,7 @@ document.addEventListener('keydown', e => {
   if ((e.key === 'k' || e.key === 'K') && (e.ctrlKey || e.metaKey)) { e.preventDefault(); Omni.toggle(); return; }
   if (e.key === '/' && !e.target.matches('input,textarea') && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); Omni.open(); }
 });
+$('#omnibtn')?.addEventListener('click', () => Omni.open());
 
 document.querySelector('.logo .sub').textContent += ' · ' + APP_VERSION;
 // 👋 first-visit guide — three plain-English pointers for people who don't speak betting.
