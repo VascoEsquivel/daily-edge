@@ -486,6 +486,24 @@
   .omni-hint { color: var(--muted); font-size: 11px; padding: 10px 18px; border-top: 1px solid var(--border); display: flex; gap: 14px; letter-spacing: .3px; }
   .omni-flash { animation: omniflash 1.5s ease; }
   @keyframes omniflash { 0%, 100% { box-shadow: none; } 30% { box-shadow: 0 0 0 2px var(--accent); } }
+  /* 🎛️ What-If Sandbox */
+  .sandbox { margin-top: 10px; border: 1px solid var(--border); border-radius: 12px; background: rgba(20, 30, 54, .4); overflow: hidden; }
+  .sandbox > summary { cursor: pointer; padding: 9px 13px; font-size: 11px; font-weight: 700; letter-spacing: .5px; color: var(--accent); list-style: none; }
+  .sandbox > summary::-webkit-details-marker { display: none; }
+  .sandbox > summary::before { content: '▸ '; }
+  .sandbox[open] > summary::before { content: '▾ '; }
+  .wi-body { padding: 2px 13px 12px; }
+  .wi-row { display: grid; grid-template-columns: 132px 1fr; align-items: center; gap: 10px; margin: 8px 0; }
+  .wi-row label { font-size: 11px; color: var(--muted); font-family: 'JetBrains Mono', monospace; }
+  .wi-row label b { color: var(--text); }
+  .wi-slider { width: 100%; accent-color: var(--accent); }
+  .wi-out { display: flex; gap: 8px; margin-top: 12px; }
+  .wi-stat { flex: 1; text-align: center; padding: 9px 6px; border-radius: 10px; background: rgba(10, 16, 32, .5); border: 1px solid var(--border); }
+  .wi-o { display: block; font-size: 16px; color: var(--text); font-weight: 700; }
+  .wi-o.pulse { animation: wipulse .35s ease; }
+  @keyframes wipulse { 0% { color: var(--accent); transform: scale(1.09); } 100% { color: var(--text); transform: scale(1); } }
+  .wi-k { font-size: 9.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  .wi-note { font-size: 10px; color: var(--muted); margin-top: 9px; font-style: italic; }
 
   /* skeleton shimmer while slates load */
   .skel {
@@ -761,7 +779,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v14.9';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v15.0';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -3340,6 +3358,95 @@ function renderCardProps(g, items, pg) {
 }
 
 // Full bet board: every priced side with model %, market %, EV, and stake — plus fair prices
+// ── 🎛️ What-If Sandbox ─────────────────────────────────────────────────────
+// A sensitivity explorer: recompute the model's read under altered conditions using the
+// SAME coefficients the live model uses (MLB wind 0.03 run/mph & temp 0.018 run/°F, star
+// minutes as a strength+scoring shift, a pace multiplier on the total). Pure O(1) math —
+// no simulation — so dragging is smooth. It shows the bottom-up read; live Card bets still
+// clamp to ±5% of the market, noted in the panel.
+function whatIf(g, sport, adj) {
+  const baseP = g.alphaInfo?.raw ?? g.model.home;         // bottom-up home win prob (pre-market-clamp)
+  const minShift = (adj.minutes || 0) * 0.010;            // star-minutes → team-strength logit shift
+  const pHome = clamp(invlogit(logit(clamp(baseP)) + minShift), 0.02, 0.98);
+  let total = g.total?.exp ?? null;
+  if (total != null) {
+    if (sport?.id === 'mlb') {
+      const wCoef = w => Math.max(-0.7, Math.min(0.7, w * 0.03));
+      const baseWind = g.wx?.wind?.out ?? 0, baseTemp = g.wx?.t ?? 70;
+      total += wCoef(adj.wind ?? baseWind) - wCoef(baseWind);
+      total += ((adj.temp ?? baseTemp) - 70) * 0.018 - (baseTemp - 70) * 0.018;
+    }
+    total += (adj.minutes || 0) * 0.35;                   // more star minutes → a few more points
+    total *= (adj.pace != null ? adj.pace : 100) / 100;   // pace slider is 80–120 → 0.80–1.20×
+  }
+  // recompute the game's best pick's win/cover prob + quarter-Kelly under the new numbers
+  const bp = g.bp; let pickP = null, units = null;
+  if (bp && (bp.kind === 'ev' || bp.kind === 'pass') && bp.b) {
+    if (bp.betType === 'ml') pickP = bp.side === 'home' ? pHome : 1 - pHome;
+    else if (bp.betType === 'spread') {
+      const sig = sport?.spreadSigma || 10;
+      const ph = normalCdf((invNorm(clamp(pHome)) * sig + bp.homeSpread) / sig);
+      pickP = bp.side === 'home' ? ph : 1 - ph;
+    } else if (bp.betType === 'total' && total != null) {
+      const pOver = clamp(normalCdf((total - bp.line) / (TOTAL_SIGMA[sport?.id] || 10)));
+      pickP = bp.side === 'over' ? pOver : 1 - pOver;
+    }
+    if (pickP != null) {
+      // the STAKE reflects the live market clamp so it matches the Card, even though the
+      // win% and total shown above are the raw (unclamped) model read
+      let betP = pickP;
+      if (bp.betType === 'ml' && g.alphaInfo) {
+        const prior = bp.side === 'home' ? g.alphaInfo.prior : 1 - g.alphaInfo.prior;
+        betP = clamp(prior + Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, pickP - prior)));
+      } else if (bp.betType === 'total' || bp.betType === 'spread') {
+        betP = 0.5 + Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, pickP - 0.5));
+      }
+      const ev = betP * bp.b - (1 - betP);
+      const kf = KELLY_FRACTION * (bp.b * betP - (1 - betP)) / bp.b;
+      units = ev >= MIN_EV ? Math.min(5, Math.max(0.5, Math.round(kf * 1000) / 10)) : 0;
+    }
+  }
+  return { pHome, total, pickP, units };
+}
+function fmtSliderVal(v, val) {
+  if (v === 'wind') return `${val >= 0 ? '+' : ''}${val} mph`;
+  if (v === 'temp') return `${val}°F`;
+  if (v === 'minutes') return `${val >= 0 ? '+' : ''}${val} min`;
+  if (v === 'pace') return `${(val / 100).toFixed(2)}×`;
+  return val;
+}
+function whatIfSandbox(g) {
+  const sport = SPORTS.find(s => s.id === g.sportId);
+  if (!sport || g.tennis || !g.bp || (g.bp.kind !== 'ev' && g.bp.kind !== 'pass')) return '';
+  const isMLB = g.sportId === 'mlb';
+  const isTeam = ['nba', 'wnba', 'nfl', 'nhl'].includes(g.sportId);
+  const baseWind = Math.round(Math.max(-20, Math.min(20, g.wx?.wind?.out ?? 0)));
+  const baseTemp = Math.round(Math.max(30, Math.min(100, g.wx?.t ?? 70)));
+  const sliders = [];
+  if (isMLB) {
+    sliders.push(['wind', '💨 wind', -20, 20, 1, baseWind]);
+    sliders.push(['temp', '🌡️ temp', 30, 100, 1, baseTemp]);
+  }
+  if (isTeam) sliders.push(['minutes', '⛹️ star minutes', -15, 15, 1, 0]);
+  sliders.push(['pace', '🏃 pace', 80, 120, 1, 100]);
+  const r0 = whatIf(g, sport, { wind: baseWind, temp: baseTemp, minutes: 0, pace: 100 });
+  const rows = sliders.map(([v, lbl, mn, mx, st, val]) =>
+    `<div class="wi-row"><label>${lbl} <b class="wi-val" data-for="${v}">${fmtSliderVal(v, val)}</b></label>
+      <input class="wi-slider" data-var="${v}" type="range" min="${mn}" max="${mx}" step="${st}" value="${val}"></div>`).join('');
+  return `<details class="sandbox" data-gid="${esc(g.id)}" data-k="${g.sportId}" onclick="event.stopPropagation()">
+    <summary>🎛️ WHAT-IF SANDBOX</summary>
+    <div class="wi-body">
+      ${rows}
+      <div class="wi-out">
+        <div class="wi-stat"><b class="wi-o" data-o="win">${esc(g.home.abbr)} ${pct(r0.pHome)}</b><span class="wi-k">model win</span></div>
+        <div class="wi-stat"><b class="wi-o" data-o="total">${r0.total != null ? r0.total.toFixed(1) : 'n/a'}</b><span class="wi-k">proj total</span></div>
+        <div class="wi-stat"><b class="wi-o" data-o="units">${r0.units != null ? (r0.units ? r0.units.toFixed(1) + 'u' : 'pass') : '—'}</b><span class="wi-k">⭐ Kelly</span></div>
+      </div>
+      <div class="wi-note">the model's raw read under altered inputs — live Card bets still clamp to ±5% of the market</div>
+    </div>
+  </details>`;
+}
+
 function betBoard(g) {
   const extras = formSection(g) + propsSection(g) + h2hSection(g) + gamePropsSection(g);
   if (g.state !== 'pre') return extras ? `<div class="betboard">${extras}</div>` : '';
@@ -3362,6 +3469,7 @@ function betBoard(g) {
     ${g.total ? `<div class="bo-fair">model total: ${g.total.exp.toFixed(1)} vs line ${g.total.line} → ${g.total.pOver >= 0.5 ? 'Over' : 'Under'} ${pct(Math.max(g.total.pOver, 1 - g.total.pOver))}${g.total.notes?.length ? ' · ' + esc(g.total.notes.join(' · ')) : ''}${g.wx ? ` · ${esc(g.wx.txt)}` : ''}</div>`
       : g.vegas?.ou ? `<div class="bo-fair">total: O/U ${g.vegas.ou}</div>` : ''}
     ${g.why?.length ? `<div class="bo-fair">drivers: ${esc(g.why.join(' · '))}</div>` : ''}
+    ${whatIfSandbox(g)}
     ${extras}
   </div>`;
 }
@@ -4869,6 +4977,25 @@ $('#content').addEventListener('click', e => {
 });
 $('#content').addEventListener('input', e => {
   if (e.target.id === 'gamesearch') { state.query = e.target.value; applySearch(); return; }
+  // 🎛️ What-If sandbox: live-recompute win%, projected total, and Kelly stake on drag.
+  // O(1) math + a handful of text updates → no re-render, no lag; a brief pulse animates it.
+  const sl = e.target.closest('.wi-slider');
+  if (sl) {
+    const box = sl.closest('.sandbox');
+    const g = state.lastEntries.get(box.dataset.k)?.events.find(x => String(x.id) === String(box.dataset.gid));
+    const sport = SPORTS.find(s => s.id === box.dataset.k);
+    if (!g) return;
+    const adj = {};
+    box.querySelectorAll('.wi-slider').forEach(s => adj[s.dataset.var] = Number(s.value));
+    const lbl = box.querySelector(`.wi-val[data-for="${sl.dataset.var}"]`);
+    if (lbl) lbl.textContent = fmtSliderVal(sl.dataset.var, Number(sl.value));
+    const r = whatIf(g, sport, adj);
+    const setO = (o, v) => { const el = box.querySelector(`.wi-o[data-o="${o}"]`); if (el) { el.textContent = v; el.classList.remove('pulse'); void el.offsetWidth; el.classList.add('pulse'); } };
+    setO('win', `${g.home.abbr} ${pct(r.pHome)}`);
+    setO('total', r.total != null ? r.total.toFixed(1) : 'n/a');
+    setO('units', r.units != null ? (r.units ? r.units.toFixed(1) + 'u' : 'pass') : '—');
+    return;
+  }
   const map = { 'e-a': 'a', 'e-b': 'b', 'e-pa': 'pa', 'e-oa': 'oa', 'e-ob': 'ob' };
   if (map[e.target.id]) {
     state.esports[map[e.target.id]] = e.target.value;
