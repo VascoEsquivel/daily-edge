@@ -441,6 +441,23 @@
     font-family: 'JetBrains Mono', monospace; letter-spacing: .3px;
   }
   .projline b { color: var(--text); }
+  .steam {
+    display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: .4px;
+    color: #ffcf5c; background: rgba(255, 180, 40, .12); border: 1px solid rgba(255, 180, 40, .42);
+    border-radius: 6px; padding: 2px 7px; margin-left: 6px; white-space: nowrap;
+  }
+  .hedge {
+    margin-top: 9px; padding: 10px 12px; border-radius: 12px;
+    background: rgba(30, 120, 90, .10); border: 1px solid rgba(40, 190, 140, .35);
+    font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); line-height: 1.7;
+  }
+  .hedge .h-ttl { font-weight: 700; color: #4fe0a8; letter-spacing: .4px; margin-bottom: 3px; }
+  .hedge b { color: var(--text); }
+  .hedge input {
+    background: rgba(10, 16, 32, .6); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 3px 6px; width: 76px; font-family: inherit; font-size: 11px;
+  }
+  .hedge .hedge-out { margin-left: 6px; }
 
   /* skeleton shimmer while slates load */
   .skel {
@@ -715,7 +732,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v14.5';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v14.6';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1567,7 +1584,8 @@ const Open = (() => {
         const k = sport.id + '|' + g.id;
         if (g.state !== 'pre') return;
         if (!db[k]) {
-          db[k] = { p: g.model.home, d: g.vegas?.detail || '', t: Date.now(), te: g.total?.exp ?? null };
+          db[k] = { p: g.model.home, d: g.vegas?.detail || '', t: Date.now(), te: g.total?.exp ?? null,
+                    mp: g.vegas?.homeProb ?? null };   // open de-vigged MARKET prob → line-move steam
           changed = true;
         } else if (db[k].te == null && g.total?.exp != null) {
           db[k].te = g.total.exp;   // snapshots from before totals tracking existed
@@ -1652,6 +1670,36 @@ const MyBets = (() => {
       });
       if (changed) save();
     },
+    // Closing Line Value: for open moneyline game legs still pre-game, refresh the
+    // de-vigged market implied for the side. Once the game tips off the last value
+    // stands as the "closing" number. (Only ml — implied-prob CLV is well-defined
+    // there on our single de-vigged feed; spread/total/manual legs get no CLV.)
+    trackClose(sport, events) {
+      let changed = false;
+      const pre = new Map(events.filter(g => g.state === 'pre').map(g => [String(g.id), g]));
+      db.bets.forEach(bet => {
+        if (bet.status !== 'open') return;
+        bet.legs.forEach(l => {
+          if (l.k !== sport.id || l.bt !== 'ml') return;
+          const g = pre.get(String(l.gid));
+          if (!g || g.vegas?.homeProb == null) return;
+          const imp = l.side === 'home' ? g.vegas.homeProb : 1 - g.vegas.homeProb;
+          if (l.takenImp == null) { l.takenImp = imp; changed = true; }   // fallback if unset at log time
+          if (l.closeImp !== imp) { l.closeImp = imp; changed = true; }
+        });
+      });
+      if (changed) save();
+    },
+    // ticket CLV = average leg CLV over ml legs that have both a taken and closing implied
+    clv(bet) {
+      const cs = bet.legs.map(l => (l.takenImp && l.closeImp) ? l.closeImp / l.takenImp - 1 : null).filter(x => x != null);
+      return cs.length ? cs.reduce((a, b) => a + b, 0) / cs.length : null;
+    },
+    // open tickets holding a single game leg on this game — powers the hedge assistant
+    openForGame(sportId, gid) {
+      return db.bets.filter(b => b.status === 'open' && b.legs.length === 1
+        && b.legs[0].k === sportId && String(b.legs[0].gid) === String(gid) && b.legs[0].bt);
+    },
     resolve(id, status) {
       const bet = db.bets.find(b => b.id === id);
       if (!bet || bet.status !== 'open') return;
@@ -1665,16 +1713,19 @@ const MyBets = (() => {
     list: () => db.bets,
     stats() {
       const settled = db.bets.filter(b => b.status !== 'open').sort((a, b) => (a.settled || 0) - (b.settled || 0));
-      let pnl = 0, staked = 0, w = 0, l = 0;
-      const series = [];
+      let pnl = 0, staked = 0, w = 0, l = 0, clvSum = 0, clvN = 0, clvBeat = 0;
+      const series = [], clvSeries = [];
       settled.forEach(b => {
         pnl += b.pnl || 0;
         if (b.status !== 'push') staked += b.stake;
         if (b.status === 'won') w++; else if (b.status === 'lost') l++;
         series.push(+pnl.toFixed(2));
+        const c = this.clv(b);
+        if (c != null) { clvSum += c; clvN++; if (c > 0.002) clvBeat++; clvSeries.push(+(clvSum * 100).toFixed(2)); }
       });
       return { open: db.bets.filter(b => b.status === 'open').length, settled: settled.length,
-        w, l, pnl: +pnl.toFixed(2), staked, roi: staked ? pnl / staked * 100 : 0, series };
+        w, l, pnl: +pnl.toFixed(2), staked, roi: staked ? pnl / staked * 100 : 0, series,
+        clvN, clvAvg: clvN ? clvSum / clvN * 100 : 0, clvBeat: clvN ? Math.round(clvBeat / clvN * 100) : 0, clvSeries };
     },
   };
 })();
@@ -2212,6 +2263,7 @@ async function fetchSport(sport, date, force = false) {
   Brain.recordPending(sport, events);    // log ⭐ picks at today's price for honest settling
   Open.record(sport, events);            // snapshot pregame odds/model for live movement tracking
   MyBets.settleFromEvents(sport, events);// settle the user's real game bets off finals
+  MyBets.trackClose(sport, events);      // capture closing market line on open ml legs (CLV)
   return entry;
 }
 
@@ -3311,6 +3363,34 @@ function teamRow(t, g, side) {
   </div>`;
 }
 
+// In-play hedge / cash-out assistant. For a LIVE game where the user holds an open
+// single-leg moneyline ticket, the live Stern win probability values the position and
+// sizes the profit-locking hedge. We have no live BOOK odds (ESPN strips them live), so
+// the benchmark is the model's FAIR exit price — the user can type the book's live
+// opposing number to get the exact real hedge and see if the cash-out beats fair.
+function hedgePanel(g, sport) {
+  if (g.state !== 'in' || g.tennis || g.model.draw > 0.05) return '';
+  const tickets = MyBets.openForGame(sport.id, g.id).filter(b => b.legs[0].bt === 'ml');
+  if (!tickets.length) return '';
+  const lp = liveProbs(g, sport);
+  const bank = Number(localStorage.getItem('de-bank')) || 0;
+  const money = u => bank ? ` <span style="opacity:.7">($${(u * bank / 100).toFixed(0)})</span>` : '';
+  const blocks = tickets.map(bet => {
+    const l = bet.legs[0];
+    const pSide = clamp(l.side === 'home' ? lp.home : lp.away, 0.01, 0.99);
+    const opp = l.side === 'home' ? g.away.abbr : g.home.abbr;
+    const S = bet.stake, payout = S * (1 + l.b);
+    const Hfair = payout * (1 - pSide);      // = payout / fair opposing decimal odds
+    const locked = payout * pSide - S;       // locked profit at fair odds = position's current fair value
+    const fairAm = probToAmerican(clamp(1 - pSide));
+    return `<div class="h-ttl">⚖️ HEDGE / CASH-OUT · ${esc(l.t)}</div>
+      <div>live win prob <b>${pct(pSide)}</b> (Stern) · position fair value <b class="${locked >= 0 ? 'ok' : 'bad'}">${locked >= 0 ? '+' : ''}${locked.toFixed(2)}u</b>${money(locked)}</div>
+      <div>to fully lock: bet <b>${Hfair.toFixed(2)}u</b>${money(Hfair)} on <b>${esc(opp)}</b> @ fair ${fmtML(fairAm)} → guarantees <b class="${locked >= 0 ? 'ok' : 'bad'}">${locked >= 0 ? '+' : ''}${locked.toFixed(2)}u</b> either way</div>
+      <div class="hedge-calc" data-payout="${payout.toFixed(4)}" data-stake="${S}" data-p="${pSide.toFixed(4)}">book's live ${esc(opp)} price: <input class="hedge-odds" type="text" inputmode="numeric" placeholder="${fmtML(fairAm)}"><span class="hedge-out"></span></div>`;
+  }).join('<div style="height:9px"></div>');
+  return `<div class="hedge">${blocks}</div>`;
+}
+
 // One compact line under the verdict: projected final score (ball sports + soccer),
 // projected set score (tennis), or a method-of-victory read (MMA) tied to the rounds O/U.
 function projLineHtml(g) {
@@ -3352,6 +3432,17 @@ function gameCard(g, i, sport) {
     ? ` (opened ${esc(opened.d)})` : '';
   const vegasStr = g.vegas?.detail
     ? `<span class="vegas">Vegas: ${esc(g.vegas.detail)}${moved}${g.vegas.ou ? ' · O/U ' + g.vegas.ou : ''}</span>` : '';
+  // market steam: how far the de-vigged market has moved since we first saw the line.
+  // On a single aggregated feed this is line MOVEMENT (new info repricing the game), NOT
+  // a cross-book arbitrage — the honest read is "grab the number before it settles further".
+  let steamBadge = '';
+  if (g.state === 'pre' && opened?.mp != null && g.vegas?.homeProb != null) {
+    const mv = g.vegas.homeProb - opened.mp;
+    if (Math.abs(mv) >= 0.05) {
+      const side = mv > 0 ? g.home.abbr : g.away.abbr;
+      steamBadge = `<span class="steam" title="The de-vigged market has moved ${(Math.abs(mv) * 100).toFixed(1)}% toward ${esc(side)} since it opened — the book is repricing on new information (injury, lineup, sharp action). This is a line-move signal on our single feed, not a guaranteed arbitrage. If you like ${esc(side)}, the price is still catching up.">⚡ MARKET STEAM · ${esc(side)} +${(Math.abs(mv) * 100).toFixed(1)}%</span>`;
+    }
+  }
 
   // live cards show the in-game probability and movement vs the opening number
   const lp = live ? liveProbs(g, sport) : null;
@@ -3391,8 +3482,9 @@ function gameCard(g, i, sport) {
     ${probBar(lp || g.model)}
     ${probLabels(g, lp)}
     ${liveLine}
-    <div class="g-verdict">${verdict}${vegasStr}</div>
+    <div class="g-verdict">${verdict}${vegasStr}${steamBadge}</div>
     ${suggestedStrip(g)}
+    ${live ? hedgePanel(g, sport) : ''}
     ${projLineHtml(g)}
     ${g.state === 'pre' && g.bp?.kind === 'ev' && g.why?.length
       ? `<div class="whyline">🧠 why: ${esc(g.why.slice(0, 3).join(' · '))}</div>` : ''}
@@ -3662,7 +3754,9 @@ function renderMyBets() {
   const bets = MyBets.list(), mb = MyBets.stats();
   const row = b => {
     const legs = b.legs.map(l => `${esc(l.t)}${l.res ? ` <span class="${l.res === 'won' ? 'ok' : l.res === 'lost' ? 'bad' : 'h-pick'}">[${l.res}]</span>` : ''}`).join(' + ');
-    const meta = `${b.stake}u${b.legs.length > 1 ? ' · ' + b.legs.length + '-leg parlay' : ''}${b.legs[0].m ? ' · ' + esc(b.legs[0].m) : ''}`;
+    const c = MyBets.clv(b);
+    const clvBadge = c != null ? ` <span class="chip ${c >= 0 ? 'hit' : 'miss'}" title="Closing Line Value: the de-vigged market moved ${(c * 100).toFixed(1)}% ${c >= 0 ? 'toward' : 'against'} your side by game time. Beating the close is the strongest sign of long-run +EV.">${c >= 0 ? '+' : ''}${(c * 100).toFixed(1)}% CLV</span>` : '';
+    const meta = `${b.stake}u${b.legs.length > 1 ? ' · ' + b.legs.length + '-leg parlay' : ''}${b.legs[0].m ? ' · ' + esc(b.legs[0].m) : ''}${clvBadge}`;
     const auto = b.legs.every(l => l.bt);
     const act = b.status === 'open'
       ? (auto ? '<span class="h-pick">auto-settles at final</span>'
@@ -3685,6 +3779,7 @@ function renderMyBets() {
       const dollars = bank ? ` (${mb.pnl >= 0 ? '+' : '-'}$${Math.abs(Math.round(mb.pnl * bank / 100))})` : '';
       return `<div class="h-date" style="margin-top:10px">RECORD ${mb.w}–${mb.l} · P/L ${mb.pnl >= 0 ? '+' : ''}${mb.pnl.toFixed(2)}u${dollars} · ROI ${mb.roi >= 0 ? '+' : ''}${mb.roi.toFixed(1)}% ${lineSparkline(mb.series)}</div>`;
     })() : ''}
+    ${mb.clvN ? `<div class="bo-fair" style="margin-top:6px">📈 <b>CLV avg <span class="${mb.clvAvg >= 0 ? 'ok' : 'bad'}">${mb.clvAvg >= 0 ? '+' : ''}${mb.clvAvg.toFixed(2)}%</span></b> · beat the close ${mb.clvBeat}% of ${mb.clvN} tracked ${lineSparkline(mb.clvSeries)} — positive and rising means your entries consistently beat where the market closed (the surest sign you're genuinely +EV).</div>` : ''}
     ${open.length ? `<div class="h-date" style="margin-top:8px">OPEN (${open.length})</div>` + open.map(row).join('') : ''}
     ${done.length ? `<div class="h-date" style="margin-top:8px">SETTLED</div>` + done.slice(0, 40).map(row).join('') : ''}
     ${!bets.length ? '<div class="h-empty">No bets logged yet — build a slip and hit "🎯 I bet this", or log one manually above.</div>' : ''}
@@ -4781,6 +4876,16 @@ $('#slipbox').addEventListener('click', e => {
     if (v === null) return;
     const stake = Number(v);
     if (!(stake > 0)) { alert('Enter a stake above 0.'); return; }
+    // stamp the taken de-vigged market line on moneyline legs so CLV can be measured
+    state.slip.forEach(l => {
+      if (l.bt !== 'ml' || l.takenImp != null) return;
+      const entry = state.lastEntries.get(l.k);
+      const g = entry?.events.find(e => String(e.id) === String(l.gid));
+      if (g?.vegas?.homeProb != null) {
+        l.takenImp = l.side === 'home' ? g.vegas.homeProb : 1 - g.vegas.homeProb;
+        l.closeImp = l.takenImp;
+      }
+    });
     MyBets.add(state.slip, stake, isParlay);
     const b = e.target.closest('.logbets');
     b.textContent = '✓ logged'; setTimeout(renderSlip, 1200);
@@ -4817,6 +4922,24 @@ $('#mybetspanel').addEventListener('click', e => {
     MyBets.addManual(text, odds, stake);
     renderBrain();
   }
+});
+
+// live hedge calculator: type the book's live opposing American odds → exact hedge stake,
+// guaranteed locked profit, and whether the book's price beats the model's fair exit.
+document.addEventListener('input', e => {
+  const inp = e.target.closest('.hedge-odds');
+  if (!inp) return;
+  const box = inp.closest('.hedge-calc'), out = box.querySelector('.hedge-out');
+  const payout = +box.dataset.payout, S = +box.dataset.stake, p = +box.dataset.p;
+  const am = parseFloat((inp.value || '').replace(/[^0-9.+-]/g, ''));
+  if (!am || Math.abs(am) < 100) { out.innerHTML = ''; return; }
+  const dOpp = am > 0 ? 1 + am / 100 : 1 + 100 / -am;   // book's opposing decimal odds
+  const H = payout / dOpp;                               // full-equalizing hedge stake
+  const locked = payout - S - H;                         // guaranteed profit either way
+  const bank = Number(localStorage.getItem('de-bank')) || 0;
+  const money = u => bank ? ` ($${(u * bank / 100).toFixed(0)})` : '';
+  const good = dOpp >= 1 / (1 - p);                      // book opposing odds beat the model-fair price?
+  out.innerHTML = ` → hedge <b>${H.toFixed(2)}u</b>${money(H)}, locks <b class="${locked >= 0 ? 'ok' : 'bad'}">${locked >= 0 ? '+' : ''}${locked.toFixed(2)}u</b>${money(locked)} <span class="${good ? 'ok' : 'bad'}">${good ? '✓ beats fair' : '✗ below fair'}</span>`;
 });
 
 // keyboard: ←/→ dates · t today · r refresh · 1-9 tabs (1 = The Card)
