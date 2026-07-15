@@ -436,6 +436,11 @@
     font-size: 10.5px; color: var(--muted); margin-top: 7px;
     font-family: 'JetBrains Mono', monospace; letter-spacing: .3px;
   }
+  .projline {
+    font-size: 11px; color: var(--muted); margin-top: 7px;
+    font-family: 'JetBrains Mono', monospace; letter-spacing: .3px;
+  }
+  .projline b { color: var(--text); }
 
   /* skeleton shimmer while slates load */
   .skel {
@@ -710,7 +715,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v14.1';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v14.2';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -814,6 +819,45 @@ function poissonSoccer(lh, la, rho = -0.13) {
   }
   const s = home + draw + away;
   return { home: home / s, draw: draw / s, away: away / s };
+}
+
+// ── Method of victory (MMA) ────────────────────────────────────────────────
+// ESPN carries no per-fighter finish-rate stats, so the pregame method model is
+// built on well-documented UFC weight-class base rates (heavier = more finishes,
+// mostly KO; lighter = more decisions) scaled by the fight's skill mismatch — a
+// lopsided fight ends early far more often than a coin-flip. fin = P(not decision);
+// ko = fraction of finishes that are KO/TKO (the remainder are submissions).
+const MMA_CLASS = {
+  'Heavyweight': { fin: 0.68, ko: 0.80 }, 'Light Heavyweight': { fin: 0.60, ko: 0.72 },
+  'Middleweight': { fin: 0.55, ko: 0.68 }, 'Welterweight': { fin: 0.50, ko: 0.60 },
+  'Lightweight': { fin: 0.48, ko: 0.58 }, 'Featherweight': { fin: 0.45, ko: 0.55 },
+  'Bantamweight': { fin: 0.42, ko: 0.52 }, 'Flyweight': { fin: 0.38, ko: 0.48 },
+  'W Strawweight': { fin: 0.33, ko: 0.42 }, 'W Flyweight': { fin: 0.35, ko: 0.45 },
+  'W Bantamweight': { fin: 0.40, ko: 0.50 }, 'W Featherweight': { fin: 0.45, ko: 0.55 },
+  'Catchweight': { fin: 0.50, ko: 0.60 },
+};
+const MMA_DEFAULT = { fin: 0.47, ko: 0.58 };
+function mmaOutcome(g) {
+  const base = MMA_CLASS[g.wclass] || MMA_DEFAULT;
+  const edge = Math.abs(g.model.home - 0.5) * 2;                 // 0 (pick-em) → 1 (lock)
+  const fin = clamp(base.fin + edge * 0.18, 0.10, 0.92);        // mismatch raises finish rate
+  const ko = fin * base.ko, sub = fin * (1 - base.ko), dec = 1 - fin;
+  const sched = g.rounds || 3;
+  // decisions go the full distance; finishes cluster near the middle of the fight
+  const expRounds = dec * sched + fin * (sched * 0.45);
+  return { ko, sub, dec, fin, expRounds, sched };
+}
+
+// Best-of-3 tennis: invert the match win prob p = s²(3−2s) to the per-set win prob s,
+// then show whether the favorite likely closes it in straight sets or needs a third.
+function tennisSetScore(p) {
+  let s = 0.5 + (p - 0.5) * 0.6;
+  for (let i = 0; i < 20; i++) {
+    const f = s * s * (3 - 2 * s) - p, d = 6 * s - 6 * s * s;
+    if (Math.abs(d) < 1e-9) break;
+    s = Math.min(0.999, Math.max(0.001, s - f / d));
+  }
+  return 2 * s * (1 - s) > 0.42 ? '2–1' : '2–0';   // P(3rd set) high → competitive
 }
 
 // Soccer with no season records (tournament knockouts): expand the market's
@@ -2426,7 +2470,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
     // effective HFA = static prior blended with the learned per-sport home EMA
     const hfaWinEff = Brain.effHfa(sport.id, sport.hfaWin);
     const hfaL = logit(hfaWinEff);
-    let model, marketPrior = false;
+    let model, marketPrior = false, soccerLambda = null;
     if (sport.soccer && (!played(home.rec) || !played(away.rec))) {
       if (vegas?.homeProb != null) { model = predictFromMarket(vegas.homeProb); marketPrior = true; }
       else model = { home: 0.37, away: 0.37, draw: 0.26 };
@@ -2446,6 +2490,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
       if (home.pfg != null && away.pfg != null && home.pag != null && away.pag != null) {
         const lh = Math.max(0.15, ((home.pfg + away.pag) / 2) * 1.12);
         const la = Math.max(0.15, ((away.pfg + home.pag) / 2) * 0.90);
+        soccerLambda = { lh, la };   // expected goals per side → projected scoreline
         const dc = poissonSoccer(lh, la);
         let m = { home: 0.5 * model.home + 0.5 * dc.home,
                   away: 0.5 * model.away + 0.5 * dc.away,
@@ -2576,7 +2621,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
     const wind = winds?.get(ev.id) || null;
     const wx = (ev.weather && !comp.venue?.indoor)
       ? { t: ev.weather.temperature ?? null, txt: ev.weather.displayValue || '', wind } : null;
-    let total = null, sim = null;
+    let total = null, sim = null, expTotal = null;
     if (TOTAL_SIGMA[sport.id] && home.pfg != null && away.pfg != null) {
       let exp = (home.pfg + away.pag) / 2 + (away.pfg + home.pag) / 2;
       const notes = [];
@@ -2621,6 +2666,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         sim = MonteCarlo.simGame(sport.id, exp, model.home, ev.id);
         if (sim) notes.push(`${sim.n / 1000}k-run sim · σ${sim.sdTotal.toFixed(1)}`);
       }
+      expTotal = exp;   // keep the projected total even when no O/U line is posted
       if (vegas?.ou) {
         const pOverRaw = sim ? sim.pOver(vegas.ou) : clamp(normalCdf((exp - vegas.ou) / TOTAL_SIGMA[sport.id]));
         // market-median prior: the posted total IS the market's 50/50 point — the
@@ -2629,12 +2675,21 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         total = { exp, line: vegas.ou, pOver, pOverRaw, notes };
       }
     }
+    // projected final score: soccer splits into the Poisson λ's; ball sports split the
+    // expected total by the model's expected margin (win prob × the sport's margin σ).
+    let proj = null;
+    if (soccerLambda) {
+      proj = { h: soccerLambda.lh, a: soccerLambda.la, soccer: true };
+    } else if (expTotal != null && sport.spreadSigma) {
+      const margin = invNorm(clamp(model.home)) * sport.spreadSigma;   // home minus away
+      proj = { h: (expTotal + margin) / 2, a: (expTotal - margin) / 2, total: expTotal };
+    }
 
     const st = ev.status?.type || {};
     return {
       id: ev.id, home, away, model, pick, pickProb, vegas, edge, marketPrior, noLearn,
       alphaInfo: typeof alphaInfo !== 'undefined' ? alphaInfo : null,
-      total, sim, wx, why: typeof whyDrivers !== 'undefined' ? whyDrivers : [],
+      total, sim, proj, wx, why: typeof whyDrivers !== 'undefined' ? whyDrivers : [],
       pRaw: typeof pRawHome !== 'undefined' ? pRawHome : null,
       state: st.state || 'pre',                       // pre | in | post
       statusText: st.shortDetail || st.detail || '',
@@ -2717,6 +2772,20 @@ function parseMMA(json, sport) {
       const pick = model.home >= model.away ? 'home' : 'away';
       const st = comp.status?.type || {};
       const wclass = comp.type?.text || comp.type?.abbreviation || '';
+      const sched = comp.format?.regulation?.periods || 3;
+      // finished fights: recover the actual method from the play-by-play + end round.
+      // Reaching the final round's 5:00 = went the distance (Decision); an earlier stop
+      // with any grappling-finish keyword = Submission, otherwise KO/TKO.
+      let result = null;
+      if (st.state === 'post') {
+        const dc = comp.status?.displayClock || '', period = comp.status?.period || sched;
+        const distance = period >= sched && (dc === '5:00' || dc === '0:00' || dc === '');
+        const detTxt = (comp.details || []).map(d => (d.type?.text || '')).join(' ').toLowerCase();
+        const method = distance ? 'Decision'
+          : /submission|tapout|choke|armbar|triangle|guillotine|kimura|rear-naked|heel hook/.test(detTxt) ? 'Submission'
+          : 'KO/TKO';
+        result = { method, round: period, clock: dc };
+      }
       const g = {
         id: comp.id, home, away, model, pick, pickProb: model[pick],
         vegas, edge: vegas ? model.home - vegas.homeProb : null, marketPrior: false, alphaInfo,
@@ -2725,7 +2794,7 @@ function parseMMA(json, sport) {
         statusText: [wclass, st.shortDetail || st.detail].filter(Boolean).join(' · '),
         start: new Date(comp.date || ev.date),
         venue: [ev.shortName || ev.name, wclass].filter(Boolean).join(' · '),
-        tv: '', mma: true, correct: null,
+        tv: '', mma: true, wclass, rounds: sched, result, correct: null,
       };
       if (g.state === 'post') g.correct = g.pick === (home.winner ? 'home' : 'away');
       g.bp = computeBestPick(g, sport);
@@ -2785,10 +2854,26 @@ function parseTennis(jsons, ranks, date) {
         const pick = model.home >= model.away ? 'home' : 'away';
         const st = comp.status?.type || {};
         const round = comp.round?.displayName || '';
+        let state = st.state || 'pre';
+        // ESPN routinely strands a finished tennis match in STATUS_IN_PROGRESS — the
+        // feed never flips to Final (common on retirements), so it shows "live" for days.
+        // If it began long enough ago that no real match could still be running AND one
+        // player has clinched the sets, finalize it off the set score.
+        if (state === 'in') {
+          let hs = 0, as = 0;
+          const n = Math.max(home.sets.length, away.sets.length);
+          for (let k = 0; k < n; k++) { const h = home.sets[k] ?? 0, a = away.sets[k] ?? 0; if (h > a) hs++; else if (a > h) as++; }
+          if ((Date.now() - start) / 3.6e6 > 8 && hs !== as) {
+            state = 'post';
+            home.winner = hs > as; away.winner = as > hs;
+          }
+        }
+        const favName = model.home >= model.away ? home.name : away.name;
+        const proj = { tennis: true, fav: favName, sets: tennisSetScore(Math.max(model.home, model.away)) };
         const g = {
           id: comp.id, home, away, model, pick, pickProb: model[pick],
-          vegas: null, edge: null, marketPrior: false,
-          state: st.state || 'pre',
+          vegas: null, edge: null, marketPrior: false, proj,
+          state,
           statusText: [round, st.shortDetail].filter(Boolean).join(' · '),
           start,
           venue: [tier, ev.shortName || ev.name, { grass: '🌿 grass', clay: '🧱 clay', hard: '🏟️ hard' }[surf], round, comp.venue?.court].filter(Boolean).join(' · '),
@@ -3134,6 +3219,26 @@ function teamRow(t, g, side) {
   </div>`;
 }
 
+// One compact line under the verdict: projected final score (ball sports + soccer),
+// projected set score (tennis), or a method-of-victory read (MMA) tied to the rounds O/U.
+function projLineHtml(g) {
+  if (g.mma) {
+    if (g.state === 'post' && g.result)
+      return `<div class="projline">🥊 result: <b>${esc(g.result.method)}</b>${g.result.round ? ` · R${g.result.round}${g.result.clock ? ' ' + esc(g.result.clock) : ''}` : ''}</div>`;
+    if (g.state === 'pre') {
+      const o = mmaOutcome(g);
+      const lean = o.fin >= 0.58 ? 'leans finish → under' : o.dec >= 0.60 ? 'likely decision → over' : `~${o.expRounds.toFixed(1)} rds`;
+      return `<div class="projline">🥊 method: KO/TKO <b>${pct(o.ko)}</b> · Sub <b>${pct(o.sub)}</b> · Dec <b>${pct(o.dec)}</b> · ${lean}</div>`;
+    }
+    return '';
+  }
+  if (!g.proj || g.state === 'post') return '';
+  const P = g.proj;
+  if (P.tennis) return `<div class="projline">📊 proj <b>${esc(P.fav)}</b> in <b>${P.sets}</b></div>`;
+  if (P.soccer) return `<div class="projline">📊 proj <b>${esc(g.away.abbr)} ${P.a.toFixed(1)}–${P.h.toFixed(1)} ${esc(g.home.abbr)}</b> goals</div>`;
+  return `<div class="projline">📊 proj <b>${esc(g.away.abbr)} ${Math.round(P.a)}–${Math.round(P.h)} ${esc(g.home.abbr)}</b>${P.total ? ` · total ${P.total.toFixed(1)}` : ''}</div>`;
+}
+
 function gameCard(g, i, sport) {
   const live = g.state === 'in';
   const badge = live ? '<span class="badge in">● LIVE</span>'
@@ -3196,6 +3301,7 @@ function gameCard(g, i, sport) {
     ${liveLine}
     <div class="g-verdict">${verdict}${vegasStr}</div>
     ${suggestedStrip(g)}
+    ${projLineHtml(g)}
     ${g.state === 'pre' && g.bp?.kind === 'ev' && g.why?.length
       ? `<div class="whyline">🧠 why: ${esc(g.why.slice(0, 3).join(' · '))}</div>` : ''}
     ${hint}
