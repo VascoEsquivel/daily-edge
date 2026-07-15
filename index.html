@@ -458,6 +458,34 @@
     border-radius: 6px; padding: 3px 6px; width: 76px; font-family: inherit; font-size: 11px;
   }
   .hedge .hedge-out { margin-left: 6px; }
+  /* ⌘K / "/" command omnibar */
+  #omnibar {
+    position: fixed; inset: 0; z-index: 1000; display: none;
+    background: rgba(4, 8, 18, .55); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+    align-items: flex-start; justify-content: center;
+  }
+  #omnibar.on { display: flex; }
+  .omni-box {
+    margin-top: 12vh; width: min(560px, 92vw); background: #0e1626;
+    border: 1px solid var(--border); border-radius: 16px;
+    box-shadow: 0 24px 80px rgba(0, 0, 0, .6); overflow: hidden;
+  }
+  #omni-input {
+    width: 100%; box-sizing: border-box; background: transparent; border: none;
+    color: var(--text); font-size: 17px; padding: 16px 18px; outline: none; font-family: inherit;
+  }
+  #omni-list { max-height: 46vh; overflow-y: auto; border-top: 1px solid var(--border); }
+  .omni-item {
+    display: flex; justify-content: space-between; gap: 12px; padding: 10px 18px;
+    cursor: pointer; align-items: baseline;
+  }
+  .omni-item.sel { background: rgba(80, 120, 220, .16); }
+  .oi-label { color: var(--text); font-weight: 600; }
+  .oi-sub { color: var(--muted); font-size: 12px; text-align: right; }
+  .omni-empty { color: var(--muted); font-size: 13px; padding: 14px 18px; }
+  .omni-hint { color: var(--muted); font-size: 11px; padding: 10px 18px; border-top: 1px solid var(--border); display: flex; gap: 14px; letter-spacing: .3px; }
+  .omni-flash { animation: omniflash 1.5s ease; }
+  @keyframes omniflash { 0%, 100% { box-shadow: none; } 30% { box-shadow: 0 0 0 2px var(--accent); } }
 
   /* skeleton shimmer while slates load */
   .skel {
@@ -733,7 +761,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v14.8';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v14.9';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -4987,6 +5015,121 @@ document.addEventListener('keydown', e => {
     const id = ids[Number(e.key) - 1];
     if (id) { state.tab = id; localStorage.setItem('de-tab', id); refresh(); }
   }
+});
+
+// ── ⌘K / "/" Command Omnibar ─────────────────────────────────────────────
+// Global launcher: jump to any team's card, switch sports, or queue a slip bet by keyboard.
+const Omni = (() => {
+  let el, input, list, items = [], sel = 0, isOpen = false;
+  function build() {
+    el = document.createElement('div');
+    el.id = 'omnibar';
+    el.innerHTML = `<div class="omni-box">
+      <input id="omni-input" placeholder="Jump to a team · /nba switch sport · /slip celtics -110 queue a bet" autocomplete="off" spellcheck="false">
+      <div id="omni-list"></div>
+      <div class="omni-hint"><span>↵ go</span><span>↑ ↓ pick</span><span>esc close</span></div>
+    </div>`;
+    document.body.appendChild(el);
+    input = el.querySelector('#omni-input');
+    list = el.querySelector('#omni-list');
+    input.addEventListener('input', render);
+    input.addEventListener('keydown', onKey);
+    el.addEventListener('mousedown', e => { if (e.target === el) close(); });
+  }
+  // searchable index of every team on every currently-loaded slate
+  function index() {
+    const out = [];
+    for (const [sid, entry] of state.lastEntries) {
+      const sp = SPORTS.find(s => s.id === sid);
+      (entry.events || []).forEach(g => ['home', 'away'].forEach(side => {
+        const t = g[side];
+        out.push({ type: 'team', label: t.name, abbr: t.abbr, tab: sid, gid: g.id, side, g,
+          sub: `${sp?.label || sid} · ${g.away.abbr} @ ${g.home.abbr}` });
+      }));
+    }
+    return out;
+  }
+  function matches(q) {
+    q = q.trim().toLowerCase();
+    if (!q) return [];
+    const bare = q.replace(/^\//, '');
+    const sportHits = SPORTS.filter(s => s.id.startsWith(bare) || s.label.toLowerCase().replace(/[^a-z]/g, '').includes(bare))
+      .map(s => ({ type: 'sport', label: `/${s.id}`, sub: `switch to ${s.label}`, tab: s.id }));
+    if (q.startsWith('/')) return sportHits.slice(0, 6);
+    const seen = new Set(), teams = [];
+    for (const t of index()) {
+      if (!(t.label.toLowerCase().includes(q) || t.abbr.toLowerCase().includes(q))) continue;
+      const k = t.gid + t.side; if (seen.has(k)) continue; seen.add(k); teams.push(t);
+    }
+    return [...sportHits, ...teams].slice(0, 8);
+  }
+  function render() {
+    const q = input.value;
+    items = q.trim().toLowerCase().startsWith('/slip')
+      ? [{ type: 'slipcmd', label: q, sub: 'queue to slip — /slip <team> <american odds>' }]
+      : matches(q);
+    sel = 0;
+    list.innerHTML = items.length
+      ? items.map((it, i) => `<div class="omni-item ${i === sel ? 'sel' : ''}" data-i="${i}"><span class="oi-label">${esc(it.label)}</span><span class="oi-sub">${esc(it.sub || '')}</span></div>`).join('')
+      : `<div class="omni-empty">no matches${q.trim() ? '' : ' — try a team name, /nba, or /slip'}</div>`;
+    [...list.querySelectorAll('.omni-item')].forEach(d => {
+      d.addEventListener('mouseenter', () => { sel = +d.dataset.i; hi(); });
+      d.addEventListener('click', () => run(items[+d.dataset.i]));
+    });
+  }
+  function hi() { [...list.querySelectorAll('.omni-item')].forEach((d, i) => d.classList.toggle('sel', i === sel)); }
+  function onKey(e) {
+    if (e.key === 'Escape') { e.preventDefault(); close(); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); sel = Math.min(items.length - 1, sel + 1); hi(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); sel = Math.max(0, sel - 1); hi(); }
+    else if (e.key === 'Enter') {
+      e.preventDefault();
+      const q = input.value.trim();
+      if (q.toLowerCase().startsWith('/slip')) runSlip(q);
+      else if (items[sel]) run(items[sel]);
+    }
+  }
+  async function run(it) {
+    if (!it) return;
+    if (it.type === 'sport') { close(); state.tab = it.tab; localStorage.setItem('de-tab', it.tab); refresh(); }
+    else if (it.type === 'team') { close(); await gotoGame(it.tab, it.gid); }
+    else if (it.type === 'slipcmd') runSlip(input.value.trim());
+  }
+  async function gotoGame(tab, gid) {
+    state.openCards.add(gid);
+    if (state.tab !== tab) { state.tab = tab; localStorage.setItem('de-tab', tab); await refresh(); }
+    else renderActive();
+    setTimeout(() => {
+      const card = [...document.querySelectorAll('.game')].find(c => c.dataset.id === String(gid));
+      if (card) { card.classList.add('open'); card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        card.classList.add('omni-flash'); setTimeout(() => card.classList.remove('omni-flash'), 1500); }
+    }, 140);
+  }
+  function runSlip(q) {
+    const parts = q.replace(/^\/slip\s*/i, '').trim().split(/\s+/).filter(Boolean);
+    if (!parts.length) { flash('name a team — /slip celtics -110'); return; }
+    let odds = null;
+    if (/^[+-]?\d{2,4}$/.test(parts[parts.length - 1])) odds = Number(parts.pop());
+    const name = parts.join(' ').toLowerCase();
+    if (!name) { flash('name a team — /slip celtics -110'); return; }
+    const hit = index().find(x => x.label.toLowerCase().includes(name) || x.abbr.toLowerCase() === name);
+    if (!hit) { flash(`no loaded team matches “${name}”`); return; }
+    const p = hit.g.model[hit.side];
+    const american = odds != null ? (Math.abs(odds) < 100 ? (odds < 0 ? -110 : 110) : odds) : probToAmerican(clamp(p));
+    const b = american > 0 ? american / 100 : 100 / -american;
+    addLeg({ gid: hit.g.id, t: `${hit.g[hit.side].abbr} ML ${fmtML(american)}`, p: +p.toFixed(3), b: +b.toFixed(3),
+      m: '', k: hit.tab, tm: '', side: hit.side, bt: 'ml' });
+    close();
+  }
+  function flash(msg) { if (input) { input.value = ''; input.placeholder = msg; setTimeout(() => { if (input) input.placeholder = 'Jump to a team · /nba switch sport · /slip celtics -110 queue a bet'; }, 2200); } }
+  function open() { if (!el) build(); isOpen = true; el.classList.add('on'); input.value = ''; render(); setTimeout(() => input.focus(), 20); }
+  function close() { isOpen = false; if (el) el.classList.remove('on'); }
+  return { open, close, toggle() { isOpen ? close() : open(); } };
+})();
+// global trigger: Ctrl/⌘+K anywhere, or "/" when not already typing in a field
+document.addEventListener('keydown', e => {
+  if ((e.key === 'k' || e.key === 'K') && (e.ctrlKey || e.metaKey)) { e.preventDefault(); Omni.toggle(); return; }
+  if (e.key === '/' && !e.target.matches('input,textarea') && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); Omni.open(); }
 });
 
 document.querySelector('.logo .sub').textContent += ' · ' + APP_VERSION;
