@@ -492,6 +492,7 @@
   .le-row { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
   .le-in { display: inline-flex; align-items: center; gap: 5px; flex-wrap: wrap; }
   .le-note { margin-top: 5px; font-size: 10px; opacity: .75; }
+  .le-quote { font-size: 10.5px; color: #9fc1ff; }
   /* 📰 news-driven prop angle */
   .newsangle {
     margin: 7px 0; padding: 8px 11px; border-radius: 10px;
@@ -840,6 +841,9 @@
     <label class="bankbox" title="Your bankroll in $ — type it and it saves instantly; stakes then show in dollars too (1u = 1% of bankroll). Clear it to go back to units only.">
       💵 <input id="bankinput" type="number" min="0" inputmode="numeric" placeholder="bankroll $">
     </label>
+    <label class="bankbox" title="Paste your Kalshi proxy Worker URL (see kalshi-worker/README in the repo — a 2-minute free Cloudflare deploy). Live Kalshi prices then auto-fill the ⚡ LIVE EDGE console, pregame value chips and the hedge assistant. Read-only market data; no keys, no orders.">
+      💹 <input id="kalshiproxy" type="url" placeholder="kalshi proxy URL" spellcheck="false" style="width:120px">
+    </label>
     <button class="omni-btn" id="omnibtn" title="Command bar — jump to a team, switch sports, queue a bet, open a panel. Press Ctrl/⌘+K or /">🔍 <kbd>/</kbd></button>
     <button class="refresh" id="refreshbtn">⟳ Refresh</button>
   </header>
@@ -880,7 +884,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v15.5';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v15.6';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1908,6 +1912,81 @@ const LiveTape = (() => {
   };
 })();
 
+// ── 💹 Kalshi live prices (v15.6) ────────────────────────────────────────
+// Kalshi's public market API is CORS-blocked from a browser, so prices flow through the
+// user's own Cloudflare Worker relay (kalshi-worker/ in the repo, read-only market data).
+// One nested-events request per sport per poll (45s cache); games are matched to Kalshi
+// events by date code + team-name word overlap (Kalshi team codes ≠ ESPN abbrs — e.g.
+// CWS vs CHW — so names, not codes, are the join key). Attaches g.kalshi =
+// { home:{bid,ask,last}, away:{...}, ticker } for the LIVE EDGE console, pregame value
+// chips and the hedge assistant. READ-ONLY by design: no keys, no orders, ever.
+const Kalshi = (() => {
+  const KEY = 'de-kalshi-proxy';
+  const SERIES = { mlb: 'KXMLBGAME', wnba: 'KXWNBAGAME', nba: 'KXNBAGAME', nhl: 'KXNHLGAME',
+                   nfl: 'KXNFLGAME', mma: 'KXUFCFIGHT' };
+  const cache = new Map();   // sportId → { t, events }
+  const base = () => (localStorage.getItem(KEY) || '').trim().replace(/\/+$/, '');
+  const MON = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+  const dayCode = d => String(d.getFullYear() % 100).padStart(2, '0') + MON[d.getMonth()] + String(d.getDate()).padStart(2, '0');
+  const words = s => String(s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(w => w.length > 1);
+  const overlap = (a, B) => a.filter(w => B.has(w)).length;
+  async function eventsFor(sportId) {
+    if (!SERIES[sportId] || !base()) return null;
+    const c = cache.get(sportId);
+    if (c && Date.now() - c.t < 45000) return c.events;
+    try {
+      const r = await fetch(`${base()}/trade-api/v2/events?limit=200&status=open&series_ticker=${SERIES[sportId]}&with_nested_markets=true`);
+      const events = (await r.json())?.events || [];
+      cache.set(sportId, { t: Date.now(), events });
+      return events;
+    } catch { cache.set(sportId, { t: Date.now(), events: null }); return null; }
+  }
+  function match(g, events) {
+    // same-day code, plus next day: a late-night ET start can straddle the ticker date
+    const codes = [dayCode(g.start), dayCode(new Date(g.start.getTime() + 864e5))];
+    // ESPN names teams by NICKNAME ("Mystics"), Kalshi subtitles by CITY ("Washington") —
+    // so the join key is city+nickname words, with the market-ticker suffix vs the ESPN
+    // abbreviation as a second signal (they often agree: WSH, PHX — but CWS ≠ CHW).
+    const hw = new Set(words((g.home.loc || '') + ' ' + g.home.name)), ha = String(g.home.abbr || '').toUpperCase();
+    const aw = new Set(words((g.away.loc || '') + ' ' + g.away.name)), aa = String(g.away.abbr || '').toUpperCase();
+    let best = null, bestScore = 0;
+    for (const e of events) {
+      const dpart = (e.event_ticker || '').split('-')[1] || '';
+      if (!codes.some(c => dpart.startsWith(c))) continue;
+      let mh = null, ma = null;
+      for (const m of e.markets || []) {
+        const w = words(m.yes_sub_title || m.subtitle);
+        const suf = String(m.ticker || '').split('-').pop().toUpperCase();
+        const sh = overlap(w, hw) + (suf === ha ? 1 : 0), sa = overlap(w, aw) + (suf === aa ? 1 : 0);
+        if (sh > sa && (!mh || sh > mh.s)) mh = { m, s: sh };
+        else if (sa > sh && (!ma || sa > ma.s)) ma = { m, s: sa };
+      }
+      if (mh && ma && mh.s + ma.s > bestScore) { bestScore = mh.s + ma.s; best = { h: mh.m, a: ma.m, ticker: e.event_ticker }; }
+    }
+    return best;
+  }
+  const px = m => ({ bid: m.yes_bid || null, ask: m.yes_ask || null, last: m.last_price || null });
+  return {
+    enabled: () => !!base() ,
+    setProxy(u) { if (u) localStorage.setItem(KEY, u.trim()); else localStorage.removeItem(KEY); cache.clear(); },
+    proxy: base,
+    // best executable BUY price for a side: the ask, else last trade as a reference
+    buy(k) { return k ? (k.ask || k.last || null) : null; },
+    async attach(sport, evs) {
+      if (!base() || !SERIES[sport.id]) return false;
+      const events = await eventsFor(sport.id);
+      if (!events) return false;
+      let hit = false;
+      evs.forEach(g => {
+        if (g.state === 'post' || g.kalshi?.t > Date.now() - 40000) return;
+        const m = match(g, events);
+        if (m) { g.kalshi = { home: px(m.h), away: px(m.a), ticker: m.ticker, t: Date.now() }; hit = true; }
+      });
+      return hit;
+    },
+  };
+})();
+
 // ── My Bets: the user's REAL tickets (separate from the model's auto-ledger) ──
 // Game legs settle themselves off final scores; manual bets settle with a tap.
 const MyBets = (() => {
@@ -2575,6 +2654,8 @@ async function fetchSport(sport, date, force = false) {
   MyBets.settleFromEvents(sport, events);// settle the user's real game bets off finals
   MyBets.trackClose(sport, events);      // capture closing market line on open ml legs (CLV)
   LiveTape.record(sport, events);        // score snapshots → live momentum runs
+  // live Kalshi prices via the user's proxy Worker (fire-and-forget: re-render on arrival)
+  Kalshi.attach(sport, events).then(hit => { if (hit && state.tab === sport.id) renderActive(); }).catch(() => {});
   return entry;
 }
 
@@ -2897,6 +2978,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         rec: parseRecord(recSummary, sport.soccer),
         score: c.score,
         winner: c.winner === true,
+        loc: c.team?.location || '',   // city — Kalshi names markets by city, ESPN by nickname
         probable, leaders, pen,
         pyth: q?.pyth ?? null, pythG: q?.g || 0,
         pfg: q?.pfg ?? null, pag: q?.pag ?? null,
@@ -3840,7 +3922,7 @@ function hedgePanel(g, sport) {
     return `<div class="h-ttl">⚖️ HEDGE / CASH-OUT · ${esc(l.t)}</div>
       <div>live model <b>${pct(pSide)}</b> (Stern) = fair <b>${Math.round(pSide * 100)}¢</b> your side · position fair value <b class="${locked >= 0 ? 'ok' : 'bad'}">${locked >= 0 ? '+' : ''}${locked.toFixed(2)}u</b>${money(locked)}</div>
       <div>fair exit: hedge <b>${esc(opp)}</b> at ≤<b>${fairCents}¢</b> (Kalshi) / ${fmtML(fairAm)} (book) → locks <b class="${locked >= 0 ? 'ok' : 'bad'}">${locked >= 0 ? '+' : ''}${locked.toFixed(2)}u</b> either way</div>
-      <div class="hedge-calc" data-payout="${payout.toFixed(4)}" data-stake="${S}" data-p="${pSide.toFixed(4)}" data-opp="${esc(opp)}">live ${esc(opp)} price (Kalshi ¢ or book odds): <input class="hedge-odds" type="text" inputmode="numeric" placeholder="${fairCents}¢"><span class="hedge-out"></span></div>`;
+      <div class="hedge-calc" data-payout="${payout.toFixed(4)}" data-stake="${S}" data-p="${pSide.toFixed(4)}" data-opp="${esc(opp)}">live ${esc(opp)} price (Kalshi ¢ or book odds): <input class="hedge-odds" type="text" inputmode="numeric" placeholder="${fairCents}¢"><span class="hedge-out"></span>${(() => { const kb = Kalshi.buy(g.kalshi?.[l.side === 'home' ? 'away' : 'home']); return kb ? ` <span class="h-pick">💹 Kalshi now ${kb}¢${kb <= fairCents ? ' ✓' : ''}</span>` : ''; })()}</div>`;
   }).join('<div style="height:9px"></div>');
   return `<div class="hedge">${blocks}</div>`;
 }
@@ -3906,6 +3988,21 @@ function parlayHedgeHtml(b) {
 // quant read: in-play markets systematically chase runs, while the Stern number already
 // counts the scoreboard (the run itself is mostly noise) — so a fat run often puts the
 // OTHER side on discount.
+// one Kalshi-cents price vs a model probability → verdict + EV + live-sized stake.
+// Shared by the manual inputs and the auto-filled Kalshi quotes.
+function liveEdgeReadout(p, cents) {
+  const imp = cents / 100, b = (100 - cents) / cents;
+  const edge = p - imp, ev = p * b - (1 - p);
+  const kf = KELLY_FRACTION * 0.5 * (b * p - (1 - p)) / b;      // live haircut: ⅛-Kelly
+  const units = ev >= 0.02 && kf > 0 ? Math.min(3, Math.max(0.5, Math.round(kf * 1000) / 10)) : 0;
+  const bank = Number(localStorage.getItem('de-bank')) || 0;
+  const money = u => bank ? ` ($${(u * bank / 100).toFixed(0)})` : '';
+  const verdict = edge >= 0.03 ? `<b class="ok">✓ VALUE +${(edge * 100).toFixed(0)}¢</b>`
+    : edge >= 0 ? `<span class="h-pick">thin +${(edge * 100).toFixed(0)}¢ — pass</span>`
+    : `<b class="bad">✗ ${(edge * 100).toFixed(0)}¢ vs fair</b>`;
+  return `${verdict} · EV ${ev >= 0 ? '+' : ''}${(ev * 100).toFixed(0)}% · ${units ? `stake <b>${units.toFixed(1)}u</b>${money(units)}` : 'no stake'}`;
+}
+
 function liveEdgePanel(g, sport, lp) {
   if (g.state !== 'in' || g.tennis || g.model.draw > 0.05 || !lp) return '';
   const pH = clamp(lp.home, 0.02, 0.98), pA = 1 - pH;
@@ -3918,14 +4015,22 @@ function liveEdgePanel(g, sport, lp) {
     const rs = run.side === 'home' ? `${run.rh}–${run.ra}` : `${run.ra}–${run.rh}`;
     runLine = `<div class="le-run">🔥 <b>${esc(rt)}</b> on a <b>${rs}</b> run (${run.mins} min) — live markets chase runs; the fair number already counts the scoreboard, so if <b>${esc(fade)}</b> trades below fair <b>${run.side === 'home' ? cA : cH}¢</b>, the run is your discount.</div>`;
   }
-  const row = (t, c, p) => `<div class="le-row"><b>${esc(t.abbr)}</b> fair <b>${c}¢</b>
-    <span class="le-in">Kalshi: <input class="live-odds" data-p="${p.toFixed(4)}" type="text" inputmode="numeric" placeholder="${c}¢"><span class="live-out"></span></span></div>`;
+  // auto-fill from the Kalshi proxy when quotes exist; the input stays as a manual override
+  const row = (side, t, c, p) => {
+    const k = g.kalshi?.[side];
+    const buy = Kalshi.buy(k);
+    const quote = k ? (buy
+      ? `<span class="le-quote">💹 ${k.bid || '–'}/${k.ask || '–'}¢ → ${liveEdgeReadout(p, buy)}</span>`
+      : '<span class="le-quote" style="opacity:.6">💹 listed, no quotes yet</span>') : '';
+    return `<div class="le-row"><b>${esc(t.abbr)}</b> fair <b>${c}¢</b>
+      <span class="le-in">Kalshi: <input class="live-odds" data-p="${p.toFixed(4)}" type="text" inputmode="numeric" placeholder="${buy || c}¢"><span class="live-out"></span></span>${quote}</div>`;
+  };
   return `<div class="liveedge">
-    <div class="le-ttl">⚡ LIVE EDGE · Stern fair prices (Kalshi ¢ = implied %)</div>
+    <div class="le-ttl">⚡ LIVE EDGE · Stern fair prices (Kalshi ¢ = implied %)${g.kalshi ? ' · <span class="ok">live quotes on</span>' : ''}</div>
     ${runLine}
-    ${row(g.away, cA, pA)}
-    ${row(g.home, cH, pH)}
-    <div class="le-note">type Kalshi's live price → edge vs fair + a live-sized stake (⅛-Kelly: in-play reads are noisier than pregame, so stakes auto-halve)</div>
+    ${row('away', g.away, cA, pA)}
+    ${row('home', g.home, cH, pH)}
+    <div class="le-note">${g.kalshi ? 'quotes auto-pull through your proxy every poll (bid/ask; edge priced off the ask) — type a price to override' : 'type Kalshi\'s live price → edge vs fair + a live-sized stake'} (⅛-Kelly: in-play reads are noisier than pregame, so stakes auto-halve)</div>
   </div>`;
 }
 
@@ -4001,6 +4106,17 @@ function gameCard(g, i, sport, bare = false) {   // bare = focus-sheet header (n
       steamBadge = `<span class="steam" title="The de-vigged market has moved ${(Math.abs(mv) * 100).toFixed(1)}% toward ${esc(side)} since it opened — the book is repricing on new information (injury, lineup, sharp action). This is a line-move signal on our single feed, not a guaranteed arbitrage. If you like ${esc(side)}, the price is still catching up.">⚡ MARKET STEAM · ${esc(side)} +${(Math.abs(mv) * 100).toFixed(1)}%</span>`;
     }
   }
+  // 💹 pregame Kalshi value chip (v15.6): the model's pick side priced against Kalshi's
+  // actual ask, live through the proxy. +3¢ or better vs the model's fair = highlighted.
+  let kalshiChip = '';
+  if (g.state === 'pre' && g.kalshi && g.pick !== 'draw') {
+    const buy = Kalshi.buy(g.kalshi[g.pick]);
+    if (buy) {
+      const fair = Math.round(clamp(g.model[g.pick]) * 100);
+      const d = fair - buy;
+      kalshiChip = `<span class="steam" style="${d >= 3 ? 'color:#7dffb8;border-color:rgba(60,220,140,.5);background:rgba(30,160,90,.12)' : ''}" title="Kalshi's live ask for ${esc(g[g.pick].abbr)} vs the model's fair price (bid/ask ${g.kalshi[g.pick].bid || '–'}/${g.kalshi[g.pick].ask || '–'}¢). ${d >= 3 ? 'The market is selling your side cheaper than the model thinks it is worth — value entry.' : d <= -3 ? 'Kalshi prices it richer than the model — no value at the ask.' : 'Priced about fair.'}">💹 KALSHI ${esc(g[g.pick].abbr)} ${buy}¢ vs fair ${fair}¢${d >= 3 ? ' · +' + d + '¢' : ''}</span>`;
+    }
+  }
 
   // live cards show the in-game probability and movement vs the opening number
   const lp = live ? liveProbs(g, sport) : null;
@@ -4049,7 +4165,7 @@ function gameCard(g, i, sport, bare = false) {   // bare = focus-sheet header (n
     ${probBar(lp || g.model)}
     ${probLabels(g, lp)}
     ${liveLine}
-    <div class="g-verdict">${verdict}${vegasStr}${steamBadge}</div>
+    <div class="g-verdict">${verdict}${vegasStr}${steamBadge}${kalshiChip}</div>
     ${suggestedStrip(g)}
     ${live ? hedgePanel(g, sport) + liveEdgePanel(g, sport, lp) : ''}
     ${projLineHtml(g)}
@@ -5317,6 +5433,22 @@ $('#refreshbtn').addEventListener('click', () => refresh(true));
   });
 }
 
+// 💹 Kalshi proxy URL: paste-and-save like the bankroll; prices start flowing next poll
+{
+  const ki = $('#kalshiproxy');
+  ki.value = localStorage.getItem('de-kalshi-proxy') || '';
+  let kT = null;
+  ki.addEventListener('input', () => {
+    clearTimeout(kT);
+    kT = setTimeout(() => {
+      const v = ki.value.trim();
+      if (v && !/^https:\/\//.test(v)) return;             // wait for a full https URL
+      Kalshi.setProxy(v || null);
+      if (v) refresh(true);                                // pull quotes right away
+    }, 600);
+  });
+}
+
 // content clicks: add-to-slip, filter buttons, or expand a card's bet board
 function contentClick(e) {
   const ccBtn = e.target.closest('[data-copycard]');
@@ -5563,24 +5695,16 @@ document.addEventListener('input', e => {
   const num = parseFloat(raw.replace(/[^0-9.+-]/g, ''));
   if (!num) { out.innerHTML = ''; return; }
   const isAmerican = /[+-]/.test(raw) || Math.abs(num) >= 100;
-  let imp, b;
+  let cents;                                              // everything reduces to Kalshi cents
   if (isAmerican) {
     if (Math.abs(num) < 100) { out.innerHTML = ''; return; }
-    b = num > 0 ? num / 100 : 100 / -num; imp = 1 / (1 + b);
+    const b = num > 0 ? num / 100 : 100 / -num;
+    cents = 100 / (1 + b);
   } else {
     if (num < 1 || num > 99) { out.innerHTML = ''; return; }
-    imp = num / 100; b = (100 - num) / num;
+    cents = num;
   }
-  const edge = p - imp;                                   // model prob vs the price's implied
-  const ev = p * b - (1 - p);
-  const kf = KELLY_FRACTION * 0.5 * (b * p - (1 - p)) / b;   // live haircut: ⅛-Kelly
-  const units = ev >= 0.02 && kf > 0 ? Math.min(3, Math.max(0.5, Math.round(kf * 1000) / 10)) : 0;
-  const bank = Number(localStorage.getItem('de-bank')) || 0;
-  const money = u => bank ? ` ($${(u * bank / 100).toFixed(0)})` : '';
-  const verdict = edge >= 0.03 ? `<b class="ok">✓ VALUE +${(edge * 100).toFixed(0)}¢</b>`
-    : edge >= 0 ? `<span class="h-pick">thin +${(edge * 100).toFixed(0)}¢ — pass</span>`
-    : `<b class="bad">✗ ${(edge * 100).toFixed(0)}¢ vs fair</b>`;
-  out.innerHTML = ` → ${verdict} · EV ${ev >= 0 ? '+' : ''}${(ev * 100).toFixed(0)}% · ${units ? `stake <b>${units.toFixed(1)}u</b>${money(units)}` : 'no stake'}`;
+  out.innerHTML = ' → ' + liveEdgeReadout(p, cents);
 });
 
 // keyboard: ←/→ dates · t today · r refresh · 1-9 tabs (1 = The Card)
