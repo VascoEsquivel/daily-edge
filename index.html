@@ -473,6 +473,32 @@
     50% { opacity: 1; transform: translateY(-1px); }
   }
   .slipchip { cursor: help; color: #ffd75e; border-color: rgba(255, 195, 60, .45); }
+  /* ⚡ live edge console */
+  .liveedge {
+    margin-top: 9px; padding: 10px 12px; border-radius: 12px;
+    background: rgba(30, 70, 160, .12); border: 1px solid rgba(90, 140, 255, .38);
+    font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); line-height: 1.8;
+  }
+  .liveedge .le-ttl { font-weight: 700; color: #7aa8ff; letter-spacing: .4px; margin-bottom: 3px; }
+  .liveedge b { color: var(--text); }
+  .liveedge input {
+    background: rgba(10, 16, 32, .6); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 3px 6px; width: 66px; font-family: inherit; font-size: 11px;
+  }
+  .le-run {
+    margin: 4px 0 6px; padding: 6px 9px; border-radius: 8px;
+    background: rgba(255, 140, 30, .10); border: 1px solid rgba(255, 160, 40, .35); color: #ffcf9a;
+  }
+  .le-row { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+  .le-in { display: inline-flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+  .le-note { margin-top: 5px; font-size: 10px; opacity: .75; }
+  /* 📰 news-driven prop angle */
+  .newsangle {
+    margin: 7px 0; padding: 8px 11px; border-radius: 10px;
+    background: rgba(255, 190, 40, .08); border: 1px solid rgba(255, 190, 60, .32);
+    font-size: 11px; color: var(--muted); line-height: 1.65;
+  }
+  .newsangle b { color: #ffd75e; }
   /* 🎴 game focus sheet */
   #focus {
     position: fixed; inset: 0; z-index: 90; display: none;
@@ -854,7 +880,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v15.4';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v15.5';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1847,6 +1873,41 @@ const Open = (() => {
   };
 })();
 
+// ── Session live tape (v15.5): score snapshot per poll for every LIVE game ──
+// In-memory only — a scoring run is a NOW signal, there's nothing to persist.
+// Feeds the 🔥 momentum read on live cards and the ⚡ LIVE EDGE console.
+const LiveTape = (() => {
+  const tape = new Map();   // sport|gid → [{t, hs, as}]
+  // net run (points/goals) over the window that reads as real momentum per sport
+  const RUN_MIN = { nba: 8, wnba: 7, nfl: 8, mlb: 3, nhl: 2, mls: 1, wc: 1 };
+  return {
+    record(sport, events) {
+      events.forEach(g => {
+        if (g.state !== 'in') return;
+        const k = sport.id + '|' + g.id;
+        const arr = tape.get(k) || [];
+        arr.push({ t: Date.now(), hs: Number(g.home.score) || 0, as: Number(g.away.score) || 0 });
+        if (arr.length > 40) arr.splice(0, arr.length - 40);   // ~40 polls ≈ 40 min of history
+        tape.set(k, arr);
+      });
+    },
+    // the trailing-window scoring run: who has the door open RIGHT NOW
+    run(sportId, g, winMs = 8 * 60000) {
+      const arr = tape.get(sportId + '|' + g.id);
+      if (!arr || arr.length < 2) return null;
+      const now = arr[arr.length - 1];
+      let i = arr.length - 1;
+      while (i > 0 && now.t - arr[i - 1].t <= winMs) i--;
+      const base = arr[i];
+      if (now.t - base.t < 3 * 60000) return null;         // need ≥3 min of tape to call it a run
+      const rh = now.hs - base.hs, ra = now.as - base.as;
+      if (Math.abs(rh - ra) < (RUN_MIN[sportId] ?? 4)) return null;
+      return { rh, ra, mins: Math.max(1, Math.round((now.t - base.t) / 60000)),
+               side: rh > ra ? 'home' : 'away' };
+    },
+  };
+})();
+
 // ── My Bets: the user's REAL tickets (separate from the model's auto-ledger) ──
 // Game legs settle themselves off final scores; manual bets settle with a tap.
 const MyBets = (() => {
@@ -2513,6 +2574,7 @@ async function fetchSport(sport, date, force = false) {
   Open.record(sport, events);            // snapshot pregame odds/model for live movement tracking
   MyBets.settleFromEvents(sport, events);// settle the user's real game bets off finals
   MyBets.trackClose(sport, events);      // capture closing market line on open ml legs (CLV)
+  LiveTape.record(sport, events);        // score snapshots → live momentum runs
   return entry;
 }
 
@@ -3476,7 +3538,7 @@ function propsSection(g) {
     const chips = (t.leaders || []).map(l => `<span class="prop-chip">${esc(l.name)} · ${esc(l.cat)} ${esc(l.val)}</span>`).join('');
     return chips ? `<div class="prop-row"><b>${esc(t.abbr)}</b>${chips}</div>` : '';
   };
-  const html = row(g.away) + row(g.home);
+  const html = newsAngleRow(g) + row(g.away) + row(g.home);
   return html ? `<div class="bo-h" style="margin-top:13px">PROP ANGLES · team leaders</div>${html}` : '';
 }
 
@@ -3838,6 +3900,55 @@ function parlayHedgeHtml(b) {
   </div>`;
 }
 
+// ⚡ LIVE EDGE (v15.5): the live-betting console on every in-play 2-way game. The Stern
+// live model prices both sides as fair Kalshi cents; type Kalshi's actual live price on
+// either side → edge vs fair, EV, and a live-sized stake. Momentum runs get the classic
+// quant read: in-play markets systematically chase runs, while the Stern number already
+// counts the scoreboard (the run itself is mostly noise) — so a fat run often puts the
+// OTHER side on discount.
+function liveEdgePanel(g, sport, lp) {
+  if (g.state !== 'in' || g.tennis || g.model.draw > 0.05 || !lp) return '';
+  const pH = clamp(lp.home, 0.02, 0.98), pA = 1 - pH;
+  const cH = Math.round(pH * 100), cA = Math.round(pA * 100);
+  const run = LiveTape.run(sport.id, g);
+  let runLine = '';
+  if (run) {
+    const rt = run.side === 'home' ? g.home.abbr : g.away.abbr;
+    const fade = run.side === 'home' ? g.away.abbr : g.home.abbr;
+    const rs = run.side === 'home' ? `${run.rh}–${run.ra}` : `${run.ra}–${run.rh}`;
+    runLine = `<div class="le-run">🔥 <b>${esc(rt)}</b> on a <b>${rs}</b> run (${run.mins} min) — live markets chase runs; the fair number already counts the scoreboard, so if <b>${esc(fade)}</b> trades below fair <b>${run.side === 'home' ? cA : cH}¢</b>, the run is your discount.</div>`;
+  }
+  const row = (t, c, p) => `<div class="le-row"><b>${esc(t.abbr)}</b> fair <b>${c}¢</b>
+    <span class="le-in">Kalshi: <input class="live-odds" data-p="${p.toFixed(4)}" type="text" inputmode="numeric" placeholder="${c}¢"><span class="live-out"></span></span></div>`;
+  return `<div class="liveedge">
+    <div class="le-ttl">⚡ LIVE EDGE · Stern fair prices (Kalshi ¢ = implied %)</div>
+    ${runLine}
+    ${row(g.away, cA, pA)}
+    ${row(g.home, cH, pH)}
+    <div class="le-note">type Kalshi's live price → edge vs fair + a live-sized stake (⅛-Kelly: in-play reads are noisier than pregame, so stakes auto-halve)</div>
+  </div>`;
+}
+
+// 📰 news-driven prop value (v15.5): a star ruled OUT vacates usage that flows to the
+// remaining leaders — their overs gain value while prop lines lag the news. Day-to-day
+// stars are the watch list (confirm the inactive report, then strike).
+function newsAngleRow(g) {
+  if (g.state === 'post') return '';
+  return [g.away, g.home].map(t => {
+    if (!t?.injStar || !t.inj?.list?.length) return '';
+    const stars = t.inj.list.filter(x => leaderMult(t.leaders, x.name) > 1);
+    if (!stars.length) return '';
+    const out = stars.filter(x => !x.dtd).map(x => x.name);
+    const dtd = stars.filter(x => x.dtd).map(x => x.name);
+    const healthy = (t.leaders || []).filter(l => !t.inj.list.some(x => leaderKey(x.name) === leaderKey(l.name)))
+      .map(l => l.name).filter((v, i, a) => a.indexOf(v) === i);
+    const bits = [];
+    if (out.length) bits.push(`⭐ <b>${esc(out.join(', '))}</b> OUT`);
+    if (dtd.length) bits.push(`⭐ ${esc(dtd.join(', '))} day-to-day`);
+    return `<div class="newsangle">📰 <b>${esc(t.abbr)}</b>: ${bits.join(' · ')} — vacated usage flows to ${healthy.length ? `<b>${esc(healthy.join(', '))}</b>` : 'the remaining rotation'}; their prop OVERS gain value while lines lag the news${out.length ? '' : ' (watch-list: confirm inactives first)'}. Load the real lines below and lean over on the healthy leaders.</div>`;
+  }).join('');
+}
+
 // One compact line under the verdict: projected final score (ball sports + soccer),
 // projected set score (tennis), or a method-of-victory read (MMA) tied to the rounds O/U.
 function projLineHtml(g) {
@@ -3911,6 +4022,11 @@ function gameCard(g, i, sport, bare = false) {   // bare = focus-sheet header (n
       const pm = livePaceMult(g, sport, f);
       if (Math.abs(pm - 1) >= 0.08) pace += ` · ⏱ clock ×${pm.toFixed(2)} ${pm < 1 ? 'slow — leader safer' : 'fast — swingier'}`;
     }
+    const runNow = LiveTape.run(sport.id, g);
+    if (runNow) {
+      const rt = runNow.side === 'home' ? g.home.abbr : g.away.abbr;
+      pace += ` · 🔥 ${esc(rt)} ${runNow.side === 'home' ? runNow.rh + '–' + runNow.ra : runNow.ra + '–' + runNow.rh} run`;
+    }
     liveLine = `<div class="liveline">⚡ LIVE <b>${esc(g.home.abbr)} ${pct(lp.home)}</b> ${arrow} vs open ${pct(base)}${pace}
       <span class="open-ref">${open?.d ? 'opened ' + esc(open.d) : 'model preline'}</span></div>`;
   }
@@ -3935,7 +4051,7 @@ function gameCard(g, i, sport, bare = false) {   // bare = focus-sheet header (n
     ${liveLine}
     <div class="g-verdict">${verdict}${vegasStr}${steamBadge}</div>
     ${suggestedStrip(g)}
-    ${live ? hedgePanel(g, sport) : ''}
+    ${live ? hedgePanel(g, sport) + liveEdgePanel(g, sport, lp) : ''}
     ${projLineHtml(g)}
     ${g.state === 'pre' && g.bp?.kind === 'ev' && g.why?.length
       ? `<div class="whyline">🧠 why: ${esc(g.why.slice(0, 3).join(' · '))}</div>` : ''}
@@ -5433,6 +5549,38 @@ document.addEventListener('input', e => {
     fairBit = ` · <span class="${good ? 'ok' : 'bad'}">${good ? '✓ beats fair' : '✗ below fair'}</span> · your side <span class="${edge >= 0 ? 'ok' : 'bad'}">${edge >= 0 ? '+' : ''}${(edge * 100).toFixed(0)}%</span> vs mkt`;
   }
   out.innerHTML = ` → hedge <b>${H.toFixed(2)}u</b>${money(H)} on ${esc(opp)} @ ${priceLabel}, locks <b class="${locked >= 0 ? 'ok' : 'bad'}">${locked >= 0 ? '+' : ''}${locked.toFixed(2)}u</b>${money(locked)}${fairBit}`;
+});
+
+// ⚡ live edge calculator: type Kalshi's live cents (or a book's American, auto-detected)
+// for a side → edge vs the Stern fair price, EV per unit, and a LIVE-sized stake — half
+// of quarter-Kelly, because in-play reads are noisier and the price moves while you click.
+document.addEventListener('input', e => {
+  const inp = e.target.closest('.live-odds');
+  if (!inp) return;
+  const out = inp.parentElement.querySelector('.live-out');
+  const p = +inp.dataset.p;
+  const raw = (inp.value || '').trim();
+  const num = parseFloat(raw.replace(/[^0-9.+-]/g, ''));
+  if (!num) { out.innerHTML = ''; return; }
+  const isAmerican = /[+-]/.test(raw) || Math.abs(num) >= 100;
+  let imp, b;
+  if (isAmerican) {
+    if (Math.abs(num) < 100) { out.innerHTML = ''; return; }
+    b = num > 0 ? num / 100 : 100 / -num; imp = 1 / (1 + b);
+  } else {
+    if (num < 1 || num > 99) { out.innerHTML = ''; return; }
+    imp = num / 100; b = (100 - num) / num;
+  }
+  const edge = p - imp;                                   // model prob vs the price's implied
+  const ev = p * b - (1 - p);
+  const kf = KELLY_FRACTION * 0.5 * (b * p - (1 - p)) / b;   // live haircut: ⅛-Kelly
+  const units = ev >= 0.02 && kf > 0 ? Math.min(3, Math.max(0.5, Math.round(kf * 1000) / 10)) : 0;
+  const bank = Number(localStorage.getItem('de-bank')) || 0;
+  const money = u => bank ? ` ($${(u * bank / 100).toFixed(0)})` : '';
+  const verdict = edge >= 0.03 ? `<b class="ok">✓ VALUE +${(edge * 100).toFixed(0)}¢</b>`
+    : edge >= 0 ? `<span class="h-pick">thin +${(edge * 100).toFixed(0)}¢ — pass</span>`
+    : `<b class="bad">✗ ${(edge * 100).toFixed(0)}¢ vs fair</b>`;
+  out.innerHTML = ` → ${verdict} · EV ${ev >= 0 ? '+' : ''}${(ev * 100).toFixed(0)}% · ${units ? `stake <b>${units.toFixed(1)}u</b>${money(units)}` : 'no stake'}`;
 });
 
 // keyboard: ←/→ dates · t today · r refresh · 1-9 tabs (1 = The Card)
