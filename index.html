@@ -242,7 +242,7 @@
   }
 
   /* ── Game cards ── */
-  .games { display: grid; grid-template-columns: repeat(auto-fill, minmax(355px, 1fr)); gap: 18px; }
+  .games { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(355px, 100%), 1fr)); gap: 18px; }
   .game {
     background: var(--card); backdrop-filter: blur(12px);
     border: 1px solid var(--border); border-radius: 18px;
@@ -473,6 +473,55 @@
     50% { opacity: 1; transform: translateY(-1px); }
   }
   .slipchip { cursor: help; color: #ffd75e; border-color: rgba(255, 195, 60, .45); }
+  /* 🎴 game focus sheet */
+  #focus {
+    position: fixed; inset: 0; z-index: 90; display: none;
+    background: rgba(4, 8, 18, .62); backdrop-filter: blur(7px); -webkit-backdrop-filter: blur(7px);
+    padding: 4vh 14px;
+  }
+  #focus.show { display: flex; align-items: flex-start; justify-content: center; }
+  .fs-sheet {
+    position: relative; width: 100%; max-width: 700px; max-height: 92vh; overflow-y: auto;
+    min-width: 0; overflow-x: hidden;   /* flex item: don't let nowrap content force overflow */
+    background: linear-gradient(160deg, #0d1526, #0a101f 60%);
+    border: 1px solid rgba(110, 140, 220, .35); border-radius: 18px; padding: 16px 18px 18px;
+    box-shadow: 0 24px 80px rgba(0, 0, 0, .6), 0 0 40px rgba(60, 90, 200, .12);
+    animation: fsUp .22s ease both;
+  }
+  @keyframes fsUp { from { transform: translateY(18px); opacity: 0; } to { transform: none; opacity: 1; } }
+  .fs-x {
+    position: absolute; top: 10px; right: 12px; z-index: 3;
+    background: rgba(10, 16, 32, .75); border: 1px solid var(--border); color: var(--muted);
+    border-radius: 8px; padding: 4px 10px; cursor: pointer; font-size: 13px;
+  }
+  .fs-x:hover { color: var(--text); border-color: rgba(110, 140, 220, .5); }
+  .fs-head .game { border: none !important; background: transparent !important; padding: 0; margin: 0; cursor: default; animation: none; box-shadow: none !important; transform: none !important; }
+  .fs-pills {
+    display: flex; gap: 7px; flex-wrap: wrap; margin: 12px 0 4px;
+    position: sticky; top: -16px; background: #0c1424; padding: 9px 0; z-index: 2;
+    border-bottom: 1px dashed var(--border);
+  }
+  .fs-pill {
+    background: var(--bg2); border: 1px solid var(--border); color: var(--muted);
+    border-radius: 999px; padding: 6px 14px; font-size: 11px; font-weight: 700;
+    letter-spacing: 1px; cursor: pointer; transition: all .15s;
+  }
+  .fs-pill:hover { color: var(--text); }
+  .fs-pill.on { color: var(--text); border-color: rgba(110, 200, 160, .55); background: rgba(30, 120, 90, .16); }
+  .fs-body .betboard { display: block; border-top: none; padding-top: 6px; margin-top: 4px; }
+  .fs-nav { margin-top: 14px; text-align: center; font-size: 10px; color: var(--muted); letter-spacing: 1px; opacity: .65; }
+  .hero { cursor: pointer; }
+  @media (max-width: 640px) {
+    #focus { padding: 0; }
+    .fs-sheet { max-width: none; max-height: 100vh; height: 100%; border-radius: 0; border: none; padding: 12px 12px 16px; }
+    .fs-nav { display: none; }
+    body { overflow-x: hidden; }   /* a stray nowrap line shouldn't let the page pan sideways */
+    /* the date row was the one element wider than a phone (215px label + buttons) — it
+       expanded the layout viewport and every fixed overlay with it. Let it shrink. */
+    .datenav { flex-wrap: wrap; justify-content: center; }
+    .datenav .datelabel { min-width: 0; }
+    .game { min-width: 0; max-width: 100%; overflow-x: hidden; }   /* nowrap chips can't widen a card past the phone */
+  }
   /* ⌘K / "/" command omnibar */
   .omni-btn {
     background: var(--bg2); border: 1px solid var(--border); color: var(--muted);
@@ -805,7 +854,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v15.2';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v15.4';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1057,13 +1106,27 @@ const KEY_MARGIN_W = {
 function marginPMF(sportId, mu, sigma) {
   const W = KEY_MARGIN_W[sportId];
   if (!W || !sigma) return null;
+  // (v15.4) learned overlay: once enough finals bank, blend the sport's OBSERVED
+  // margin frequencies (each game scored against its own Normal expectation, so the
+  // slate's favorite mix cancels) over the hardcoded priors — self-tuning key numbers.
+  const md = typeof Brain !== 'undefined' ? Brain.marginDist(sportId) : null;
+  const mix = md && md.n >= 150 ? md.n / (md.n + 400) : 0;
   const lim = Math.ceil(sigma * 3.5) + 3;
   const ks = [], ms = [];
   let sum = 0;
   for (let k = -lim; k <= lim; k++) {
     let m = normalCdf((k + 0.5 - mu) / sigma) - normalCdf((k - 0.5 - mu) / sigma);
     const w = W[Math.abs(k)];
-    if (w != null) m *= w;
+    if (w === 0) continue;                     // structurally impossible margin (ties) stays impossible
+    let wEff = w != null ? w : 1;
+    if (mix) {
+      const a = Math.abs(k), ex = md.exp[a] || 0;
+      if (ex >= 3) {                           // enough expected mass for a stable ratio
+        const r = Math.max(0.25, Math.min(2.5, (md.obs[a] || 0) / ex));
+        wEff = (1 - mix) * wEff + mix * r;
+      }
+    }
+    m *= wEff;
     if (m > 0) { ks.push(k); ms.push(m); sum += m; }
   }
   if (!sum) return null;
@@ -1274,6 +1337,7 @@ const Brain = (() => {
   db.hfa = db.hfa || {};     // per-sport learned home-advantage EMA {w, n}
   db.edge = db.edge || {};   // per-sport Brier of market prior (mkt) vs our posterior (mdl) — edge trust
   db.mmaMethod = db.mmaMethod || {};   // per-weight-class actual finish mix {ko, sub, dec, n}
+  db.margins = db.margins || {};       // per-sport actual |margin| tally vs Normal expectation — learned key numbers
   const cutoff = ymd(new Date(Date.now() - 60 * 864e5));
   for (const k in db.processed) if (db.processed[k] < cutoff) delete db.processed[k];
   for (const k in db.learned) if (db.learned[k] < cutoff) delete db.learned[k];
@@ -1553,6 +1617,25 @@ const Brain = (() => {
           else m.dec++;
           m.n++;
         }
+        // self-learning key numbers (v15.4): tally the ACTUAL final |margin| against the
+        // plain Normal's expectation for THIS game's mu (so the mix of favorites/dogs is
+        // accounted for). marginPMF blends the observed/expected ratio over the hardcoded
+        // KEY_MARGIN_W once enough finals bank — the key-number table tunes itself to the
+        // league as it actually plays. Canonical (rides export/adopt).
+        if (KEY_MARGIN_W[sport.id] && sport.spreadSigma && g.model?.home != null) {
+          const md = db.margins[sport.id] = db.margins[sport.id] || { obs: {}, exp: {}, n: 0 };
+          const sig = sport.spreadSigma;
+          const muM = invNorm(clamp(g.model.home)) * sig;
+          const lim = Math.ceil(sig * 3.5) + 3;
+          const actual = Math.min(lim, Math.abs((Number(g.home.score) || 0) - (Number(g.away.score) || 0)));
+          md.obs[actual] = (md.obs[actual] || 0) + 1;
+          for (let k = 0; k <= lim; k++) {
+            const m = (normalCdf((k + 0.5 - muM) / sig) - normalCdf((k - 0.5 - muM) / sig))
+                    + (k > 0 ? (normalCdf((-k + 0.5 - muM) / sig) - normalCdf((-k - 0.5 - muM) / sig)) : 0);
+            if (m > 1e-6) md.exp[k] = +((md.exp[k] || 0) + m).toFixed(4);
+          }
+          md.n++;
+        }
         db.learned[key] = today;
         changed = true;
       }
@@ -1631,6 +1714,7 @@ const Brain = (() => {
       return Math.max(0.3, Math.min(1.3, 1 + gain * 25));
     },
     mmaMethod: wc => db.mmaMethod[wc] || null,   // learned finish mix for a weight class
+    marginDist: s => db.margins[s] || null,      // learned |margin| tally → self-tuning key numbers
     effHfa,
     // 🧬 one consistent base for every device: adopt the canonical pricing brain shipped
     // with the site (brain.json). Canonical always wins on a new publish — personal state
@@ -1643,7 +1727,7 @@ const Brain = (() => {
         if (db.canonId === r.id && (db.through || 0) >= r.through) return false;   // already on this base
         db.elo = r.elo; db.calib = r.calib || {}; db.perf = r.perf || {};
         db.totalsBias = r.totalsBias || {}; db.hfa = r.hfa || {}; db.edge = r.edge || {};
-        db.mmaMethod = r.mmaMethod || {};
+        db.mmaMethod = r.mmaMethod || {}; db.margins = r.margins || {};
         db.through = r.through; db.anchor = r.through; db.learned = {};
         db.canonId = r.id;
         // brain-level counters ride along so a fresh device shows the brain's real experience
@@ -1656,7 +1740,7 @@ const Brain = (() => {
     exportCanonical() {
       return JSON.stringify({ id: syncFingerprint().id, through: db.through || 0,
         elo: db.elo, calib: db.calib, perf: db.perf, totalsBias: db.totalsBias, hfa: db.hfa, edge: db.edge,
-        mmaMethod: db.mmaMethod,
+        mmaMethod: db.mmaMethod, margins: db.margins,
         stats: { absorbed: db.stats.absorbed, hits: db.stats.hits, misses: db.stats.misses } });
     },
     postmortems: () => db.postmortems,
@@ -3540,7 +3624,7 @@ function fmtSliderVal(v, val) {
   if (v === 'pace') return `${(val / 100).toFixed(2)}×`;
   return val;
 }
-function whatIfSandbox(g) {
+function whatIfSandbox(g, openNow) {
   const sport = SPORTS.find(s => s.id === g.sportId);
   if (!sport || g.tennis || !g.bp || (g.bp.kind !== 'ev' && g.bp.kind !== 'pass')) return '';
   const isMLB = g.sportId === 'mlb';
@@ -3558,7 +3642,7 @@ function whatIfSandbox(g) {
   const rows = sliders.map(([v, lbl, mn, mx, st, val]) =>
     `<div class="wi-row"><label>${lbl} <b class="wi-val" data-for="${v}">${fmtSliderVal(v, val)}</b></label>
       <input class="wi-slider" data-var="${v}" type="range" min="${mn}" max="${mx}" step="${st}" value="${val}"></div>`).join('');
-  return `<details class="sandbox" data-gid="${esc(g.id)}" data-k="${g.sportId}" onclick="event.stopPropagation()">
+  return `<details class="sandbox" ${openNow ? 'open ' : ''}data-gid="${esc(g.id)}" data-k="${g.sportId}" onclick="event.stopPropagation()">
     <summary>🎛️ WHAT-IF SANDBOX</summary>
     <div class="wi-body">
       ${rows}
@@ -3595,6 +3679,13 @@ function altSpreadRow(g) {
 function betBoard(g) {
   const extras = formSection(g) + propsSection(g) + h2hSection(g) + gamePropsSection(g);
   if (g.state !== 'pre') return extras ? `<div class="betboard">${extras}</div>` : '';
+  const core = boardCore(g);
+  return `<div class="betboard">${core}${whatIfSandbox(g)}${extras}</div>`;
+}
+// the pure pricing table (rows + fair prices + alt spreads + total + drivers) — the focus
+// sheet renders this as its own section, the legacy inline board wraps it with the extras
+function boardCore(g) {
+  if (g.state !== 'pre') return '';
   const rows = (g.bp?.board || []).map(c => {
     const star = g.bp.kind === 'ev' && c.text === g.bp.text ? '⭐ ' : '';
     return `<div class="bo-row ${c.ev >= MIN_EV ? 'bet' : 'skip'}">
@@ -3608,16 +3699,13 @@ function betBoard(g) {
   }).join('');
   const fh = fmtML(probToAmerican(clamp(g.model.home))), fa = fmtML(probToAmerican(clamp(g.model.away)));
   const fd = g.model.draw > 0 ? ` / draw ${fmtML(probToAmerican(clamp(g.model.draw)))}` : '';
-  return `<div class="betboard"><div class="bo-h">FULL BET BOARD</div>
+  return `<div class="bo-h">FULL BET BOARD</div>
     ${rows || '<div class="bo-row skip"><span class="bo-bet">no priced markets listed for this match</span></div>'}
     <div class="bo-fair">model's fair prices: ${esc(g.home.abbr)} ${fh} / ${esc(g.away.abbr)} ${fa}${fd} — only take better numbers than these</div>
     ${altSpreadRow(g)}
     ${g.total ? `<div class="bo-fair">model total: ${g.total.exp.toFixed(1)} vs line ${g.total.line} → ${g.total.pOver >= 0.5 ? 'Over' : 'Under'} ${pct(Math.max(g.total.pOver, 1 - g.total.pOver))}${g.total.notes?.length ? ' · ' + esc(g.total.notes.join(' · ')) : ''}${g.wx ? ` · ${esc(g.wx.txt)}` : ''}</div>`
       : g.vegas?.ou ? `<div class="bo-fair">total: O/U ${g.vegas.ou}</div>` : ''}
-    ${g.why?.length ? `<div class="bo-fair">drivers: ${esc(g.why.join(' · '))}</div>` : ''}
-    ${whatIfSandbox(g)}
-    ${extras}
-  </div>`;
+    ${g.why?.length ? `<div class="bo-fair">drivers: ${esc(g.why.join(' · '))}</div>` : ''}`;
 }
 
 // ⭐ pick strip for every game state: pregame = live best pick; live/final = the
@@ -3770,7 +3858,7 @@ function projLineHtml(g) {
   return `<div class="projline">📊 proj <b>${esc(g.away.abbr)} ${Math.round(P.a)}–${Math.round(P.h)} ${esc(g.home.abbr)}</b>${P.total ? ` · total ${P.total.toFixed(1)}` : ''}</div>`;
 }
 
-function gameCard(g, i, sport) {
+function gameCard(g, i, sport, bare = false) {   // bare = focus-sheet header (no panel/hint)
   const live = g.state === 'in';
   const badge = live ? '<span class="badge in">● LIVE</span>'
     : g.state === 'post' ? '<span class="badge post">FINAL</span>'
@@ -3827,13 +3915,15 @@ function gameCard(g, i, sport) {
       <span class="open-ref">${open?.d ? 'opened ' + esc(open.d) : 'model preline'}</span></div>`;
   }
 
-  const panel = betBoard(g);
-  const hint = panel
-    ? '<div class="expand-hint"><span class="c1">▾ BOARD · FORM · PROPS</span><span class="c2">▴ COLLAPSE</span></div>' : '';
+  // (v15.3) cards no longer carry a hidden inline panel — a tap opens the GAME SHEET
+  // (focused overlay with BOARD/PROPS/FORM/SANDBOX pills). data-sheet marks openability.
+  const sheetable = !bare && (g.state === 'pre' || !!(formSection(g) || propsSection(g) || h2hSection(g) || gamePropsSection(g)));
+  const hint = sheetable
+    ? '<div class="expand-hint"><span class="c1">▸ TAP — GAME SHEET · BOARD · PROPS · FORM</span></div>' : '';
 
-  return `<div class="game ${live ? 'live' : ''} ${state.openCards.has(g.id) ? 'open' : ''}" data-id="${esc(g.id)}"
+  return `<div class="game ${live ? 'live' : ''} ${bare ? 'bare' : ''}" data-id="${esc(g.id)}" data-k="${g.sportId}"${sheetable ? ' data-sheet="1"' : ''}
     data-names="${esc((g.away.name + ' ' + g.home.name + ' ' + g.away.abbr + ' ' + g.home.abbr).toLowerCase())}"
-    style="animation-delay:${Math.min(i * 45, 450)}ms">
+    style="animation-delay:${bare ? 0 : Math.min(i * 45, 450)}ms">
     <div class="g-top">
       ${badge}
       <span class="where">${esc(g.state === 'pre' ? (g.tv || g.venue) : g.statusText)}${g.wx?.t != null && g.state !== 'post' ? esc(` · ${g.wx.t}°`) : ''}${g.wx?.wind && Math.abs(g.wx.wind.out) >= 5 && g.state === 'pre' ? esc(` · 💨${Math.round(g.wx.wind.speed)}mph ${g.wx.wind.out > 0 ? 'out' : 'in'}`) : ''}</span>
@@ -3850,7 +3940,6 @@ function gameCard(g, i, sport) {
     ${g.state === 'pre' && g.bp?.kind === 'ev' && g.why?.length
       ? `<div class="whyline">🧠 why: ${esc(g.why.slice(0, 3).join(' · '))}</div>` : ''}
     ${hint}
-    ${panel}
   </div>`;
 }
 
@@ -3868,7 +3957,7 @@ function heroCard(events) {
   </div>`;
   const favSide = g.model.home >= g.model.away ? 'home' : 'away';
   const pickName = g[g.pick].name;
-  return `<div class="hero">
+  return `<div class="hero" data-k="${g.sportId}" data-id="${esc(g.id)}" title="tap to open the game sheet">
     <div class="hero-tag">🔥 GAME OF THE DAY</div>
     <div class="hero-grid">
       ${sideBlock(g.away, g.model.away, favSide === 'away' ? 'fav' : 'dog')}
@@ -4678,6 +4767,7 @@ function renderSlip() {
 function renderActive() {
   if (state.tab === 'card') renderCard([...state.lastEntries.values()].flatMap(e => e.events));
   else if (state.activeEntry) renderContent(SPORTS.find(s => s.id === state.tab), state.activeEntry);
+  if (typeof Focus !== 'undefined') Focus.sync();   // keep an open game sheet live-updating
 }
 
 // 🎮 Esports EV Lab — honest tool: no free live V/LoL data exists for a static
@@ -5112,7 +5202,7 @@ $('#refreshbtn').addEventListener('click', () => refresh(true));
 }
 
 // content clicks: add-to-slip, filter buttons, or expand a card's bet board
-$('#content').addEventListener('click', e => {
+function contentClick(e) {
   const ccBtn = e.target.closest('[data-copycard]');
   if (ccBtn) {   // share the day's card: graded +EV picks, honoring the active filter
     const gf = state.gradeFilter || 'all';
@@ -5175,13 +5265,16 @@ $('#content').addEventListener('click', e => {
     if (fb.dataset.s) state.sort = fb.dataset.s;
     renderActive(); return;
   }
+  const hero = e.target.closest('.hero');
+  if (hero?.dataset.id) { Focus.open(hero.dataset.k, hero.dataset.id); return; }
+  // (v15.3) a tap on a game opens the focused GAME SHEET overlay (board/props/form/sandbox
+  // pills) instead of the old expand-in-place dropdown — the game gets the whole screen
   const card = e.target.closest('.game');
-  if (!card || !card.dataset.id || !card.querySelector('.betboard')) return;
-  card.classList.toggle('open');
-  const id = card.dataset.id;
-  state.openCards.has(id) ? state.openCards.delete(id) : state.openCards.add(id);
-});
-$('#content').addEventListener('input', e => {
+  if (!card || !card.dataset.sheet) return;
+  Focus.open(card.dataset.k, card.dataset.id);
+}
+$('#content').addEventListener('click', contentClick);
+function contentInput(e) {
   if (e.target.id === 'gamesearch') { state.query = e.target.value; applySearch(); return; }
   // 🎛️ What-If sandbox: live-recompute win%, projected total, and Kelly stake on drag.
   // O(1) math + a handful of text updates → no re-render, no lag; a brief pulse animates it.
@@ -5217,7 +5310,8 @@ $('#content').addEventListener('input', e => {
     if (e.target.id === 'pr-player') updatePropAuto();   // refresh the auto-suggested context
     renderPropsOut();
   }
-});
+}
+$('#content').addEventListener('input', contentInput);
 $('#brainbar').addEventListener('click', e => {
   if (e.target.closest('#bmore')) { state.brainMore = !state.brainMore; renderBrain(); return; }
   if (e.target.closest('#histbtn')) { state.showHistory = !state.showHistory; renderBrain(); return; }
@@ -5444,13 +5538,14 @@ const Omni = (() => {
     else if (it.type === 'slipcmd') runSlip(input.value.trim());
   }
   async function gotoGame(tab, gid) {
-    state.openCards.add(gid);
     if (state.tab !== tab) { state.tab = tab; localStorage.setItem('de-tab', tab); await refresh(); }
     else renderActive();
     setTimeout(() => {
+      // scroll the slate underneath so the card is there when the sheet closes, then focus
       const card = [...document.querySelectorAll('.game')].find(c => c.dataset.id === String(gid));
-      if (card) { card.classList.add('open'); card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      if (card) { card.scrollIntoView({ behavior: 'smooth', block: 'center' });
         card.classList.add('omni-flash'); setTimeout(() => card.classList.remove('omni-flash'), 1500); }
+      Focus.open(tab, gid);
     }, 140);
   }
   function runSlip(q) {
@@ -5480,6 +5575,87 @@ document.addEventListener('keydown', e => {
   if (e.key === '/' && !e.target.matches('input,textarea') && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); Omni.open(); }
 });
 $('#omnibtn')?.addEventListener('click', () => Omni.open());
+
+// ── 🎴 GAME FOCUS SHEET (v15.3) ──────────────────────────────────────────
+// Tap a game → a focused overlay takes the screen: rich live header (teams, prob bar,
+// verdict, live line, hedge) + section pills so BOARD / PROPS / FORM / SANDBOX each get
+// full width instead of stacking in one long dropdown. ←/→ walks the slate, esc closes.
+// Reuses contentClick/contentInput so slip buttons, prop loaders, sliders and hedge
+// inputs work identically inside the sheet.
+const Focus = (() => {
+  let el, head, pills, body, isOpen = false, cur = null, section = 'board', lastState = null;
+  function build() {
+    if (el) return;
+    el = document.createElement('div');
+    el.id = 'focus';
+    el.innerHTML = `<div class="fs-sheet">
+      <button class="fs-x" title="close (esc)">✕</button>
+      <div class="fs-head"></div>
+      <div class="fs-pills"></div>
+      <div class="fs-body"></div>
+      <div class="fs-nav">← / → walk the slate · esc closes</div>
+    </div>`;
+    document.body.appendChild(el);
+    head = el.querySelector('.fs-head'); pills = el.querySelector('.fs-pills'); body = el.querySelector('.fs-body');
+    el.addEventListener('click', e => {
+      if (e.target === el) { close(); return; }                    // backdrop
+      if (e.target.closest('.fs-x')) { close(); return; }
+      const pill = e.target.closest('.fs-pill');
+      if (pill) { section = pill.dataset.s; render(true); return; }
+      contentClick(e);                                             // slip / props / copy handlers
+    });
+    el.addEventListener('input', contentInput);                    // sandbox sliders etc.
+    // capture-phase so ←/→ walk games instead of shifting the date while the sheet is up
+    document.addEventListener('keydown', e => {
+      if (!isOpen) return;
+      if (e.key === 'Escape') { close(); e.stopImmediatePropagation(); }
+      else if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !e.target.matches('input,textarea')) {
+        step(e.key === 'ArrowRight' ? 1 : -1);
+        e.stopImmediatePropagation(); e.preventDefault();
+      }
+    }, true);
+  }
+  const game = () => (state.lastEntries.get(cur?.k)?.events || []).find(x => String(x.id) === String(cur?.gid));
+  function step(d) {
+    const evs = state.lastEntries.get(cur.k)?.events || [];
+    const i = evs.findIndex(x => String(x.id) === String(cur.gid));
+    const nx = evs[i + d];
+    if (nx) { cur = { k: cur.k, gid: String(nx.id) }; lastState = null; render(true); el.querySelector('.fs-sheet').scrollTop = 0; }
+  }
+  function render(hard) {
+    const g = game();
+    if (!g) { close(); return; }
+    const sport = SPORTS.find(s => s.id === cur.k);
+    head.innerHTML = gameCard(g, 0, sport, true);
+    const secs = [];
+    const core = boardCore(g);
+    if (core) secs.push(['board', '💰 BOARD', core]);
+    const props = propsSection(g) + h2hSection(g) + gamePropsSection(g);
+    if (props) secs.push(['props', '🎯 PROPS', props]);
+    const form = formSection(g);
+    if (form) secs.push(['form', '📈 FORM', form]);
+    const sand = whatIfSandbox(g, true);
+    if (sand) secs.push(['sandbox', '🎛️ SANDBOX', sand]);
+    if (!secs.length) { pills.innerHTML = ''; body.innerHTML = ''; lastState = g.state; return; }
+    if (!secs.find(s => s[0] === section)) section = secs[0][0];
+    pills.innerHTML = secs.map(([id, lbl]) => `<button class="fs-pill ${id === section ? 'on' : ''}" data-s="${id}">${lbl}</button>`).join('');
+    // soft syncs (live polls) refresh the header only — keeps loaded props/slider state alive
+    if (hard || lastState !== g.state || !body.firstChild) {
+      body.innerHTML = `<div class="betboard">${secs.find(s => s[0] === section)[2]}</div>`;
+    }
+    lastState = g.state;
+  }
+  function close() { isOpen = false; el?.classList.remove('show'); document.body.style.overflow = ''; }
+  return {
+    open(k, gid) {
+      build(); cur = { k: String(k), gid: String(gid) }; section = 'board'; lastState = null;
+      isOpen = true; el.classList.add('show'); document.body.style.overflow = 'hidden';
+      render(true); el.querySelector('.fs-sheet').scrollTop = 0;
+    },
+    close, isOpen: () => isOpen,
+    sync() { if (isOpen) render(false); },
+  };
+})();
 
 document.querySelector('.logo .sub').textContent += ' · ' + APP_VERSION;
 // 👋 first-visit guide — three plain-English pointers for people who don't speak betting.
