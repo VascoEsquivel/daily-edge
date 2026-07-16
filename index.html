@@ -458,6 +458,21 @@
     border-radius: 6px; padding: 3px 6px; width: 76px; font-family: inherit; font-size: 11px;
   }
   .hedge .hedge-out { margin-left: 6px; }
+  /* 🧩 last-leg parlay hedge drawer — same calc chrome, violet identity */
+  .parlayhedge { border-color: rgba(150, 120, 255, .40); background: rgba(90, 70, 200, .10); margin-bottom: 8px; }
+  .parlayhedge .h-ttl { color: #b6a4ff; }
+  /* ⚡ sharp-steam velocity vector on team rows */
+  .steamvec {
+    display: inline-block; margin-left: 6px; font-size: 10px; font-weight: 800;
+    letter-spacing: -1px; cursor: help; color: #ffd75e;
+    text-shadow: 0 0 7px rgba(255, 195, 60, .95), 0 0 14px rgba(255, 160, 20, .5);
+    animation: steamPulse 1.1s ease-in-out infinite;
+  }
+  @keyframes steamPulse {
+    0%, 100% { opacity: .5; transform: translateY(1px); }
+    50% { opacity: 1; transform: translateY(-1px); }
+  }
+  .slipchip { cursor: help; color: #ffd75e; border-color: rgba(255, 195, 60, .45); }
   /* ⌘K / "/" command omnibar */
   .omni-btn {
     background: var(--bg2); border: 1px solid var(--border); color: var(--muted);
@@ -790,7 +805,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v15.1';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v15.2';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1015,8 +1030,55 @@ function normalCdf(x) {
   const p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
   return x >= 0 ? 1 - p : p;
 }
-function spreadToProb(spread, sigma) {
-  return normalCdf(Math.abs(spread) / sigma);
+function spreadToProb(spread, sigma, sportId) {
+  // (v15.2) when the sport has an empirical margin PMF, read the win prob off it —
+  // a -3 NFL favorite wins more often than a smooth Normal admits because margins PILE on 3
+  const pmf = sportId ? marginPMF(sportId, Math.abs(spread), sigma) : null;
+  return pmf ? pmfHomeCover(pmf, 0) : normalCdf(Math.abs(spread) / sigma);
+}
+
+// ── Empirical "key numbers" margin engine (v15.2) ───────────────────────
+// Final margins do NOT fall on a smooth Normal curve: NFL games land on 3 and 7 (a field
+// goal / a touchdown decide close games), ~28% of MLB games are one-run, NHL trailing
+// teams pull the goalie (1-goal piles up, empty-netters inflate 2), NBA late-game fouling
+// thins out the tiny margins. We discretize the model's Normal margin curve onto integer
+// margins, multiply each bin by its sport's historical over/under-representation factor
+// (empirical frequency ÷ Normal frequency, league history), zero out impossible ties,
+// and renormalize. Spread cover probs — and alt-spread fair prices — read off this PMF.
+const KEY_MARGIN_W = {
+  nfl:  { 0: 0.07, 1: 0.42, 2: 0.60, 3: 1.90, 4: 0.80, 5: 0.55, 6: 1.05, 7: 1.45, 8: 0.90,
+          9: 0.55, 10: 1.20, 11: 0.62, 12: 0.68, 13: 0.80, 14: 1.20, 16: 0.85, 17: 1.10, 21: 1.10 },
+  mlb:  { 0: 0, 1: 1.18, 2: 1.02, 3: 0.96, 4: 0.94 },          // one-run games ≈ 28% of all MLB
+  nhl:  { 0: 0, 1: 1.12, 2: 1.06, 3: 0.92, 4: 0.90 },          // OT forces 1; empty-netters feed 2
+  nba:  { 0: 0, 1: 0.55, 2: 0.68, 3: 0.85, 4: 0.92, 5: 1.05, 6: 1.08, 7: 1.10, 8: 1.08,
+          9: 1.05, 10: 1.05, 11: 1.03, 12: 1.02 },             // fouling stretches close finishes
+  wnba: { 0: 0, 1: 0.58, 2: 0.70, 3: 0.86, 4: 0.93, 5: 1.05, 6: 1.07, 7: 1.08, 8: 1.06, 10: 1.04 },
+};
+function marginPMF(sportId, mu, sigma) {
+  const W = KEY_MARGIN_W[sportId];
+  if (!W || !sigma) return null;
+  const lim = Math.ceil(sigma * 3.5) + 3;
+  const ks = [], ms = [];
+  let sum = 0;
+  for (let k = -lim; k <= lim; k++) {
+    let m = normalCdf((k + 0.5 - mu) / sigma) - normalCdf((k - 0.5 - mu) / sigma);
+    const w = W[Math.abs(k)];
+    if (w != null) m *= w;
+    if (m > 0) { ks.push(k); ms.push(m); sum += m; }
+  }
+  if (!sum) return null;
+  for (let i = 0; i < ms.length; i++) ms[i] /= sum;
+  return { ks, ms };
+}
+// P(home covers homeSpread), pushes refunded (standard -110 both-ways convention):
+// win mass / (1 − push mass). homeSpread is the home team's line (favorites negative).
+function pmfHomeCover(pmf, homeSpread) {
+  let win = 0, push = 0;
+  for (let i = 0; i < pmf.ks.length; i++) {
+    const d = pmf.ks[i] + homeSpread;
+    if (d > 0.001) win += pmf.ms[i]; else if (d > -0.001) push += pmf.ms[i];
+  }
+  return push >= 1 ? 0.5 : win / (1 - push);
 }
 
 // ── Player-prop projection ──────────────────────────────────────────────
@@ -1659,16 +1721,45 @@ const Open = (() => {
         if (g.state !== 'pre') return;
         if (!db[k]) {
           db[k] = { p: g.model.home, d: g.vegas?.detail || '', t: Date.now(), te: g.total?.exp ?? null,
-                    mp: g.vegas?.homeProb ?? null };   // open de-vigged MARKET prob → line-move steam
+                    mp: g.vegas?.homeProb ?? null,     // open de-vigged MARKET prob → line-move steam
+                    h: g.vegas?.homeProb != null ? [[Date.now(), g.vegas.homeProb]] : [] };
           changed = true;
-        } else if (db[k].te == null && g.total?.exp != null) {
-          db[k].te = g.total.exp;   // snapshots from before totals tracking existed
-          changed = true;
+        } else {
+          const rec = db[k];
+          if (rec.te == null && g.total?.exp != null) { rec.te = g.total.exp; changed = true; }
+          // line-velocity tape (v15.2): append a [timestamp, de-vigged home prob] sample
+          // whenever the market's number actually moves — powers steam vectors + slippage
+          const mp = g.vegas?.homeProb;
+          if (mp != null) {
+            rec.h = rec.h || (rec.mp != null ? [[rec.t, rec.mp]] : []);
+            const lastS = rec.h[rec.h.length - 1];
+            if (!lastS || Math.abs(mp - lastS[1]) >= 0.004) {
+              rec.h.push([Date.now(), mp]);
+              if (rec.h.length > 30) rec.h.splice(0, rec.h.length - 30);
+              changed = true;
+            }
+          }
         }
       });
       if (changed) save();
     },
     get(sport, g) { return db[sport.id + '|' + g.id]; },
+    // LINE VELOCITY (v15.2): implied-probability shift per minute over the trailing window.
+    // A line that jumped ≥1.5 points within the last 45 min is moving on real information
+    // (sharp money, breaking news) — normal drift never travels that fast. Returns null
+    // when the tape is quiet; velocity is a NOW signal, not a since-open one.
+    velocity(sportId, g) {
+      const h = db[sportId + '|' + g.id]?.h;
+      if (!h || h.length < 2) return null;
+      const W = 45 * 60000, last = h[h.length - 1];
+      if (Date.now() - last[0] > W) return null;         // nothing moved recently
+      let i = h.length - 1;
+      while (i > 0 && last[0] - h[i - 1][0] <= W) i--;
+      const dp = last[1] - h[i][1];
+      if (Math.abs(dp) < 0.015) return null;             // under 1.5 pts → normal drift
+      const mins = Math.max(1, Math.round((last[0] - h[i][0]) / 60000));
+      return { dp, vpm: dp / mins, side: dp > 0 ? 'home' : 'away', mins };
+    },
   };
 })();
 
@@ -2366,7 +2457,7 @@ function parseVegas(comp, sport, home) {
   } else {
     v.spread = line;
     if (sport.spreadSigma) {
-      const favProb = spreadToProb(line, sport.spreadSigma);
+      const favProb = spreadToProb(line, sport.spreadSigma, sport.id);
       v.homeProb = v.favIsHome ? favProb : 1 - favProb;
     }
   }
@@ -2524,7 +2615,14 @@ function computeBestPick(g, sport) {
     // so keep the analytic Normal there (the sim adds value on basketball TOTALS, not spreads)
     let pHome;
     if (g.sim && sport.id === 'mlb') pHome = g.sim.pHomeCover(homeSpread);
-    else { const sigma = sport.spreadSigma; pHome = normalCdf((invNorm(g.model.home) * sigma + homeSpread) / sigma); }
+    else {
+      // (v15.2) cover prob off the empirical key-numbers PMF where the sport has one —
+      // crossing 3/7 in the NFL or the one-run pile in MLB moves the price in steps,
+      // not linearly. Normal fallback for sports without a margin map.
+      const sigma = sport.spreadSigma, mu = invNorm(g.model.home) * sigma;
+      const pmf = marginPMF(sport.id, mu, sigma);
+      pHome = pmf ? pmfHomeCover(pmf, homeSpread) : normalCdf((mu + homeSpread) / sigma);
+    }
     // the posted spread IS the market's median margin — cover prob = 0.5 + clamped alpha
     pHome = 0.5 + Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, pHome - 0.5));
     const b = 100 / 110, imp = 0.524;                       // spread bets priced -110
@@ -2561,6 +2659,18 @@ function computeBestPick(g, sport) {
   if (grade !== 'A' && best.units) {
     best.units = Math.max(0.5, Math.round(best.units * (grade === 'B' ? 0.8 : 0.6) * 10) / 10);
   }
+  // ⚡ execution slippage buffer (v15.2): when the de-vigged line is moving fast RIGHT NOW
+  // (Open.velocity), assume the click fills at a worse price than the screen shows — trim
+  // the SUGGESTED stake 10–20%, scaled by how far the line has run. Shown as ADVICE on the
+  // pick strip (same precedent as the portfolio guard); the canonical logged stake stays a
+  // pure function of price+edge so the ⭐ ledger reads identically on every device.
+  let slip = null;
+  const vel = typeof Open !== 'undefined' ? Open.velocity(sport.id, g) : null;
+  if (vel && best.units) {
+    const decay = Math.min(0.20, 0.10 + Math.abs(vel.dp) * 2);   // 1.5-pt move → −13%, 5-pt → −20%
+    slip = { pct: Math.round(decay * 100), dp: vel.dp, mins: vel.mins,
+             take: Math.max(0.5, Math.round(best.units * (1 - decay) * 10) / 10) };
+  }
   // spread picks also show the model's FAIR line (expected margin off the win prob) so
   // the size of the disagreement with the posted number is visible at a glance
   let fairLine = '';
@@ -2577,7 +2687,7 @@ function computeBestPick(g, sport) {
   return { kind: 'ev', text: best.text, ev: best.ev, board: cands,
     side: best.side, b: best.b, p: best.p, betType: best.type,
     homeSpread: best.homeSpread ?? null, line: best.line ?? null,
-    units: best.units, grade,
+    units: best.units, grade, slip,
     sub };
 }
 
@@ -3214,6 +3324,9 @@ function bestPickStrip(g) {
     : '';
   const slipBtn = bp.kind === 'ev' && g.state === 'pre'
     ? `<button class="addleg" data-leg="${esc(JSON.stringify(legOf(g, bp.text, bp.p, bp.b, { side: bp.side, type: bp.betType, line: bp.line, homeSpread: bp.homeSpread })))}">🎟️ + slip</button>` : '';
+  // ⚡ slippage buffer: line is moving fast — advise a trimmed stake for late execution
+  const slipChip = bp.kind === 'ev' && bp.slip && bp.units
+    ? `<span class="chip mkt slipchip" title="EXECUTION SLIPPAGE BUFFER: this market moved ${(Math.abs(bp.slip.dp) * 100).toFixed(1)} pts in the last ${bp.slip.mins} min — by the time you click, the fill is likely worse than the screen price. Kelly suggestion trimmed ${bp.slip.pct}% so a late entry can't over-allocate to an edge that's closing. (The ⭐ ledger still logs the canonical ${bp.units}u.)">⚡ take ${bp.slip.take}u</span>` : '';
   // steam: how far the market has moved on our side since the ⭐ ticket was logged
   let steam = '';
   if (bp.kind === 'ev' && g.state === 'pre') {
@@ -3228,7 +3341,7 @@ function bestPickStrip(g) {
   return `<div class="bestpick ${bp.kind}">
     <span class="bp-tag">${icon} ${tag}</span>
     <span class="bp-main">${esc(bp.text)}</span>
-    ${bp.kind === 'ev' ? gradeChip(bp.grade) : ''}${ev}${units}${steam}${slipBtn}
+    ${bp.kind === 'ev' ? gradeChip(bp.grade) : ''}${ev}${units}${slipChip}${steam}${slipBtn}
     <span class="bp-sub">${esc(bp.sub)}</span>
   </div>`;
 }
@@ -3395,8 +3508,9 @@ function whatIf(g, sport, adj) {
   if (bp && (bp.kind === 'ev' || bp.kind === 'pass') && bp.b) {
     if (bp.betType === 'ml') pickP = bp.side === 'home' ? pHome : 1 - pHome;
     else if (bp.betType === 'spread') {
-      const sig = sport?.spreadSigma || 10;
-      const ph = normalCdf((invNorm(clamp(pHome)) * sig + bp.homeSpread) / sig);
+      const sig = sport?.spreadSigma || 10, mu = invNorm(clamp(pHome)) * sig;
+      const pmf = sport ? marginPMF(sport.id, mu, sig) : null;   // key-numbers PMF, same as the Card
+      const ph = pmf ? pmfHomeCover(pmf, bp.homeSpread) : normalCdf((mu + bp.homeSpread) / sig);
       pickP = bp.side === 'home' ? ph : 1 - ph;
     } else if (bp.betType === 'total' && total != null) {
       const pOver = clamp(normalCdf((total - bp.line) / (TOTAL_SIGMA[sport?.id] || 10)));
@@ -3458,6 +3572,26 @@ function whatIfSandbox(g) {
   </details>`;
 }
 
+// 📐 alt-spread fair-price ladder (v15.2): prices a band of alternative lines around the
+// posted spread off the key-numbers PMF, so buying/selling points is priced in the same
+// steps the real margin distribution moves in (crossing 3 in the NFL is worth real cents;
+// crossing 5 is nearly free). Fair = no-vig — only take book numbers better than these.
+function altSpreadRow(g) {
+  const sport = SPORTS.find(s => s.id === g.sportId);
+  if (g.state !== 'pre' || !sport?.spreadSigma || !KEY_MARGIN_W[sport.id] || g.vegas?.spread == null) return '';
+  const homeSpread = g.vegas.favIsHome ? g.vegas.spread : -g.vegas.spread;
+  const sigma = sport.spreadSigma;
+  const pmf = marginPMF(sport.id, invNorm(clamp(g.model.home)) * sigma, sigma);
+  if (!pmf) return '';
+  const chips = [-2, -1, -0.5, 0.5, 1, 2].map(off => {
+    const alt = +(homeSpread + off).toFixed(1);
+    const p = pmfHomeCover(pmf, alt);
+    const lbl = alt === 0 ? 'PK' : (alt > 0 ? '+' : '') + alt;
+    return `${esc(g.home.abbr)} ${lbl} <b>${fmtML(probToAmerican(Math.min(0.97, Math.max(0.03, p))))}</b>`;
+  }).join(' · ');
+  return `<div class="bo-fair" title="Fair (no-vig) prices for alternative spreads, read off the empirical key-numbers margin PMF — margins cluster on structural numbers (3/7 in football, one-run baseball games), so moving the line across a key number changes the price in a step, not a straight line. Only pay for points that cross a key number, and only at a book price better than fair.">📐 alt spreads (fair): ${chips}</div>`;
+}
+
 function betBoard(g) {
   const extras = formSection(g) + propsSection(g) + h2hSection(g) + gamePropsSection(g);
   if (g.state !== 'pre') return extras ? `<div class="betboard">${extras}</div>` : '';
@@ -3477,6 +3611,7 @@ function betBoard(g) {
   return `<div class="betboard"><div class="bo-h">FULL BET BOARD</div>
     ${rows || '<div class="bo-row skip"><span class="bo-bet">no priced markets listed for this match</span></div>'}
     <div class="bo-fair">model's fair prices: ${esc(g.home.abbr)} ${fh} / ${esc(g.away.abbr)} ${fa}${fd} — only take better numbers than these</div>
+    ${altSpreadRow(g)}
     ${g.total ? `<div class="bo-fair">model total: ${g.total.exp.toFixed(1)} vs line ${g.total.line} → ${g.total.pOver >= 0.5 ? 'Over' : 'Under'} ${pct(Math.max(g.total.pOver, 1 - g.total.pOver))}${g.total.notes?.length ? ' · ' + esc(g.total.notes.join(' · ')) : ''}${g.wx ? ` · ${esc(g.wx.txt)}` : ''}</div>`
       : g.vegas?.ou ? `<div class="bo-fair">total: O/U ${g.vegas.ou}</div>` : ''}
     ${g.why?.length ? `<div class="bo-fair">drivers: ${esc(g.why.join(' · '))}</div>` : ''}
@@ -3520,9 +3655,14 @@ function teamRow(t, g, side) {
   const w5 = l5.filter(m => m > 0).length;
   const streakChip = l5.length === 5 && w5 >= 4 ? `<span class="injchip" title="${w5}-${5 - w5} last 5 — hot" style="color:var(--gold)">🔥</span>`
     : l5.length === 5 && w5 <= 1 ? `<span class="injchip" title="${w5}-${5 - w5} last 5 — ice cold" style="color:var(--accent2)">🥶</span>` : '';
+  // ⚡ sharp-steam vector (v15.2): the de-vigged line is moving toward this side fast enough
+  // right now that it reads as informed money, not drift — pulsing directional badge
+  const vel = g.state === 'pre' && typeof Open !== 'undefined' ? Open.velocity(g.sportId, g) : null;
+  const steamVec = vel && vel.side === side
+    ? `<span class="steamvec" title="SHARP STEAM: the de-vigged market moved ${(Math.abs(vel.dp) * 100).toFixed(1)} pts toward ${esc(t.abbr)} in the last ${vel.mins} min (${(Math.abs(vel.vpm) * 100).toFixed(2)}%/min). Velocity like this usually means sharp money or breaking news — the reaction window on a lagging price is closing.">▲▲</span>` : '';
   return `<div class="teamrow ${isWinner ? 'winner' : ''} ${isPicked ? 'picked' : ''}">
     ${teamLogo(t)}
-    <div><div class="tname">${esc(t.name)}${injChip}${b2bChip}${streakChip}</div><div class="trec">${esc(t.recSummary)}${eloStr}${esc(pit)}</div></div>
+    <div><div class="tname">${esc(t.name)}${injChip}${b2bChip}${streakChip}${steamVec}</div><div class="trec">${esc(t.recSummary)}${eloStr}${esc(pit)}</div></div>
     ${score}
   </div>`;
 }
@@ -3553,6 +3693,61 @@ function hedgePanel(g, sport) {
       <div class="hedge-calc" data-payout="${payout.toFixed(4)}" data-stake="${S}" data-p="${pSide.toFixed(4)}" data-opp="${esc(opp)}">live ${esc(opp)} price (Kalshi ¢ or book odds): <input class="hedge-odds" type="text" inputmode="numeric" placeholder="${fairCents}¢"><span class="hedge-out"></span></div>`;
   }).join('<div style="height:9px"></div>');
   return `<div class="hedge">${blocks}</div>`;
+}
+
+// 🧩 LAST-LEG PARLAY HEDGE OPTIMIZER (v15.2): an open multi-leg ticket where every settled
+// leg has cashed and exactly one still rides is THE guaranteed-profit spot. Full-equalizer
+// math is identical to the single-ticket hedge — H* = Payout ÷ d_opp — and any opposing
+// implied below 1 − stake/payout locks a risk-free profit no matter how the last leg lands.
+// current win prob of a pending leg's side, from today's loaded slate (Stern when live,
+// posterior model pregame; spread legs price off the key-numbers PMF)
+function legLiveProbNow(l, g, sport) {
+  if (l.bt === 'ml') {
+    const pH = g.state === 'in' ? liveProbs(g, sport).home : g.model.home;
+    return clamp(l.side === 'home' ? pH : 1 - pH, 0.01, 0.99);
+  }
+  if (g.state !== 'pre') return null;   // no live cover model for spread/total legs
+  if (l.bt === 'spread' && sport.spreadSigma) {
+    const sig = sport.spreadSigma, mu = invNorm(clamp(g.model.home)) * sig;
+    const pmf = marginPMF(sport.id, mu, sig);
+    const ph = pmf ? pmfHomeCover(pmf, l.hs || 0) : normalCdf((mu + (l.hs || 0)) / sig);
+    return clamp(l.side === 'home' ? ph : 1 - ph, 0.01, 0.99);
+  }
+  if (l.bt === 'total' && g.total?.exp != null && TOTAL_SIGMA[sport.id]) {
+    const pOver = clamp(normalCdf((g.total.exp - l.line) / TOTAL_SIGMA[sport.id]));
+    return clamp(l.side === 'over' ? pOver : 1 - pOver, 0.01, 0.99);
+  }
+  return null;
+}
+function parlayHedgeHtml(b) {
+  if (b.status !== 'open' || b.legs.length < 2) return '';
+  const pending = b.legs.filter(l => !l.res);
+  if (pending.length !== 1) return '';
+  const wonN = b.legs.filter(l => l.res === 'won').length;
+  if (!wonN) return '';                                  // nothing banked yet — nothing to lock
+  const last = pending[0];
+  if (!last.bt || last.b == null) return '';
+  // payout if the last leg hits: pushes drop out, winners multiply (standard parlay rules)
+  const D = b.legs.filter(l => l.res === 'won').reduce((d, l) => d * (1 + l.b), 1) * (1 + last.b);
+  const S = b.stake, payout = S * D;
+  const g = (state.lastEntries.get(last.k)?.events || []).find(x => String(x.id) === String(last.gid));
+  const sport = SPORTS.find(s => s.id === last.k);
+  const p = g && sport && !g.tennis && !(g.model?.draw > 0.05) ? legLiveProbNow(last, g, sport) : null;
+  const opp = last.bt === 'total' ? (last.side === 'over' ? 'the Under' : 'the Over')
+    : g ? (last.side === 'home' ? g.away.abbr : g.home.abbr) : 'the other side';
+  const bank = Number(localStorage.getItem('de-bank')) || 0;
+  const money = u => bank ? ` <span style="opacity:.7">($${(u * bank / 100).toFixed(0)})</span>` : '';
+  const be = 1 - S / payout;                             // break-even opposing implied for a risk-free lock
+  const fairC = p != null ? Math.round((1 - p) * 100) : null;
+  const lockedFair = p != null ? payout * p - S : null;  // lock at exactly-fair hedge odds
+  const fairBit = p != null
+    ? ` · model has your leg <b>${pct(p)}</b> · at fair (${fairC}¢): hedge <b>${(payout * (1 - p)).toFixed(2)}u</b>${money(payout * (1 - p))} → locks <b class="${lockedFair >= 0 ? 'ok' : 'bad'}">${lockedFair >= 0 ? '+' : ''}${lockedFair.toFixed(2)}u</b>${money(lockedFair)} either way`
+    : ' · game not on the loaded slate — type the live opposing price below';
+  return `<div class="hedge parlayhedge">
+    <div class="h-ttl">🧩 LAST-LEG HEDGE · ${wonN}/${b.legs.length} legs cashed · rides on ${esc(last.t)}</div>
+    <div>hits: <b>+${(payout - S).toFixed(2)}u</b>${money(payout - S)} · misses: <b class="bad">−${S}u</b> · any ${esc(opp)} price under <b>${Math.round(be * 100)}¢</b> / ${fmtML(probToAmerican(Math.min(0.98, Math.max(0.02, be))))} locks a <b>risk-free profit</b>${fairBit}</div>
+    <div class="hedge-calc" data-payout="${payout.toFixed(4)}" data-stake="${S}" data-p="${p != null ? p.toFixed(4) : ''}" data-opp="${esc(opp)}">live ${esc(opp)} price (Kalshi ¢ or book odds): <input class="hedge-odds" type="text" inputmode="numeric" placeholder="${fairC != null ? fairC + '¢' : '45¢ / -120'}"><span class="hedge-out"></span></div>
+  </div>`;
 }
 
 // One compact line under the verdict: projected final score (ball sports + soccer),
@@ -3946,7 +4141,7 @@ function renderMyBets() {
       return `<div class="h-date" style="margin-top:10px">RECORD ${mb.w}–${mb.l} · P/L ${mb.pnl >= 0 ? '+' : ''}${mb.pnl.toFixed(2)}u${dollars} · ROI ${mb.roi >= 0 ? '+' : ''}${mb.roi.toFixed(1)}% ${lineSparkline(mb.series)}</div>`;
     })() : ''}
     ${mb.clvN ? `<div class="bo-fair" style="margin-top:6px">📈 <b>CLV avg <span class="${mb.clvAvg >= 0 ? 'ok' : 'bad'}">${mb.clvAvg >= 0 ? '+' : ''}${mb.clvAvg.toFixed(2)}%</span></b> · beat the close ${mb.clvBeat}% of ${mb.clvN} tracked ${lineSparkline(mb.clvSeries)} — positive and rising means your entries consistently beat where the market closed (the surest sign you're genuinely +EV).</div>` : ''}
-    ${open.length ? `<div class="h-date" style="margin-top:8px">OPEN (${open.length})</div>` + open.map(row).join('') : ''}
+    ${open.length ? `<div class="h-date" style="margin-top:8px">OPEN (${open.length})</div>` + open.map(b => row(b) + parlayHedgeHtml(b)).join('') : ''}
     ${done.length ? `<div class="h-date" style="margin-top:8px">SETTLED</div>` + done.slice(0, 40).map(row).join('') : ''}
     ${!bets.length ? '<div class="h-empty">No bets logged yet — build a slip and hit "🎯 I bet this", or log one manually above.</div>' : ''}
   </div>`;
@@ -5117,7 +5312,8 @@ document.addEventListener('input', e => {
   const inp = e.target.closest('.hedge-odds');
   if (!inp) return;
   const box = inp.closest('.hedge-calc'), out = box.querySelector('.hedge-out');
-  const payout = +box.dataset.payout, S = +box.dataset.stake, p = +box.dataset.p, opp = box.dataset.opp || 'the other side';
+  const payout = +box.dataset.payout, S = +box.dataset.stake, opp = box.dataset.opp || 'the other side';
+  const p = box.dataset.p ? +box.dataset.p : null;   // model prob may be absent (parlay leg off-slate)
   const raw = (inp.value || '').trim();
   const num = parseFloat(raw.replace(/[^0-9.+-]/g, ''));
   if (!num) { out.innerHTML = ''; return; }
@@ -5136,9 +5332,13 @@ document.addEventListener('input', e => {
   const locked = payout - S - H;                         // guaranteed profit either way
   const bank = Number(localStorage.getItem('de-bank')) || 0;
   const money = u => bank ? ` ($${(u * bank / 100).toFixed(0)})` : '';
-  const good = oppImp <= (1 - p) + 1e-9;                 // opposing price at/below fair → cheap hedge
-  const edge = p - (1 - oppImp);                         // your side model prob vs its market implied
-  out.innerHTML = ` → hedge <b>${H.toFixed(2)}u</b>${money(H)} on ${esc(opp)} @ ${priceLabel}, locks <b class="${locked >= 0 ? 'ok' : 'bad'}">${locked >= 0 ? '+' : ''}${locked.toFixed(2)}u</b>${money(locked)} · <span class="${good ? 'ok' : 'bad'}">${good ? '✓ beats fair' : '✗ below fair'}</span> · your side <span class="${edge >= 0 ? 'ok' : 'bad'}">${edge >= 0 ? '+' : ''}${(edge * 100).toFixed(0)}%</span> vs mkt`;
+  let fairBit = '';
+  if (p != null) {
+    const good = oppImp <= (1 - p) + 1e-9;               // opposing price at/below fair → cheap hedge
+    const edge = p - (1 - oppImp);                       // your side model prob vs its market implied
+    fairBit = ` · <span class="${good ? 'ok' : 'bad'}">${good ? '✓ beats fair' : '✗ below fair'}</span> · your side <span class="${edge >= 0 ? 'ok' : 'bad'}">${edge >= 0 ? '+' : ''}${(edge * 100).toFixed(0)}%</span> vs mkt`;
+  }
+  out.innerHTML = ` → hedge <b>${H.toFixed(2)}u</b>${money(H)} on ${esc(opp)} @ ${priceLabel}, locks <b class="${locked >= 0 ? 'ok' : 'bad'}">${locked >= 0 ? '+' : ''}${locked.toFixed(2)}u</b>${money(locked)}${fairBit}`;
 });
 
 // keyboard: ←/→ dates · t today · r refresh · 1-9 tabs (1 = The Card)
