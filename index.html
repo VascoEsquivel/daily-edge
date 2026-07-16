@@ -493,6 +493,29 @@
   .le-in { display: inline-flex; align-items: center; gap: 5px; flex-wrap: wrap; }
   .le-note { margin-top: 5px; font-size: 10px; opacity: .75; }
   .le-quote { font-size: 10.5px; color: #9fc1ff; }
+  /* 📈 player form explorer */
+  .fxwrap:not(:empty) {
+    margin: 8px 0; padding: 10px 12px; border-radius: 12px;
+    background: rgba(20, 40, 80, .25); border: 1px solid rgba(110, 140, 220, .35);
+    font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted);
+  }
+  .fx-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+  .fx-head b { color: var(--text); }
+  .fx-x { margin-left: auto; background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 6px; padding: 1px 7px; cursor: pointer; font-size: 11px; }
+  .fx-pills { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+  .fx-stat {
+    background: var(--bg2); border: 1px solid var(--border); color: var(--muted);
+    border-radius: 999px; padding: 2px 9px; font-size: 10px; font-weight: 700; cursor: pointer;
+  }
+  .fx-stat.on { color: var(--text); border-color: rgba(110, 200, 160, .55); background: rgba(30, 120, 90, .16); }
+  .fx-ctl { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
+  .fx-ctl input { width: 62px; background: rgba(10, 16, 32, .6); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 3px 6px; font-family: inherit; font-size: 11.5px; }
+  .fx-step { background: var(--bg2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; width: 24px; height: 24px; cursor: pointer; font-size: 13px; line-height: 1; }
+  .fx-hits { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 6px; }
+  .fx-hit b { color: var(--text); }
+  .fx-k { font-size: 9.5px; opacity: .75; letter-spacing: .3px; }
+  .fx-open { cursor: pointer; }
+  .fx-open:hover { text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
   /* 📰 news-driven prop angle */
   .newsangle {
     margin: 7px 0; padding: 8px 11px; border-radius: 10px;
@@ -884,7 +907,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v15.6';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v15.7';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -2462,7 +2485,8 @@ function gamelogVal(statId, labels, stats) {
     return [h, d, t, hr].some(x => x == null) ? null : h + d + 2 * t + 3 * hr;
   }
   const LBL = { pts: ['PTS'], reb: ['REB'], ast: ['AST'], threes: ['3PT'],
-                hits: ['H'], rbi: ['RBI'], ks: ['K', 'SO'], sog: ['SOG', 'S'], goals: ['G'] };
+                hits: ['H'], rbi: ['RBI'], ks: ['K', 'SO'], sog: ['SOG', 'S'], goals: ['G'],
+                hr: ['HR'], runs: ['R'], sb: ['SB'] };
   const idx = (LBL[statId] || []).map(k => labels.indexOf(k)).find(i => i >= 0);
   if (idx == null) return null;
   const v = parseFloat(String(stats[idx] ?? '').split('-')[0]);
@@ -2490,8 +2514,8 @@ function fetchGameProps(sport, ev) {
           fetch(`${V3_API}/${sport.path}/athletes/${a.id}/stats`).then(x => x.json()).catch(() => null),
           fetchGameLog(sport, a.id),
         ]);
-        info.set(r, { name: a.displayName || a.shortName || '?', v3, gl });
-      } catch { info.set(r, { name: '?', v3: null, gl: null }); }
+        info.set(r, { name: a.displayName || a.shortName || '?', aid: a.id, v3, gl });
+      } catch { info.set(r, { name: '?', aid: null, v3: null, gl: null }); }
     }));
     return items.map(it => {
       const m = PROP_TYPE_MAP[it.type.name];
@@ -2515,7 +2539,7 @@ function fetchGameProps(sport, ev) {
           recent = s / sw;
         }
       }
-      return { player: meta.name, statId: m.stat, threshold, american, imp: mlToProb(american), avg, recent, l10 };
+      return { player: meta.name, aid: meta.aid, statId: m.stat, threshold, american, imp: mlToProb(american), avg, recent, l10 };
     }).filter(Boolean)
       // the feed can list the same line twice (multiple providers) — keep the first
       .filter((x, i, arr) => arr.findIndex(y => y.player === x.player && y.statId === x.statId && y.threshold === x.threshold) === i);
@@ -2960,6 +2984,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         cat: L.shortDisplayName || L.abbreviation || L.name || '',
         name: L.leaders?.[0]?.athlete?.shortName || '',
         val: L.leaders?.[0]?.displayValue || '',
+        id: L.leaders?.[0]?.athlete?.id || null,   // → tap-to-open form-vs-line explorer
       })).filter(x => x.name);
       const q = noLearn ? null : quality?.get(String(c.team?.id));
       const xwBat = savant?.bat.get(c.team?.abbreviation) ?? savant?.bat.get((c.team?.shortDisplayName || '').toLowerCase());
@@ -3615,13 +3640,116 @@ function formSection(g) {
   return `<div class="bo-h" style="margin-top:13px">RECENT FORM · margin per game</div>${row(g.away, eA)}${row(g.home, eH)}`;
 }
 
+// ── 📈 Player Form Explorer (v15.7) ──────────────────────────────────────
+// Tap any player (leader chip or prop card name) → their recent game log charted
+// against ANY line you pick: green bars cleared it, red bars missed, with L5/L10/all
+// hit rates, weighted-recent form and the raw-frequency fair Kalshi price. The point:
+// "how often has Citron actually hit 15+?" answered in one tap, on real games.
+const FX_STATS = [
+  ['pts', 'PTS'], ['reb', 'REB'], ['ast', 'AST'], ['threes', '3PT'],
+  ['hits', 'H'], ['tb', 'TB'], ['hr', 'HR'], ['rbi', 'RBI'], ['runs', 'R'], ['sb', 'SB'], ['ks', 'K'],
+  ['sog', 'SOG'], ['goals', 'G'],
+];
+function fxStatFromCat(cat) {
+  const c = String(cat || '').toLowerCase();
+  if (/reb|rpg/.test(c)) return 'reb';
+  if (/ast|apg|assist/.test(c)) return 'ast';
+  if (/hr|home/.test(c)) return 'hr';
+  if (/rbi/.test(c)) return 'rbi';
+  if (/avg|\bba\b|hit/.test(c)) return 'hits';
+  if (/strikeout|\bk\b|\bso\b|era/.test(c)) return 'ks';
+  if (/goal/.test(c)) return 'goals';
+  if (/save|shot|sog/.test(c)) return 'sog';
+  return 'pts';
+}
+function fxVals(wrap, gl) {
+  return gl.rows.map(r => gamelogVal(wrap.dataset.stat, gl.labels, r.stats)).filter(v => v != null).slice(0, 20);
+}
+function fxChart(vals, line) {   // newest-first in, oldest-left out
+  const v = vals.slice(0, 15).reverse();
+  if (!v.length) return '<div class="bo-fair">no games for this stat</div>';
+  const W = 330, H = 76, max = Math.max(line + 1, ...v, 1) * 1.18;
+  const bw = W / v.length;
+  const bars = v.map((x, i) => {
+    const h = Math.max(2, x / max * (H - 15));
+    return `<rect x="${(i * bw + 1.5).toFixed(1)}" y="${(H - h).toFixed(1)}" width="${Math.max(2, bw - 3).toFixed(1)}" height="${h.toFixed(1)}" rx="2"
+        fill="${x >= line ? 'rgba(0,255,136,.72)' : 'rgba(255,77,109,.62)'}"><title>${x}</title></rect>
+      <text x="${(i * bw + bw / 2).toFixed(1)}" y="${(H - h - 3).toFixed(1)}" text-anchor="middle" font-size="7.5" fill="rgba(200,215,240,.8)">${x}</text>`;
+  }).join('');
+  const y = Math.max(8, H - line / max * (H - 15));
+  return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="max-width:100%">
+    ${bars}
+    <line x1="0" y1="${y.toFixed(1)}" x2="${W}" y2="${y.toFixed(1)}" stroke="#ffd75e" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <text x="${W - 2}" y="${(y - 3).toFixed(1)}" text-anchor="end" font-size="8.5" fill="#ffd75e">${line}</text>
+  </svg>`;
+}
+function fxUpdate(wrap, gl) {
+  const line = parseFloat(wrap.dataset.line);
+  const vals = fxVals(wrap, gl);
+  const chart = wrap.querySelector('.fx-chart'), hits = wrap.querySelector('.fx-hits'), fair = wrap.querySelector('.fx-fair');
+  if (!vals.length) { if (chart) chart.innerHTML = '<div class="bo-fair">no games logged for this stat</div>'; if (hits) hits.innerHTML = ''; if (fair) fair.innerHTML = ''; return; }
+  const seg = n => { const v = vals.slice(0, n); const h = v.filter(x => x >= line).length; return { h, n: v.length }; };
+  const L5 = seg(5), L10 = seg(10), all = seg(vals.length);
+  const cls = s => s.h / s.n >= 0.6 ? 'ok' : s.h / s.n <= 0.4 ? 'bad' : '';
+  const fmt = (lbl, s) => `<span class="fx-hit"><span class="fx-k">${lbl}</span> <b class="${cls(s)}">${s.h}/${s.n}</b> <span class="fx-k">(${Math.round(s.h / s.n * 100)}%)</span></span>`;
+  const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+  let s = 0, sw = 0; vals.forEach((v, i) => { const w = 0.85 ** i; s += w * v; sw += w; });
+  const ewma = s / sw;
+  let streak = 0;
+  for (const v of vals) { const hit = v >= line; if (!streak) streak = hit ? 1 : -1; else if (hit === streak > 0) streak += hit ? 1 : -1; else break; }
+  if (chart) chart.innerHTML = fxChart(vals, line);
+  if (hits) hits.innerHTML = fmt('L5', L5) + fmt('L10', L10) + fmt('all ' + all.n, all)
+    + `<span class="fx-hit"><span class="fx-k">avg</span> <b>${avg.toFixed(1)}</b></span>`
+    + `<span class="fx-hit"><span class="fx-k">recent (wtd)</span> <b>${ewma.toFixed(1)}</b>${ewma >= avg * 1.15 ? ' 🔥' : ewma <= avg * 0.85 ? ' 🥶' : ''}</span>`
+    + (Math.abs(streak) >= 3 ? `<span class="fx-hit"><b class="${streak > 0 ? 'ok' : 'bad'}">${Math.abs(streak)} straight ${streak > 0 ? 'hits' : 'misses'}</b></span>` : '');
+  if (fair) fair.innerHTML = `raw L10 frequency prices OVER ${line} at <b>${Math.round(L10.h / L10.n * 100)}¢</b> Kalshi — a lens, not a lock: ${L10.n}-game samples swing hard, and books shade for matchup/minutes news this chart can't see.`;
+}
+function renderFx(wrap, gl, stat, line, avail) {
+  wrap.dataset.stat = stat;
+  if (line == null || isNaN(line)) {
+    const vals = fxVals(wrap, gl);
+    const avg = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0.5;
+    line = Math.floor(avg) + 0.5;
+  }
+  wrap.dataset.line = line;
+  wrap.innerHTML = `<div class="fx-head"><b>📈 ${esc(wrap.dataset.name)}</b>
+      <span class="fx-pills">${avail.map(([id, lbl]) => `<button class="fx-stat ${id === stat ? 'on' : ''}" data-fs="${id}">${lbl}</button>`).join('')}</span>
+      <button class="fx-x" title="close">✕</button></div>
+    <div class="fx-ctl">line <button class="fx-step" data-d="-0.5">−</button><input class="fx-line" type="number" step="0.5" value="${line}"><button class="fx-step" data-d="0.5">+</button>
+      <span class="fx-k">green = hit (≥ line) · newest game on the right</span></div>
+    <div class="fx-chart"></div>
+    <div class="fx-hits"></div>
+    <div class="bo-fair fx-fair" style="margin-top:4px"></div>`;
+  fxUpdate(wrap, gl);
+}
+function fxAvail(gl) {
+  return FX_STATS.filter(([id]) => gl.rows.slice(0, 6).filter(row => gamelogVal(id, gl.labels, row.stats) != null).length >= 3);
+}
+async function openFormExplorer(wrap, d) {
+  const sport = SPORTS.find(s => s.id === d.k);
+  if (!sport || !d.aid) return;
+  wrap.innerHTML = '<div class="loading" style="padding:10px"><div class="spinner"></div>pulling the game log…</div>';
+  wrap.dataset.aid = d.aid; wrap.dataset.k = d.k; wrap.dataset.name = d.name || 'player';
+  const gl = await fetchGameLog(sport, d.aid);
+  if (!gl || !gl.rows.length) { wrap.innerHTML = `<div class="bo-fair">no game log available for ${esc(d.name || 'this player')}</div>`; return; }
+  const avail = fxAvail(gl);
+  if (!avail.length) { wrap.innerHTML = `<div class="bo-fair">no chartable stats in ${esc(d.name || '')}'s log</div>`; return; }
+  const stat = avail.some(([id]) => id === d.stat) ? d.stat : avail[0][0];
+  renderFx(wrap, gl, stat, d.line ? parseFloat(d.line) : null, avail);
+}
+function refx(wrap, stat, line) {
+  const sport = SPORTS.find(s => s.id === wrap.dataset.k);
+  if (!sport) return;
+  fetchGameLog(sport, wrap.dataset.aid).then(gl => { if (gl) renderFx(wrap, gl, stat, line, fxAvail(gl)); });
+}
+
 function propsSection(g) {
   const row = t => {
-    const chips = (t.leaders || []).map(l => `<span class="prop-chip">${esc(l.name)} · ${esc(l.cat)} ${esc(l.val)}</span>`).join('');
+    const chips = (t.leaders || []).map(l => `<span class="prop-chip${l.id ? ' fx-open' : ''}"${l.id ? ` data-aid="${l.id}" data-k="${g.sportId}" data-name="${esc(l.name)}" data-stat="${fxStatFromCat(l.cat)}" title="tap: chart ${esc(l.name)}'s recent games against any line"` : ''}>${esc(l.name)} · ${esc(l.cat)} ${esc(l.val)}${l.id ? ' 📈' : ''}</span>`).join('');
     return chips ? `<div class="prop-row"><b>${esc(t.abbr)}</b>${chips}</div>` : '';
   };
   const html = newsAngleRow(g) + row(g.away) + row(g.home);
-  return html ? `<div class="bo-h" style="margin-top:13px">PROP ANGLES · team leaders</div>${html}` : '';
+  return html ? `<div class="bo-h" style="margin-top:13px">PROP ANGLES · team leaders — tap a player to chart their form vs a line</div><div class="fxwrap"></div>${html}` : '';
 }
 
 // last meetings between the two sides, straight from the brain's absorbed-results log
@@ -3702,10 +3830,10 @@ function renderCardProps(g, items, pg) {
         : `<span class="l10bar"><i class="${barCls}" style="width:${Math.round(rate * 100)}%"></i></span><span class="pp-l10">${x.l10.hit}/${x.l10.n}</span>`;
       return `<span class="pp-line" title="market ${pct(x.imp)}${x.over != null ? ' · model ' + pct(x.over) : ''}${x.l10 ? ` · cleared this line in ${x.l10.hit} of his last ${x.l10.n} games` : ''}"><b>${thrTxt(x.threshold)} ${esc(x.statId)}</b>${x.over != null ? `<span class="pp-model">${pct(x.over)}</span>` : ''}${bar}</span>`;
     }).join('');
-    return `<div class="pp-player"><div class="pp-head"><span class="pp-name">${esc(pl.name)}</span><span class="pp-form">${form}</span></div><div class="pp-lines">${chips}</div></div>`;
+    return `<div class="pp-player"><div class="pp-head"><span class="pp-name${a0.aid ? ' fx-open' : ''}"${a0.aid ? ` data-aid="${a0.aid}" data-k="${g.sportId}" data-name="${esc(pl.name)}" data-stat="${esc(a0.statId)}" data-line="${a0.threshold}" title="tap: chart ${esc(pl.name)}'s recent games against any line"` : ''}>${esc(pl.name)}${a0.aid ? ' 📈' : ''}</span><span class="pp-form">${form}</span></div><div class="pp-lines">${chips}</div></div>`;
   }).join('');
   return `<div class="bo-fair" style="margin-bottom:4px">📊 biggest model-vs-market gaps — spots to <b>investigate</b>, not locks</div>${top}
-    <div class="bo-h" style="margin-top:10px;color:var(--text)">player lines · season &amp; recent rates · L10 = games he actually cleared it</div>${plHtml}
+    <div class="bo-h" style="margin-top:10px;color:var(--text)">player lines · season &amp; recent rates · L10 = games he actually cleared it — tap a name to chart form vs any line</div><div class="fxwrap"></div>${plHtml}
     <div class="bo-fair">Real milestone lines ("X+" = reach X). Model % = the market's own price re-shaped by his form (EWMA last-10 vs season, mean capped ±10%, hot/cold widens the tail)${items[0]?.env && Math.abs(items[0].env - 1) >= 0.02 ? ` · 🌡️ game environment ×${items[0].env.toFixed(2)} baked in` : ''}; L10 = how often he actually cleared that exact line. "+ slip" adds a vetted leg.</div>`;
 }
 
@@ -5513,6 +5641,26 @@ function contentClick(e) {
     if (fb.dataset.s) state.sort = fb.dataset.s;
     renderActive(); return;
   }
+  // 📈 form explorer: open on a tapped player; steppers/pills re-render it in place
+  const fxx = e.target.closest('.fx-x');
+  if (fxx) { const w = fxx.closest('.fxwrap'); if (w) w.innerHTML = ''; return; }
+  const fxs = e.target.closest('.fx-stat');
+  if (fxs) { refx(fxs.closest('.fxwrap'), fxs.dataset.fs, null); return; }
+  const fstep = e.target.closest('.fx-step');
+  if (fstep) {
+    const wrap = fstep.closest('.fxwrap'), inp = wrap.querySelector('.fx-line');
+    const nv = (parseFloat(inp.value) || 0) + parseFloat(fstep.dataset.d);
+    inp.value = nv; wrap.dataset.line = nv;
+    const sport = SPORTS.find(s => s.id === wrap.dataset.k);
+    if (sport) fetchGameLog(sport, wrap.dataset.aid).then(gl => gl && fxUpdate(wrap, gl));
+    return;
+  }
+  const fx = e.target.closest('.fx-open');
+  if (fx) {
+    const wrap = fx.closest('.cardprops, .betboard, .fs-body')?.querySelector('.fxwrap');
+    if (wrap) { openFormExplorer(wrap, fx.dataset); wrap.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+    return;
+  }
   const hero = e.target.closest('.hero');
   if (hero?.dataset.id) { Focus.open(hero.dataset.k, hero.dataset.id); return; }
   // (v15.3) a tap on a game opens the focused GAME SHEET overlay (board/props/form/sandbox
@@ -5524,6 +5672,16 @@ function contentClick(e) {
 $('#content').addEventListener('click', contentClick);
 function contentInput(e) {
   if (e.target.id === 'gamesearch') { state.query = e.target.value; applySearch(); return; }
+  // 📈 form explorer line input: recompute chart + hit rates in place (input keeps focus)
+  const fl = e.target.closest('.fx-line');
+  if (fl) {
+    const wrap = fl.closest('.fxwrap'), line = parseFloat(fl.value);
+    if (!wrap || isNaN(line)) return;
+    wrap.dataset.line = line;
+    const sport = SPORTS.find(s => s.id === wrap.dataset.k);
+    if (sport) fetchGameLog(sport, wrap.dataset.aid).then(gl => gl && fxUpdate(wrap, gl));
+    return;
+  }
   // 🎛️ What-If sandbox: live-recompute win%, projected total, and Kelly stake on drag.
   // O(1) math + a handful of text updates → no re-render, no lag; a brief pulse animates it.
   const sl = e.target.closest('.wi-slider');
