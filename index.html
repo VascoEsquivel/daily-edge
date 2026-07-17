@@ -493,6 +493,11 @@
   .le-in { display: inline-flex; align-items: center; gap: 5px; flex-wrap: wrap; }
   .le-note { margin-top: 5px; font-size: 10px; opacity: .75; }
   .le-quote { font-size: 10.5px; color: #9fc1ff; }
+  .steamact {
+    margin-top: 7px; padding: 7px 10px; border-radius: 10px; font-size: 11px; line-height: 1.6;
+    background: rgba(255, 170, 40, .08); border: 1px solid rgba(255, 180, 40, .32); color: var(--muted);
+  }
+  .steamact b { color: #ffd75e; }
   /* 📈 player form explorer */
   .fxwrap:not(:empty) {
     margin: 8px 0; padding: 10px 12px; border-radius: 12px;
@@ -917,7 +922,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v15.8';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v15.9';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1401,6 +1406,10 @@ const Brain = (() => {
   db.edge = db.edge || {};   // per-sport Brier of market prior (mkt) vs our posterior (mdl) — edge trust
   db.mmaMethod = db.mmaMethod || {};   // per-weight-class actual finish mix {ko, sub, dec, n}
   db.margins = db.margins || {};       // per-sport actual |margin| tally vs Normal expectation — learned key numbers
+  // (v15.9) one-time reset: totalsBias was learned against projections carrying the
+  // injury double-count (wnba had drifted to −11 pts). The model changed, so the bias
+  // restarts clean and re-learns against the corrected totals.
+  if (!db.tbV2) { db.totalsBias = {}; db.tbV2 = 1; }
   const cutoff = ymd(new Date(Date.now() - 60 * 864e5));
   for (const k in db.processed) if (db.processed[k] < cutoff) delete db.processed[k];
   for (const k in db.learned) if (db.learned[k] < cutoff) delete db.learned[k];
@@ -3060,6 +3069,11 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
       if (!t.inj) return;
       const mult = x => leaderMult(t.leaders, x.name);
       t.injEff = t.inj.list.reduce((s, x) => s + (x.dtd ? 0.4 : 1) * mult(x), 0);
+      // totals-only injury load (v15.9): a player who's been OUT for weeks is already
+      // priced into the team's season scoring rate — re-subtracting him double-counts.
+      // Day-to-day tags are the FRESH news, so for the TOTAL they get full weight and
+      // long-term absences only 25% residual.
+      t.injT = t.inj.list.reduce((s, x) => s + (x.dtd ? 1 : 0.25) * mult(x), 0);
       t.injStar = t.inj.list.some(x => mult(x) > 1);
       t.injTitle = t.inj.list.slice(0, 8).map(x => (mult(x) > 1 ? '⭐ ' : '') + x.display).join('\n');
     });
@@ -3256,12 +3270,15 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         }
         if (wx && /rain|shower|storm|drizzle/i.test(wx.txt)) { exp -= 0.25; notes.push('rain → under'); }
       }
-      // injuries & fatigue suppress scoring — a key player out or tired legs lower output,
-      // dragging the total down. The margin already reflects WHO is hurt (via the win-prob
-      // shift above); here we only move the sum, so there's no double-count.
+      // injuries & fatigue suppress scoring — but only FRESH absences move the total.
+      // (v15.9 fix) The old version subtracted the ENTIRE IL at full weight, but a
+      // player out for weeks is already in the team's season scoring average — that
+      // double-count was knocking 4+ runs off 8-run games and turning whole slates
+      // into under parades (found live 7/17: 15 of 15 total picks under). Now: the
+      // dtd-weighted fresh load (t.injT) drives it, capped at half a sigma.
       const injPts = INJ_TOTAL_PTS[sport.id] || 0;
-      if (injPts && (home.injEff || away.injEff)) {
-        const drop = ((home.injEff || 0) + (away.injEff || 0)) * injPts;
+      if (injPts && (home.injT || away.injT)) {
+        const drop = Math.min(TOTAL_SIGMA[sport.id] * 0.5, ((home.injT || 0) + (away.injT || 0)) * injPts);
         exp -= drop;
         if (drop >= TOTAL_SIGMA[sport.id] * 0.10) notes.push(`injuries → under (−${drop.toFixed(1)})`);
       }
@@ -3890,6 +3907,12 @@ async function fxPicker(wrap, gl) {
       ? `<div class="fx-best">✋ no quoted edge ≥5% right now${clean ? ` — cleanest structural over is <b>${clean.thr}+</b> (fair ${clean.fair}¢): take YES only below fair` : ''}</div>`
       : `<div class="fx-best">${clean ? `cleanest over: <b>${clean.thr}+</b> at fair <b>${clean.fair}¢</b> — take YES under that, or NO above <b>${100 - clean.fair}¢</b>` : 'no clean line — sit this one'}${Kalshi.proxy() ? '' : ' · connect the Kalshi proxy for real ladders + quotes'}</div>`;
   }
+  // 2+ prop-under signals stacking → always surface the concrete NO-side action,
+  // quotes or not (this is the "when is the under valuable" answer, made executable)
+  if (sigs.length >= 2 && !verdict.includes('UNDER')) {
+    const uRung = graded.filter(x => x.p <= 0.55).sort((a, b) => b.p - a.p)[0] || graded[graded.length - 1];
+    if (uRung) verdict += `<div class="fx-best" style="color:#ff9db0">🔻 UNDER ANGLE (${sigs.length} signals stacking): <b>NO on ${esc(name)} ${uRung.thr}+</b> — model has the under ${pct(1 - uRung.p)}, fair NO ${100 - uRung.fair}¢${uRung.underCost ? ` · Kalshi NO ${uRung.underCost}¢ → ${uRung.evU >= 0 ? '+' : ''}${Math.round(uRung.evU * 100)}% EV` : ' — only pay less than fair'}</div>`;
+  }
   const underBlock = `<div class="fx-sigs"><span class="fx-k">📉 UNDER SIGNALS (${sigs.length})</span>${sigs.length
     ? sigs.map(x => `<div class="fx-sig">${x}</div>`).join('')
     : '<div class="fx-sig" style="opacity:.6">none firing — no systematic under case beyond price</div>'}
@@ -4389,6 +4412,30 @@ function gameCard(g, i, sport, bare = false) {   // bare = focus-sheet header (n
       steamBadge = `<span class="steam" title="The de-vigged market has moved ${(Math.abs(mv) * 100).toFixed(1)}% toward ${esc(side)} since it opened — the book is repricing on new information (injury, lineup, sharp action). This is a line-move signal on our single feed, not a guaranteed arbitrage. If you like ${esc(side)}, the price is still catching up.">⚡ MARKET STEAM · ${esc(side)} +${(Math.abs(mv) * 100).toFixed(1)}%</span>`;
     }
   }
+  // ⚡→🎯 steam ACTION strip (v15.9): when the line-move badge fires, translate it into
+  // plain English — what moved, whether the NEW price still holds value vs the model,
+  // and the concrete action (act now / value flipped to the other side / already priced in).
+  let steamAct = '';
+  if (steamBadge) {
+    const mv = g.vegas.homeProb - opened.mp;
+    const toward = mv > 0 ? 'home' : 'away';
+    const tAbbr = g[toward].abbr, oAbbr = g[toward === 'home' ? 'away' : 'home'].abbr;
+    const mktT = toward === 'home' ? g.vegas.homeProb : 1 - g.vegas.homeProb;
+    const modelT = clamp(toward === 'home' ? g.model.home : 1 - g.model.home);
+    const c = x => Math.round(x * 100);
+    let read, act;
+    if (modelT - mktT >= 0.02) {
+      read = `the price still hasn't caught the model (${esc(tAbbr)} model ${c(modelT)}% vs market ${c(mktT)}¢)`;
+      act = `✅ if you want ${esc(tAbbr)}, act NOW — anything ≤${c(modelT)}¢ is value, and waiting costs cents`;
+    } else if ((1 - modelT) - (1 - mktT) >= 0.02) {
+      read = `the move OVERSHOT the model (${esc(tAbbr)} model ${c(modelT)}% but the market now asks ${c(mktT)}¢)`;
+      act = `🔻 value flipped to <b>${esc(oAbbr)}</b>: worth ≤${c(1 - modelT)}¢, market prices it ${c(1 - mktT)}¢. Don't chase ${esc(tAbbr)} at the worse number`;
+    } else {
+      read = `the new price ≈ the model (${esc(tAbbr)} ${c(modelT)}% vs ${c(mktT)}¢) — the news is already priced in`;
+      act = `✋ no action — chasing a finished move just buys the worst number of the day`;
+    }
+    steamAct = `<div class="steamact">⚡ line moved <b>${(Math.abs(mv) * 100).toFixed(1)}¢ toward ${esc(tAbbr)}</b>${moved ? ` (${esc(opened.d)} → ${esc(g.vegas.detail)})` : ''} — ${read}. <b>${act}</b></div>`;
+  }
   // 💹 pregame Kalshi value chip (v15.6): the model's pick side priced against Kalshi's
   // actual ask, live through the proxy. +3¢ or better vs the model's fair = highlighted.
   let kalshiChip = '';
@@ -4449,6 +4496,7 @@ function gameCard(g, i, sport, bare = false) {   // bare = focus-sheet header (n
     ${probLabels(g, lp)}
     ${liveLine}
     <div class="g-verdict">${verdict}${vegasStr}${steamBadge}${kalshiChip}</div>
+    ${steamAct}
     ${suggestedStrip(g)}
     ${live ? hedgePanel(g, sport) + liveEdgePanel(g, sport, lp) : ''}
     ${projLineHtml(g)}
@@ -5096,12 +5144,22 @@ function renderCard(allEvents) {
     .sort((a, b) => b.start - a.start);
   const sec = (title, arr) => arr.length
     ? `<div class="section-h">${title}</div><div class="games" style="margin-bottom:24px">${arr.map((g, i) => gameCard(g, i, bySport[g.sportId])).join('')}</div>` : '';
+  // ⚖️ one-sided-slate check (v15.9): when nearly every totals pick reads the same way,
+  // say so out loud — a shared driver means the picks are CORRELATED, not independent edges
+  let leanNote = '';
+  const tPicks = evsAll.filter(g => g.bp.betType === 'total');
+  if (tPicks.length >= 3) {
+    const u = tPicks.filter(g => g.bp.side === 'under').length;
+    const dom = Math.max(u, tPicks.length - u), side = u >= tPicks.length - u ? 'UNDER' : 'OVER';
+    if (dom / tPicks.length >= 0.75) leanNote = `<div class="bo-fair" style="margin:6px 2px 10px">⚖️ <b>slate lean check:</b> ${dom} of ${tPicks.length} totals read ${side} — one shared driver (injuries, weather, a learned bias) is pushing them all the same way. These are CORRELATED, not ${dom} independent edges: take the 1–2 strongest, not the whole set.</div>`;
+  }
   const body = sec('💰 +EV plays — 🎓 A-grades first, then by edge', evs)
     + sec('● Live right now', live)
     + sec('⭐ Settled — the day\'s receipts', settled)
     + sec('🔒 Confidence board — big favorites, no priced edge', locks);
   $('#content').innerHTML = summaryBar(allEvents)
     + filterRow
+    + leanNote
     + slateSimSection(evs)
     + `<div id="pgen-wrap">${parlaySection()}</div>`
     + (body || '<div class="empty"><div class="big">😴</div>Nothing on the card yet — check back closer to game time.</div>');
