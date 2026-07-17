@@ -516,6 +516,16 @@
   .fx-k { font-size: 9.5px; opacity: .75; letter-spacing: .3px; }
   .fx-open { cursor: pointer; }
   .fx-open:hover { text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
+  .fx-lrow {
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    padding: 4px 8px; border-radius: 7px; margin: 2px 0; background: rgba(10, 18, 36, .45);
+  }
+  .fx-lrow b { color: var(--text); min-width: 30px; }
+  .fx-best { margin-top: 6px; padding: 6px 9px; border-radius: 8px; background: rgba(20, 36, 70, .5); border: 1px solid var(--border); }
+  .fx-best.ok { border-color: rgba(60, 220, 140, .45); }
+  .fx-best b { color: var(--text); }
+  .fx-sigs { margin-top: 7px; padding: 7px 9px; border-radius: 9px; background: rgba(120, 60, 60, .10); border: 1px solid rgba(255, 120, 120, .25); }
+  .fx-sig { margin: 3px 0; font-size: 10.5px; color: #ffb9c4; }
   /* 📰 news-driven prop angle */
   .newsangle {
     margin: 7px 0; padding: 8px 11px; border-radius: 10px;
@@ -907,7 +917,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v15.7';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v15.8';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1947,23 +1957,35 @@ const Kalshi = (() => {
   const KEY = 'de-kalshi-proxy';
   const SERIES = { mlb: 'KXMLBGAME', wnba: 'KXWNBAGAME', nba: 'KXNBAGAME', nhl: 'KXNHLGAME',
                    nfl: 'KXNFLGAME', mma: 'KXUFCFIGHT' };
-  const cache = new Map();   // sportId → { t, events }
+  // per-game PLAYER milestone series (probed live: markets titled "Player: 15+", one per
+  // player-threshold, ladders like 10+/15+/20+) — powers the prop LINE PICKER
+  const PROP_SERIES = {
+    wnba: { pts: 'KXWNBAPTS', reb: 'KXWNBAREB', ast: 'KXWNBAAST', threes: 'KXWNBA3PT' },
+    nba:  { pts: 'KXNBAPTS', reb: 'KXNBAREB', ast: 'KXNBAAST', threes: 'KXNBA3PT' },
+    mlb:  { hits: 'KXMLBHIT', hr: 'KXMLBHR', rbi: 'KXMLBRBI', tb: 'KXMLBTB', ks: 'KXMLBKS' },
+  };
+  const cache = new Map();   // series ticker → { t, events }
   const base = () => (localStorage.getItem(KEY) || '').trim().replace(/\/+$/, '');
   const MON = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
   const dayCode = d => String(d.getFullYear() % 100).padStart(2, '0') + MON[d.getMonth()] + String(d.getDate()).padStart(2, '0');
   const words = s => String(s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(w => w.length > 1);
   const overlap = (a, B) => a.filter(w => B.has(w)).length;
-  async function eventsFor(sportId) {
-    if (!SERIES[sportId] || !base()) return null;
-    const c = cache.get(sportId);
+  async function seriesEvents(series) {
+    if (!series || !base()) return null;
+    const c = cache.get(series);
     if (c && Date.now() - c.t < 45000) return c.events;
     try {
-      const r = await fetch(`${base()}/trade-api/v2/events?limit=200&status=open&series_ticker=${SERIES[sportId]}&with_nested_markets=true`);
+      const r = await fetch(`${base()}/trade-api/v2/events?limit=200&status=open&series_ticker=${series}&with_nested_markets=true`);
       const events = (await r.json())?.events || [];
-      cache.set(sportId, { t: Date.now(), events });
+      cache.set(series, { t: Date.now(), events });
       return events;
-    } catch { cache.set(sportId, { t: Date.now(), events: null }); return null; }
+    } catch { cache.set(series, { t: Date.now(), events: null }); return null; }
   }
+  const eventsFor = sportId => seriesEvents(SERIES[sportId]);
+  // player-name join: Kalshi titles use full names ("Sonia Citron"), the app carries
+  // shortNames ("S. Citron") — surname + first initial is the reliable key
+  const nameBits = n => { const w = String(n || '').toLowerCase().replace(/[^a-z .\-']/g, '').trim().split(/\s+/); return { last: w[w.length - 1] || '', init: (w[0] || '')[0] || '' }; };
+  const samePlayer = (a, b) => { const x = nameBits(a), y = nameBits(b); return !!x.last && x.last === y.last && (!x.init || !y.init || x.init === y.init); };
   function match(g, events) {
     // same-day code, plus next day: a late-night ET start can straddle the ticker date
     const codes = [dayCode(g.start), dayCode(new Date(g.start.getTime() + 864e5))];
@@ -1995,6 +2017,25 @@ const Kalshi = (() => {
     proxy: base,
     // best executable BUY price for a side: the ask, else last trade as a reference
     buy(k) { return k ? (k.ask || k.last || null) : null; },
+    // the player's REAL Kalshi milestone ladder for a stat on game day:
+    // [{thr, bid, ask, last}] sorted by threshold — null when no proxy/series
+    async propLines(sportId, stat, playerName, when) {
+      const events = await seriesEvents(PROP_SERIES[sportId]?.[stat]);
+      if (!events) return null;
+      const codes = [dayCode(when), dayCode(new Date(when.getTime() + 864e5))];
+      const out = [];
+      for (const e of events) {
+        const dpart = (e.event_ticker || '').split('-')[1] || '';
+        if (!codes.some(c => dpart.startsWith(c))) continue;
+        for (const m of e.markets || []) {
+          const mm = String(m.yes_sub_title || m.title || '').match(/^(.+?):\s*(\d+(?:\.\d+)?)\+/);
+          if (mm && samePlayer(mm[1], playerName))
+            out.push({ thr: +mm[2], bid: m.yes_bid || null, ask: m.yes_ask || null, last: m.last_price || null });
+        }
+      }
+      return out.sort((a, b) => a.thr - b.thr);
+    },
+    hasPropSeries: (sportId, stat) => !!PROP_SERIES[sportId]?.[stat],
     async attach(sport, evs) {
       if (!base() || !SERIES[sport.id]) return false;
       const events = await eventsFor(sport.id);
@@ -2468,7 +2509,8 @@ function fetchGameLog(sport, athleteId) {
         (j.seasonTypes || []).forEach(st => (st.categories || []).forEach(c =>
           (c.events || []).forEach(e => {
             const meta = j.events?.[e.eventId];
-            if (meta?.gameDate && Array.isArray(e.stats)) rows.push({ d: meta.gameDate, stats: e.stats });
+            if (meta?.gameDate && Array.isArray(e.stats))
+              rows.push({ d: meta.gameDate, opp: meta.opponent?.abbreviation || null, stats: e.stats });
           })));
         rows.sort((a, b) => new Date(b.d) - new Date(a.d));   // newest first
         return { labels: j.labels, rows };
@@ -3719,8 +3761,10 @@ function renderFx(wrap, gl, stat, line, avail) {
       <span class="fx-k">green = hit (≥ line) · newest game on the right</span></div>
     <div class="fx-chart"></div>
     <div class="fx-hits"></div>
+    <div class="fx-picker"><div class="fx-k" style="opacity:.6">🎯 grading the ladder…</div></div>
     <div class="bo-fair fx-fair" style="margin-top:4px"></div>`;
   fxUpdate(wrap, gl);
+  fxPicker(wrap, gl);
 }
 function fxAvail(gl) {
   return FX_STATS.filter(([id]) => gl.rows.slice(0, 6).filter(row => gamelogVal(id, gl.labels, row.stats) != null).length >= 3);
@@ -3730,6 +3774,7 @@ async function openFormExplorer(wrap, d) {
   if (!sport || !d.aid) return;
   wrap.innerHTML = '<div class="loading" style="padding:10px"><div class="spinner"></div>pulling the game log…</div>';
   wrap.dataset.aid = d.aid; wrap.dataset.k = d.k; wrap.dataset.name = d.name || 'player';
+  wrap.dataset.gid = d.gid || ''; wrap.dataset.side = d.side || '';
   const gl = await fetchGameLog(sport, d.aid);
   if (!gl || !gl.rows.length) { wrap.innerHTML = `<div class="bo-fair">no game log available for ${esc(d.name || 'this player')}</div>`; return; }
   const avail = fxAvail(gl);
@@ -3743,12 +3788,122 @@ function refx(wrap, stat, line) {
   fetchGameLog(sport, wrap.dataset.aid).then(gl => { if (gl) renderFx(wrap, gl, stat, line, fxAvail(gl)); });
 }
 
+// ── 🎯 LINE PICKER (v15.8): which Kalshi option to take, matchup-adjusted ──
+// Projection = weighted-recent (60%) + log average (40%), scaled by the OPPONENT context:
+// how many points they allow vs league (defense) and how fast their games run (pace),
+// plus the player's own history AGAINST this opponent from the game log. Every Kalshi
+// milestone in the player's real ladder is graded over AND under (NO side), with an
+// explicit list of the under signals firing — the classic spots where NO carries value.
+const FX_DIST = {   // per-stat distribution: Normal(sd from mean) or Poisson for counts
+  pts: ['n', m => 0.30 * m + 2.5], reb: ['n', m => 0.45 * m + 1.3], ast: ['n', m => 0.45 * m + 1.2],
+  tb: ['n', m => 0.90 * m + 0.9], ks: ['n', m => 0.35 * m + 1.3], sog: ['n', m => 0.40 * m + 1.1],
+  threes: ['p'], hr: ['p'], hits: ['p'], rbi: ['p'], runs: ['p'], sb: ['p'], goals: ['p'],
+};
+function fxOverProb(stat, proj, thr) {
+  const d = FX_DIST[stat] || ['n', m => 0.4 * m + 1.5];
+  const p = d[0] === 'p' ? poissonOver(thr - 0.5, proj)
+    : 1 - normalCdf((thr - 0.5 - proj) / Math.max(0.8, d[1](proj)));
+  return Math.max(0.02, Math.min(0.98, p));
+}
+function fxMatchup(g, side) {
+  const me = g[side], opp = g[side === 'home' ? 'away' : 'home'];
+  if (!me || !opp) return null;
+  const BASE = { wnba: 81, nba: 114, nfl: 22.5, nhl: 3.0, mlb: 4.6 };
+  // league baseline = mean points-allowed across every team on this sport's loaded slate
+  const pags = (state.lastEntries.get(g.sportId)?.events || [])
+    .flatMap(x => [x.home?.pag, x.away?.pag]).filter(v => v != null);
+  const lg = pags.length >= 4 ? pags.reduce((a, b) => a + b, 0) / pags.length : BASE[g.sportId];
+  const has = lg != null && opp.pag != null;
+  const defMult = has ? Math.max(0.85, Math.min(1.15, opp.pag / lg)) : 1;
+  const paceMult = has && opp.pfg != null ? Math.max(0.90, Math.min(1.10, (opp.pfg + opp.pag) / (2 * lg))) : 1;
+  const envM = Math.max(0.88, Math.min(1.12, 1 + 0.6 * (defMult - 1) + 0.4 * (paceMult - 1)));
+  const sig = SPORTS.find(s => s.id === g.sportId)?.spreadSigma || 10;
+  const margin = invNorm(clamp(g.model[side])) * sig;   // my team's expected margin
+  const blowout = ['nba', 'wnba'].includes(g.sportId) && margin >= 9;
+  return { opp, lg, has, defMult, paceMult, envM, margin, blowout, b2b: !!me.b2b };
+}
+async function fxPicker(wrap, gl) {
+  const box = wrap.querySelector('.fx-picker');
+  if (!box) return;
+  const k = wrap.dataset.k, stat = wrap.dataset.stat, name = wrap.dataset.name;
+  const g = (state.lastEntries.get(k)?.events || []).find(x => String(x.id) === String(wrap.dataset.gid));
+  let side = wrap.dataset.side || '';
+  if (g && !side) for (const s of ['home', 'away'])
+    if ((g[s].leaders || []).some(l => leaderKey(l.name) === leaderKey(name))) side = s;
+  const vals = fxVals(wrap, gl);
+  if (vals.length < 5) { box.innerHTML = ''; return; }
+  const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+  let s = 0, sw = 0; vals.forEach((v, i) => { const w = 0.85 ** i; s += w * v; sw += w; });
+  const ewma = s / sw;
+  const rawProj = 0.6 * ewma + 0.4 * avg;
+  const mu = g && side ? fxMatchup(g, side) : null;
+  const proj = rawProj * (mu ? mu.envM : 1);
+  // the player's own history vs THIS opponent, straight off the game log
+  let vsOpp = null;
+  if (mu?.opp?.abbr) {
+    const ov = gl.rows.filter(r => r.opp === mu.opp.abbr)
+      .map(r => gamelogVal(stat, gl.labels, r.stats)).filter(v => v != null);
+    if (ov.length) vsOpp = { n: ov.length, avg: ov.reduce((a, b) => a + b, 0) / ov.length, abbr: mu.opp.abbr };
+  }
+  // real Kalshi ladder through the proxy; synthetic fair ladder otherwise
+  let lines = g && Kalshi.hasPropSeries(k, stat) ? await Kalshi.propLines(k, stat, name, g.start) : null;
+  const kalshiOn = !!(lines && lines.length);
+  if (!kalshiOn) {
+    const step = stat === 'pts' ? 5 : 1;
+    lines = [...new Set([Math.round((proj - step) / step) * step, Math.round(proj / step) * step, Math.round((proj + step) / step) * step]
+      .map(t => Math.max(1, t)))].map(thr => ({ thr, bid: null, ask: null, last: null }));
+  }
+  const graded = lines.map(L => {
+    const p = fxOverProb(stat, proj, L.thr);
+    const fair = Math.round(p * 100);
+    const overCost = L.ask || null, underCost = L.bid ? 100 - L.bid : null;
+    const evO = overCost ? (p * 100 - overCost) / overCost : null;
+    const evU = underCost ? ((1 - p) * 100 - underCost) / underCost : null;
+    return { ...L, p, fair, overCost, underCost, evO, evU };
+  });
+  const stake = ev => Math.min(2, Math.max(0.5, Math.round(ev * KELLY_FRACTION * 0.5 * 1000) / 10));
+  const bestO = graded.filter(x => x.evO != null).sort((a, b) => b.evO - a.evO)[0];
+  const bestU = graded.filter(x => x.evU != null).sort((a, b) => b.evU - a.evU)[0];
+  // 📉 under signals — the spots where the NO side historically carries the value
+  const sigs = [];
+  if (ewma <= avg * 0.87) sigs.push(`🥶 cold form — weighted recent ${ewma.toFixed(1)} vs ${avg.toFixed(1)} avg`);
+  if (mu?.has && mu.defMult <= 0.96) sigs.push(`🛡️ ${esc(mu.opp.abbr)} allow ${(mu.opp.pag).toFixed(1)}/g — ${((1 - mu.defMult) * 100).toFixed(0)}% stingier than league`);
+  if (mu?.has && mu.paceMult <= 0.97) sigs.push(`🐢 slow game script — pace ×${mu.paceMult.toFixed(2)} (fewer possessions, fewer chances)`);
+  if (mu?.blowout) sigs.push(`🏃 blowout risk — favored by ~${Math.round(mu.margin)}: starters sit crunch time`);
+  if (mu?.b2b) sigs.push('😴 back-to-back — tired legs shave a couple points off stars');
+  if (vsOpp && vsOpp.n >= 2 && vsOpp.avg < rawProj - 1) sigs.push(`🧩 vs ${esc(vsOpp.abbr)} history: ${vsOpp.avg.toFixed(1)}/g over ${vsOpp.n} games — below their usual`);
+  const muLine = mu && mu.has
+    ? `⚔️ vs <b>${esc(mu.opp.abbr)}</b>: allows <b>${mu.opp.pag.toFixed(1)}</b>/g (lg ${mu.lg.toFixed(1)}) → defense ×${mu.defMult.toFixed(2)} · pace ×${mu.paceMult.toFixed(2)} · proj <b>${rawProj.toFixed(1)}</b> → <b>${proj.toFixed(1)}</b>`
+    : mu ? `⚔️ vs <b>${esc(mu.opp.abbr)}</b> — no scoring profile loaded for the matchup adjust; proj <b>${proj.toFixed(1)}</b>` : `proj <b>${proj.toFixed(1)}</b> (team unknown — tap their leader chip for the matchup read)`;
+  const vsLine = vsOpp ? `<div class="fx-k" style="margin-top:2px">🧩 vs ${esc(vsOpp.abbr)} this log: <b style="color:var(--text)">${vsOpp.avg.toFixed(1)}/g</b> in ${vsOpp.n} game${vsOpp.n > 1 ? 's' : ''}</div>` : '';
+  const rows = graded.map(x => {
+    const oTxt = x.overCost ? `${x.overCost}¢ <span class="${x.evO >= 0.05 ? 'ok' : x.evO <= -0.05 ? 'bad' : ''}">${x.evO >= 0 ? '+' : ''}${Math.round(x.evO * 100)}%</span>` : '—';
+    const uTxt = x.underCost ? `${x.underCost}¢ <span class="${x.evU >= 0.05 ? 'ok' : x.evU <= -0.05 ? 'bad' : ''}">${x.evU >= 0 ? '+' : ''}${Math.round(x.evU * 100)}%</span>` : '—';
+    return `<div class="fx-lrow"><b>${x.thr}+</b><span>model ${pct(x.p)}</span><span>fair ${x.fair}¢</span><span>YES ${oTxt}</span><span>NO ${uTxt}</span></div>`;
+  }).join('');
+  let verdict = '';
+  if (bestO && bestO.evO >= 0.05) verdict = `<div class="fx-best ok">⭐ TAKE: <b>${esc(name)} ${bestO.thr}+ YES @ ${bestO.overCost}¢</b> · model ${pct(bestO.p)} · +${Math.round(bestO.evO * 100)}% EV · ${stake(bestO.evO)}u</div>`;
+  if (bestU && bestU.evU >= 0.05 && (!verdict || bestU.evU > bestO.evO)) verdict += `<div class="fx-best" style="color:#ff9db0">🔻 UNDER PLAY: <b>${esc(name)} ${bestU.thr}+ NO @ ${bestU.underCost}¢</b> · model says ${pct(1 - bestU.p)} under · +${Math.round(bestU.evU * 100)}% EV · ${stake(bestU.evU)}u</div>`;
+  if (!verdict) {
+    const clean = graded.filter(x => x.fair >= 55 && x.fair <= 78).sort((a, b) => b.fair - a.fair)[0];
+    verdict = kalshiOn
+      ? `<div class="fx-best">✋ no quoted edge ≥5% right now${clean ? ` — cleanest structural over is <b>${clean.thr}+</b> (fair ${clean.fair}¢): take YES only below fair` : ''}</div>`
+      : `<div class="fx-best">${clean ? `cleanest over: <b>${clean.thr}+</b> at fair <b>${clean.fair}¢</b> — take YES under that, or NO above <b>${100 - clean.fair}¢</b>` : 'no clean line — sit this one'}${Kalshi.proxy() ? '' : ' · connect the Kalshi proxy for real ladders + quotes'}</div>`;
+  }
+  const underBlock = `<div class="fx-sigs"><span class="fx-k">📉 UNDER SIGNALS (${sigs.length})</span>${sigs.length
+    ? sigs.map(x => `<div class="fx-sig">${x}</div>`).join('')
+    : '<div class="fx-sig" style="opacity:.6">none firing — no systematic under case beyond price</div>'}
+    <div class="fx-k" style="margin-top:3px">unders are most valuable when 2+ signals stack AND the price still treats the player like their season self — “X+” markets get bet by fans on YES, so NO often carries the vig cushion.</div></div>`;
+  box.innerHTML = `<div class="bo-h" style="margin-top:8px;color:var(--text)">🎯 LINE PICKER${kalshiOn ? ' · <span class="ok">real Kalshi ladder</span>' : ' · fair-price mode'}</div>
+    <div style="margin:3px 0">${muLine}</div>${vsLine}${rows}${verdict}${underBlock}`;
+}
+
 function propsSection(g) {
-  const row = t => {
-    const chips = (t.leaders || []).map(l => `<span class="prop-chip${l.id ? ' fx-open' : ''}"${l.id ? ` data-aid="${l.id}" data-k="${g.sportId}" data-name="${esc(l.name)}" data-stat="${fxStatFromCat(l.cat)}" title="tap: chart ${esc(l.name)}'s recent games against any line"` : ''}>${esc(l.name)} · ${esc(l.cat)} ${esc(l.val)}${l.id ? ' 📈' : ''}</span>`).join('');
+  const row = (t, side) => {
+    const chips = (t.leaders || []).map(l => `<span class="prop-chip${l.id ? ' fx-open' : ''}"${l.id ? ` data-aid="${l.id}" data-k="${g.sportId}" data-gid="${esc(g.id)}" data-side="${side}" data-name="${esc(l.name)}" data-stat="${fxStatFromCat(l.cat)}" title="tap: chart ${esc(l.name)}'s recent games against any line"` : ''}>${esc(l.name)} · ${esc(l.cat)} ${esc(l.val)}${l.id ? ' 📈' : ''}</span>`).join('');
     return chips ? `<div class="prop-row"><b>${esc(t.abbr)}</b>${chips}</div>` : '';
   };
-  const html = newsAngleRow(g) + row(g.away) + row(g.home);
+  const html = newsAngleRow(g) + row(g.away, 'away') + row(g.home, 'home');
   return html ? `<div class="bo-h" style="margin-top:13px">PROP ANGLES · team leaders — tap a player to chart their form vs a line</div><div class="fxwrap"></div>${html}` : '';
 }
 
@@ -3830,7 +3985,7 @@ function renderCardProps(g, items, pg) {
         : `<span class="l10bar"><i class="${barCls}" style="width:${Math.round(rate * 100)}%"></i></span><span class="pp-l10">${x.l10.hit}/${x.l10.n}</span>`;
       return `<span class="pp-line" title="market ${pct(x.imp)}${x.over != null ? ' · model ' + pct(x.over) : ''}${x.l10 ? ` · cleared this line in ${x.l10.hit} of his last ${x.l10.n} games` : ''}"><b>${thrTxt(x.threshold)} ${esc(x.statId)}</b>${x.over != null ? `<span class="pp-model">${pct(x.over)}</span>` : ''}${bar}</span>`;
     }).join('');
-    return `<div class="pp-player"><div class="pp-head"><span class="pp-name${a0.aid ? ' fx-open' : ''}"${a0.aid ? ` data-aid="${a0.aid}" data-k="${g.sportId}" data-name="${esc(pl.name)}" data-stat="${esc(a0.statId)}" data-line="${a0.threshold}" title="tap: chart ${esc(pl.name)}'s recent games against any line"` : ''}>${esc(pl.name)}${a0.aid ? ' 📈' : ''}</span><span class="pp-form">${form}</span></div><div class="pp-lines">${chips}</div></div>`;
+    return `<div class="pp-player"><div class="pp-head"><span class="pp-name${a0.aid ? ' fx-open' : ''}"${a0.aid ? ` data-aid="${a0.aid}" data-k="${g.sportId}" data-gid="${esc(g.id)}" data-name="${esc(pl.name)}" data-stat="${esc(a0.statId)}" data-line="${a0.threshold}" title="tap: chart ${esc(pl.name)}'s recent games against any line"` : ''}>${esc(pl.name)}${a0.aid ? ' 📈' : ''}</span><span class="pp-form">${form}</span></div><div class="pp-lines">${chips}</div></div>`;
   }).join('');
   return `<div class="bo-fair" style="margin-bottom:4px">📊 biggest model-vs-market gaps — spots to <b>investigate</b>, not locks</div>${top}
     <div class="bo-h" style="margin-top:10px;color:var(--text)">player lines · season &amp; recent rates · L10 = games he actually cleared it — tap a name to chart form vs any line</div><div class="fxwrap"></div>${plHtml}
