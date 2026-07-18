@@ -1,8 +1,13 @@
-# DAILY EDGE — Kalshi live-price proxy
+# DAILY EDGE — data relay (Kalshi prices + ESPN geo-unblock)
 
-Kalshi's public market API blocks browser reads (no CORS), so DAILY EDGE needs this
-tiny Cloudflare Worker as a read-only relay. Free tier is far more than enough
-(100k requests/day; the app makes ~1 per sport per minute).
+One tiny read-only Cloudflare Worker, two jobs:
+1. **Kalshi live prices** — Kalshi's public market API blocks browser reads (no CORS).
+2. **ESPN relay** — ESPN's data API is geo-blocked from some countries/ISPs (e.g. the
+   Philippines). Friends abroad paste this worker's URL into the app's 💹 box and the
+   app automatically pulls ESPN through it when direct access fails.
+
+Free tier is far more than enough (100k requests/day; the app makes ~1 per sport per
+minute). Share the deployed URL with anyone you share the site with.
 
 ## Deploy (one time, ~2 minutes)
 

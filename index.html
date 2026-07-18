@@ -879,8 +879,8 @@
     <label class="bankbox" title="Your bankroll in $ — type it and it saves instantly; stakes then show in dollars too (1u = 1% of bankroll). Clear it to go back to units only.">
       💵 <input id="bankinput" type="number" min="0" inputmode="numeric" placeholder="bankroll $">
     </label>
-    <label class="bankbox" title="Paste your Kalshi proxy Worker URL (see kalshi-worker/README in the repo — a 2-minute free Cloudflare deploy). Live Kalshi prices then auto-fill the ⚡ LIVE EDGE console, pregame value chips and the hedge assistant. Read-only market data; no keys, no orders.">
-      💹 <input id="kalshiproxy" type="url" placeholder="kalshi proxy URL" spellcheck="false" style="width:120px">
+    <label class="bankbox" title="Paste the relay Worker URL (see kalshi-worker/README in the repo — a 2-minute free Cloudflare deploy). It does two things: live Kalshi prices auto-fill the ⚡ LIVE EDGE console, pregame value chips and the hedge assistant; and viewers in countries where ESPN's API is blocked get the data feed relayed automatically. Read-only; no keys, no orders.">
+      💹 <input id="kalshiproxy" type="url" placeholder="relay URL" spellcheck="false" style="width:120px">
     </label>
     <button class="omni-btn" id="omnibtn" title="Command bar — jump to a team, switch sports, queue a bet, open a panel. Press Ctrl/⌘+K or /">🔍 <kbd>/</kbd></button>
     <button class="refresh" id="refreshbtn">⟳ Refresh</button>
@@ -922,7 +922,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v15.9';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.0';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -941,6 +941,46 @@ const SPORTS = [
   { id: 'nfl',  label: '🏈 NFL',  path: 'football/nfl',    hfaWin: 0.565, spreadSigma: 13.5, offMsg: 'Off-season — kickoff returns in September.' },
 ];
 const API = 'https://site.api.espn.com/apis/site/v2/sports';
+
+// ── 🌐 ESPN relay (v16.0) ────────────────────────────────────────────────
+// The SITE serves globally (GitHub Pages), but ESPN's data API geo-blocks or fails from
+// some regions/ISPs (reported live from the Philippines) — the app then has nothing to
+// render. Fix: with the Cloudflare Worker URL pasted in the 💹 box, every ESPN call that
+// fails directly is retried through the worker (Cloudflare egress IPs, not the viewer's),
+// and if the relay works the app remembers and routes ESPN through it from then on.
+const ESPN_RELAY_HOSTS = {
+  'https://site.api.espn.com': '/espn-site',
+  'https://sports.core.api.espn.com': '/espn-core',
+  'https://site.web.api.espn.com': '/espn-web',
+};
+function espnRelayUrl(u) {
+  const p = (localStorage.getItem('de-kalshi-proxy') || '').trim().replace(/\/+$/, '');
+  if (!p) return null;
+  for (const h in ESPN_RELAY_HOSTS) if (u.startsWith(h)) return p + ESPN_RELAY_HOSTS[h] + u.slice(h.length);
+  return null;
+}
+const espnRelayOn = () => localStorage.getItem('de-espn-relay') === '1';
+{
+  const raw = window.fetch.bind(window);
+  window.fetch = (url, opts) => {
+    const u = typeof url === 'string' ? url : (url && url.url) || '';
+    const ru = espnRelayUrl(u);
+    if (!ru) return raw(url, opts);                        // not ESPN, or no proxy configured
+    if (espnRelayOn()) return raw(ru, opts);               // relay mode: route ESPN via the worker
+    // direct first; a network error or a blocky status (403/451/0) → try the relay once,
+    // and if the relay answers, remember it for every ESPN call after
+    return raw(url, opts).then(r => {
+      if (r.ok || r.status === 404) return r;
+      throw new Error('espn ' + r.status);
+    }).catch(async err => {
+      try {
+        const rr = await raw(ru, opts);
+        if (rr.ok) { localStorage.setItem('de-espn-relay', '1'); return rr; }
+      } catch {}
+      throw err;
+    });
+  };
+}
 const REGRESS_GAMES = 10;      // pseudo-games of .500 ball added to every record
 const VALUE_EDGE = 0.04;       // model-vs-market gap to flag value
 const LIVE_POLL_MS = 60000;
@@ -5171,6 +5211,20 @@ function fmtDate(d) {
   return d.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
 }
 
+// data-feed failure screen: says WHY (regions/ISPs blocking ESPN's API, not the site)
+// and what to do about it — paste the relay URL, one line, done.
+function espnFailHtml(msg) {
+  const hasProxy = !!(localStorage.getItem('de-kalshi-proxy') || '').trim();
+  return `<div class="error">Couldn't reach the ESPN data feed (${esc(msg || 'network error')}).
+    <div style="font-size:12px;color:var(--muted);margin:10px auto;max-width:520px;line-height:1.7">
+    The site itself isn't region-locked — but ESPN's data API is blocked from some countries and ISPs.
+    ${hasProxy
+      ? 'A relay is configured and was tried automatically — if you still see this, the relay may be down or blocked too. Retry, or re-paste the relay URL in the 💹 box up top.'
+      : 'Fix: paste the DAILY EDGE relay URL (ask whoever shared this site — it ends in <b>.workers.dev</b>) into the 💹 box in the top bar. The app then pulls ESPN through the relay automatically.'}
+    </div>
+    <button onclick="refresh(true)">Retry</button></div>`;
+}
+
 async function refresh(force = false) {
   const btn = $('#refreshbtn');
   btn.classList.add('spinning');
@@ -5196,8 +5250,8 @@ async function refresh(force = false) {
   renderBrain();
 
   if (state.tab === 'card') {
-    renderCard(allEvents);
-    scheduleLivePoll(allEvents);
+    if (!entries.size) $('#content').innerHTML = espnFailHtml(results[0]?.reason?.message);
+    else { renderCard(allEvents); scheduleLivePoll(allEvents); }
   } else {
     const active = results[SPORTS.findIndex(s => s.id === state.tab)];
     if (active?.status === 'fulfilled') {
@@ -5205,8 +5259,7 @@ async function refresh(force = false) {
       renderContent(sport, active.value);
       scheduleLivePoll(active.value.events);
     } else {
-      $('#content').innerHTML = `<div class="error">Couldn't reach ESPN (${esc(active?.reason?.message || 'network error')})
-        <br><button onclick="refresh(true)">Retry</button></div>`;
+      $('#content').innerHTML = espnFailHtml(active?.reason?.message);
     }
   }
   btn.classList.remove('spinning');
@@ -6300,7 +6353,7 @@ const Focus = (() => {
   };
 })();
 
-document.querySelector('.logo .sub').textContent += ' · ' + APP_VERSION;
+document.querySelector('.logo .sub').textContent += ' · ' + APP_VERSION + (espnRelayOn() ? ' · 🌐 relay' : '');
 // 👋 first-visit guide — three plain-English pointers for people who don't speak betting.
 // Dismissed once, never shown again.
 if (!localStorage.getItem('de-howto')) {
