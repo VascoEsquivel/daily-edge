@@ -498,6 +498,9 @@
     background: rgba(255, 170, 40, .08); border: 1px solid rgba(255, 180, 40, .32); color: var(--muted);
   }
   .steamact b { color: #ffd75e; }
+  .pspark { display: inline-block; vertical-align: middle; margin-left: 7px; cursor: help; line-height: 0; }
+  .xasset { color: #8fd8ff; border-left: 2px solid rgba(90, 180, 255, .5); padding-left: 8px; }
+  .xasset b { color: #bfe6ff; }
   /* 📈 player form explorer */
   .fxwrap:not(:empty) {
     margin: 8px 0; padding: 10px 12px; border-radius: 12px;
@@ -922,7 +925,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.0';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.1';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -2782,8 +2785,26 @@ function parseVegas(comp, sport, home) {
   const hML = odds.homeTeamOdds?.moneyLine, aML = odds.awayTeamOdds?.moneyLine;
   if (hML && aML) {
     v.mlHome = hML; v.mlAway = aML;
+    // the book's posted spread magnitude rides along → synthetic cross-asset bridge
+    if (odds.spread != null && !isNaN(Number(odds.spread))) v.altSpread = Math.abs(Number(odds.spread));
     const ph = mlToProb(hML), pa = mlToProb(aML);
-    v.homeProb = powerDevig(ph, pa);   // favorite-longshot-aware de-vig
+    let fair = powerDevig(ph, pa);     // favorite-longshot-aware de-vig
+    // 💸 asymmetric-juice correction (v16.1): measure how the book SPLITS its hold
+    // against the proportional (multiplicative) baseline. A modest favorite-heavy
+    // split (≈ +0.5–1¢) is the normal favorite-longshot structure that powerDevig
+    // already prices; a split beyond ~1.8¢ means the book is shading the public side
+    // ON TOP of it — the retail tax. Shift the prior up to 1¢ off the over-taxed
+    // side (net of the structural ~0.8¢), so the model stops buying public juice.
+    const pm = ph / (ph + pa);                       // proportional de-vig baseline
+    const imb = (ph - pm) - (pa - (1 - pm));         // + → home side carries extra hold
+    const favIsH = fair >= 0.5;
+    const favImb = favIsH ? imb : -imb;              // + → the FAVORITE is over-taxed
+    if (Math.abs(favImb) >= 0.018) {
+      const shift = Math.sign(favImb) * Math.min(0.01, (Math.abs(favImb) - 0.008) * 0.6);
+      fair = clamp(favIsH ? fair - shift : fair + shift);
+      v.juiceShift = favIsH ? -shift : shift;        // surfaced in the bet board for transparency
+    }
+    v.homeProb = fair;
     return v;
   }
   if (!v.detail) return null;
@@ -2939,8 +2960,9 @@ function computeBestPick(g, sport) {
                  text: `${g[side].abbr} ML ${fmtML(ml)}${est ? ' (est.)' : ''}` });
   };
   if (v.mlHome && v.mlAway) {
-    const iH = mlToProb(v.mlHome), iA = mlToProb(v.mlAway);
-    const fairH = powerDevig(iH, iA);   // favorite-longshot-aware fair market probability
+    // v.homeProb already carries the power de-vig PLUS the asymmetric-juice correction —
+    // reuse it so candidate pricing and the Bayesian prior speak the same number
+    const fairH = v.homeProb ?? powerDevig(mlToProb(v.mlHome), mlToProb(v.mlAway));
     addML('home', v.mlHome, false, fairH);
     addML('away', v.mlAway, false, 1 - fairH);
   }
@@ -4166,6 +4188,29 @@ function altSpreadRow(g) {
   return `<div class="bo-fair" title="Fair (no-vig) prices for alternative spreads, read off the empirical key-numbers margin PMF — margins cluster on structural numbers (3/7 in football, one-run baseball games), so moving the line across a key number changes the price in a step, not a straight line. Only pay for points that cross a key number, and only at a book price better than fair.">📐 alt spreads (fair): ${chips}</div>`;
 }
 
+// 🌉 synthetic cross-asset check (v16.1): the book's OWN de-vigged moneyline fixes the
+// win probability; the key-numbers PMF converts that into what the spread's cover prob
+// MUST be for the two markets to agree. Spreads are priced -110 (52.4% implied), so when
+// the synthetic cover prob beats that by ≥2¢, one spread side is mispriced relative to
+// the same book's own moneyline — the classic side-to-spread arbitrage-family signal.
+function crossAssetRow(g) {
+  const sport = SPORTS.find(s => s.id === g.sportId);
+  const v = g.vegas;
+  if (g.state !== 'pre' || !sport?.spreadSigma || !v || v.mlHome == null || v.mlAway == null
+      || v.altSpread == null || v.homeProb == null) return '';
+  const hs = (v.homeProb >= 0.5 ? -1 : 1) * v.altSpread;    // home-relative posted spread
+  const mu = invNorm(clamp(v.homeProb)) * sport.spreadSigma;
+  const pmf = marginPMF(sport.id, mu, sport.spreadSigma);
+  const pH = pmf ? pmfHomeCover(pmf, hs) : normalCdf((mu + hs) / sport.spreadSigma);
+  const IMP110 = 0.524;                                     // -110 both ways
+  const eH = pH - IMP110, eA = (1 - pH) - IMP110;
+  const best = eH >= eA
+    ? { t: `${g.home.abbr} ${hs > 0 ? '+' : ''}${hs}`, e: eH, p: pH }
+    : { t: `${g.away.abbr} ${-hs > 0 ? '+' : ''}${-hs}`, e: eA, p: 1 - pH };
+  if (best.e < 0.02) return '';
+  return `<div class="bo-fair xasset" title="The same book's de-vigged moneyline pins the win probability; running it through the empirical key-numbers margin PMF says what the posted spread must cover. When that synthetic number beats the -110 price by 2¢+, the spread is lagging the book's own moneyline — take the spread side before they re-sync.">🌉 <b>CROSS-ASSET VALUE</b> · the moneyline (${esc(g.home.abbr)} ${pct(v.homeProb)} fair) implies <b>${esc(best.t)}</b> covers <b>${pct(best.p)}</b> vs the 52.4% a −110 price asks → <b>+${(best.e * 100).toFixed(1)}%</b> edge off the book's own numbers</div>`;
+}
+
 function betBoard(g) {
   const extras = formSection(g) + propsSection(g) + h2hSection(g) + gamePropsSection(g);
   if (g.state !== 'pre') return extras ? `<div class="betboard">${extras}</div>` : '';
@@ -4193,6 +4238,8 @@ function boardCore(g) {
     ${rows || '<div class="bo-row skip"><span class="bo-bet">no priced markets listed for this match</span></div>'}
     <div class="bo-fair">model's fair prices: ${esc(g.home.abbr)} ${fh} / ${esc(g.away.abbr)} ${fa}${fd} — only take better numbers than these</div>
     ${altSpreadRow(g)}
+    ${crossAssetRow(g)}
+    ${g.vegas?.juiceShift ? `<div class="bo-fair" title="The book loaded measurably more vig on the public (favorite) side than the favorite-longshot structure explains — classic retail shading. The Bayesian prior was nudged ${Math.abs(g.vegas.juiceShift * 100).toFixed(1)}¢ off the taxed side so the model doesn't buy the public tax.">💸 public-juice shade detected → prior shifted ${(g.vegas.juiceShift * 100).toFixed(1)}¢ off the taxed side</div>` : ''}
     ${g.total ? `<div class="bo-fair">model total: ${g.total.exp.toFixed(1)} vs line ${g.total.line} → ${g.total.pOver >= 0.5 ? 'Over' : 'Under'} ${pct(Math.max(g.total.pOver, 1 - g.total.pOver))}${g.total.notes?.length ? ' · ' + esc(g.total.notes.join(' · ')) : ''}${g.wx ? ` · ${esc(g.wx.txt)}` : ''}</div>`
       : g.vegas?.ou ? `<div class="bo-fair">total: O/U ${g.vegas.ou}</div>` : ''}
     ${g.why?.length ? `<div class="bo-fair">drivers: ${esc(g.why.join(' · '))}</div>` : ''}`;
@@ -4420,6 +4467,29 @@ function projLineHtml(g) {
   return `<div class="projline">📊 proj <b>${esc(g.away.abbr)} ${Math.round(P.a)}–${Math.round(P.h)} ${esc(g.home.abbr)}</b>${P.total ? ` · total ${P.total.toFixed(1)}` : ''}</div>`;
 }
 
+// 📈 inline price sparkline (v16.1): the Open price tape drawn as a tiny time-scaled
+// SVG next to the steam/velocity readout — neon-emerald when the market is steaming the
+// pregame favorite, neon-crimson when the money is on the dog, muted when flat. One
+// glance = the whole steam trajectory instead of a single delta number.
+function priceSpark(opened, g) {
+  const h = opened?.h;
+  if (g.state !== 'pre' || !h || h.length < 3) return '';
+  const pts = h.slice(-10);
+  const t0 = pts[0][0], t1 = pts[pts.length - 1][0];
+  const W = 64, H = 18;
+  const ys = pts.map(p => p[1]);
+  const mn = Math.min(...ys), mx = Math.max(...ys), rg = (mx - mn) || 0.01;
+  const xy = pts.map(p => `${(t1 === t0 ? W : (p[0] - t0) / (t1 - t0) * W).toFixed(1)},${(H - 2 - (p[1] - mn) / rg * (H - 4)).toFixed(1)}`).join(' ');
+  const favHome = h[0][1] >= 0.5;                            // opening favorite
+  const d = ys[ys.length - 1] - ys[0];                       // + → money toward home
+  const favSteam = favHome ? d : -d;                         // + → favorite steaming
+  const flat = Math.abs(d) < 0.008;
+  const col = flat ? 'rgba(132,148,184,.8)' : favSteam > 0 ? 'var(--accent)' : 'var(--hot)';
+  const glow = flat ? '' : ` filter="drop-shadow(0 0 3px ${favSteam > 0 ? 'rgba(0,255,136,.6)' : 'rgba(255,77,109,.55)'})"`;
+  const mins = Math.max(1, Math.round((t1 - t0) / 60000));
+  return `<span class="pspark" title="price path: ${esc(g.home.abbr)} ${Math.round(ys[0] * 100)}¢ → ${Math.round(ys[ys.length - 1] * 100)}¢ over ${pts.length} samples (${mins} min). ${flat ? 'Flat — no meaningful drift.' : favSteam > 0 ? 'Emerald: the market is steaming the favorite.' : 'Crimson: the money is landing on the dog.'}"><svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><polyline points="${xy}" fill="none" stroke="${col}" stroke-width="1.6" stroke-linejoin="round"${glow}/></svg></span>`;
+}
+
 function gameCard(g, i, sport, bare = false) {   // bare = focus-sheet header (no panel/hint)
   const live = g.state === 'in';
   const badge = live ? '<span class="badge in">● LIVE</span>'
@@ -4535,7 +4605,7 @@ function gameCard(g, i, sport, bare = false) {   // bare = focus-sheet header (n
     ${probBar(lp || g.model)}
     ${probLabels(g, lp)}
     ${liveLine}
-    <div class="g-verdict">${verdict}${vegasStr}${steamBadge}${kalshiChip}</div>
+    <div class="g-verdict">${verdict}${vegasStr}${priceSpark(opened, g)}${steamBadge}${kalshiChip}</div>
     ${steamAct}
     ${suggestedStrip(g)}
     ${live ? hedgePanel(g, sport) + liveEdgePanel(g, sport, lp) : ''}
