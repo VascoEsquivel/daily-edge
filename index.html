@@ -691,6 +691,17 @@
   .mb-form input { background: rgba(0,0,0,.35); border: 1px solid var(--border); color: var(--text);
     padding: 7px 11px; border-radius: 8px; font-family: inherit; font-size: 12px; flex: 1; min-width: 150px; outline: none; }
   .mb-form input:focus { border-color: var(--accent2); }
+  /* 🎰 manual parlay builder + per-leg settlement */
+  .mb-builder { margin: 6px 0 4px; padding: 9px 11px; border-radius: 11px;
+    background: rgba(120,90,220,.10); border: 1px solid rgba(150,120,255,.32); }
+  .mb-leg { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 4px 8px; margin: 3px 0; border-radius: 7px; background: rgba(10,16,32,.4); font-size: 11.5px; }
+  .mb-leg.done { opacity: .8; }
+  .mb-legbtns { display: inline-flex; gap: 4px; flex: 0 0 auto; }
+  .mb-legbtns .b-btn { padding: 2px 8px; font-size: 11px; min-width: 26px; }
+  .mb-parlayrow { flex-direction: column; align-items: stretch; gap: 3px; }
+  .mb-phead { display: flex; align-items: center; gap: 8px; }
+  .mb-phead .h-match { flex: 1; }
   .slip .s-actions .logbets { background: rgba(255,209,102,.12); border-color: rgba(255,209,102,.45); color: var(--gold); }
 
   /* ── Filter bar ── */
@@ -925,7 +936,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.1';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.2';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1007,6 +1018,7 @@ const state = {
   props: { player: '', stat: 'pts', avg: '', recent: '', matchup: 'neutral', pace: 'neutral', line: '', price: '', game: '' },
   liveProps: { key: null, items: null, loading: false },
   propLegs: [],
+  mbLegs: [],                  // manual parlay builder: staged legs before logging
 };
 try { state.slip = JSON.parse(localStorage.getItem('de-slip-v1')) || []; } catch {}
 try { Object.assign(state.esports, JSON.parse(localStorage.getItem('de-elab-v1')) || {}); } catch {}
@@ -2157,6 +2169,22 @@ const MyBets = (() => {
       const b = american > 0 ? american / 100 : 100 / -american;
       db.bets.unshift({ id: db.seq++, ts: Date.now(), stake, status: 'open',
         legs: [{ t: `${text} ${fmtML(american)}`, b: +b.toFixed(3), m: '' }] });
+      save();
+    },
+    // manual parlay: several hand-entered legs on one ticket, settled leg-by-leg so the
+    // last-leg hedge optimizer can light up. legs = [{ t, b }]
+    addParlay(legs, stake) {
+      db.bets.unshift({ id: db.seq++, ts: Date.now(), stake, status: 'open',
+        legs: legs.map(l => ({ t: l.t, b: +l.b.toFixed(3), m: '' })) });
+      save();
+    },
+    // settle one leg of a manual parlay; finalize() closes the whole ticket once a leg
+    // loses or every leg is graded (pushes drop out, winners multiply — standard rules)
+    resolveLeg(betId, idx, res) {
+      const bet = db.bets.find(b => b.id === betId);
+      if (!bet || bet.status !== 'open' || !bet.legs[idx]) return;
+      bet.legs[idx].res = res;
+      finalize(bet);
       save();
     },
     settleFromEvents(sport, events) {
@@ -4351,7 +4379,7 @@ function parlayHedgeHtml(b) {
   const wonN = b.legs.filter(l => l.res === 'won').length;
   if (!wonN) return '';                                  // nothing banked yet — nothing to lock
   const last = pending[0];
-  if (!last.bt || last.b == null) return '';
+  if (last.b == null) return '';   // manual legs (no bt) are fine — p stays null, user types the price
   // payout if the last leg hits: pushes drop out, winners multiply (standard parlay rules)
   const D = b.legs.filter(l => l.res === 'won').reduce((d, l) => d * (1 + l.b), 1) * (1 + last.b);
   const S = b.stake, payout = S * D;
@@ -4881,22 +4909,49 @@ function renderMyBets() {
     const clvBadge = c != null ? ` <span class="chip ${c >= 0 ? 'hit' : 'miss'}" title="Closing Line Value: the de-vigged market moved ${(c * 100).toFixed(1)}% ${c >= 0 ? 'toward' : 'against'} your side by game time. Beating the close is the strongest sign of long-run +EV.">${c >= 0 ? '+' : ''}${(c * 100).toFixed(1)}% CLV</span>` : '';
     const meta = `${b.stake}u${b.legs.length > 1 ? ' · ' + b.legs.length + '-leg parlay' : ''}${b.legs[0].m ? ' · ' + esc(b.legs[0].m) : ''}${clvBadge}`;
     const auto = b.legs.every(l => l.bt);
+    // a manual (or mixed) multi-leg parlay that's still open settles LEG-BY-LEG, so the
+    // 🧩 last-leg hedge can fire once one leg remains — render per-leg won/lost/push
+    const manualParlay = b.status === 'open' && b.legs.length > 1 && !auto;
+    if (manualParlay) {
+      const legRows = b.legs.map((l, i) => l.res
+        ? `<div class="mb-leg done"><span>${esc(l.t)}</span><span class="${l.res === 'won' ? 'ok' : l.res === 'lost' ? 'bad' : 'h-pick'}">[${l.res}]</span></div>`
+        : `<div class="mb-leg"><span>${esc(l.t)}</span><span class="mb-legbtns"><button class="b-btn mb-legres" data-bid="${b.id}" data-leg="${i}" data-st="won">✓</button><button class="b-btn mb-legres" data-bid="${b.id}" data-leg="${i}" data-st="lost">✗</button><button class="b-btn mb-legres" data-bid="${b.id}" data-leg="${i}" data-st="push">P</button></span></div>`).join('');
+      return `<div class="h-row mb-parlayrow"><div class="mb-phead"><span class="h-match">🎰 ${b.legs.length}-leg parlay</span><span class="h-pick">${meta}</span><button class="rmleg mb-del" data-bid="${b.id}" title="delete">✕</button></div>${legRows}<div class="bo-fair" style="margin:2px 0 0;font-size:10px">grade each leg as it settles — when one is left, the 🧩 last-leg hedge appears below.</div></div>`;
+    }
     const act = b.status === 'open'
       ? (auto ? '<span class="h-pick">auto-settles at final</span>'
           : `<button class="b-btn mb-res" data-bid="${b.id}" data-st="won">✓ won</button><button class="b-btn mb-res" data-bid="${b.id}" data-st="lost">✗ lost</button><button class="b-btn mb-res" data-bid="${b.id}" data-st="push">push</button>`)
       : `<span class="${b.status === 'won' ? 'ok' : b.status === 'lost' ? 'bad' : 'h-pick'}">${b.status.toUpperCase()} ${b.pnl > 0 ? '+' : ''}${(b.pnl ?? 0).toFixed(2)}u</span>`;
     return `<div class="h-row"><span class="h-match">${legs}</span><span class="h-pick">${meta}</span>${act}<button class="rmleg mb-del" data-bid="${b.id}" title="delete">✕</button></div>`;
   };
+  // 🎰 manual parlay builder: staged legs + combined odds, logged as one ticket
+  const buildRow = () => {
+    if (!state.mbLegs.length) return '';
+    const D = state.mbLegs.reduce((d, l) => d * (1 + l.b), 1);
+    const combo = fmtML(probToAmerican(clamp(1 / D, 0.001, 0.999)));
+    const legs = state.mbLegs.map((l, i) => `<div class="mb-leg"><span>${esc(l.t)}</span><button class="rmleg mb-unbuild" data-leg="${i}" title="remove">✕</button></div>`).join('');
+    return `<div class="mb-builder">
+      <div class="h-date" style="margin:0 0 5px">🎰 PARLAY BUILDER · ${state.mbLegs.length} leg${state.mbLegs.length > 1 ? 's' : ''} · combined <b>${combo}</b> (${(D).toFixed(2)}×)</div>
+      ${legs}
+      <div class="mb-form" style="margin-top:6px">
+        <input id="mb-pstake" type="number" step="0.5" min="0.5" placeholder="parlay stake u" style="max-width:120px">
+        <button class="b-btn" id="mb-plog">🎰 log ${state.mbLegs.length}-leg parlay</button>
+        <button class="b-btn" id="mb-pclear">clear</button>
+      </div>
+    </div>`;
+  };
   const open = bets.filter(b => b.status === 'open'), done = bets.filter(b => b.status !== 'open');
   el.innerHTML = `<div class="hist">
     <div class="h-date">🎯 MY BETS — your real tickets</div>
-    <div class="bo-fair">Two ways to log: build the 🎟️ slip anywhere in the app and hit "🎯 I bet this" (multi-leg slips log as one parlay ticket), or add anything manually below (Kalshi props, esports, whatever). Game bets settle themselves off final scores; manual ones you settle with a tap. This record is YOUR P/L — separate from the model's ⭐ ledger.</div>
+    <div class="bo-fair">Three ways to log: build the 🎟️ slip anywhere in the app and hit "🎯 I bet this"; add a single bet below; or stack several legs into a manual parlay with <b>＋ to parlay</b> (Kalshi props, cross-book, whatever). Game bets settle off final scores; manual ones you tap to settle — manual parlays settle leg-by-leg so the 🧩 last-leg hedge can fire. This record is YOUR P/L — separate from the model's ⭐ ledger.</div>
     <div class="mb-form">
       <input id="mb-text" placeholder="manual bet (e.g. Wilson o21.5 pts on Kalshi)">
       <input id="mb-odds" type="text" placeholder="+100 / -120" style="max-width:100px;flex:0 1 auto">
       <input id="mb-stake" type="number" step="0.5" min="0.5" placeholder="stake u" style="max-width:90px;flex:0 1 auto">
       <button class="b-btn" id="mb-add">+ log it</button>
+      <button class="b-btn" id="mb-padd" title="add this leg to a manual parlay (odds required; stake is set when you log the parlay)">＋ to parlay</button>
     </div>
+    ${buildRow()}
     ${mb.settled ? (() => {
       const bank = Number(localStorage.getItem('de-bank')) || 0;
       const dollars = bank ? ` (${mb.pnl >= 0 ? '+' : '-'}$${Math.abs(Math.round(mb.pnl * bank / 100))})` : '';
@@ -6124,9 +6179,35 @@ $('#slipbox').addEventListener('click', e => {
 // 🎯 My Bets panel: settle, delete, manual add
 $('#mybetspanel').addEventListener('click', e => {
   const res = e.target.closest('.mb-res');
-  if (res) { MyBets.resolve(Number(res.dataset.bid), res.dataset.st); renderBrain(); return; }
+  if (res) { MyBets.resolve(Number(res.dataset.bid), res.dataset.st); renderMyBets(); renderBrain(); return; }
+  const legres = e.target.closest('.mb-legres');
+  if (legres) { MyBets.resolveLeg(Number(legres.dataset.bid), Number(legres.dataset.leg), legres.dataset.st); renderMyBets(); renderBrain(); return; }
   const del = e.target.closest('.mb-del');
-  if (del) { MyBets.remove(Number(del.dataset.bid)); renderBrain(); return; }
+  if (del) { MyBets.remove(Number(del.dataset.bid)); renderMyBets(); renderBrain(); return; }
+  const unb = e.target.closest('.mb-unbuild');
+  if (unb) { state.mbLegs.splice(Number(unb.dataset.leg), 1); renderMyBets(); return; }
+  // ＋ to parlay: stage the current bet as a leg (needs a description + American odds)
+  if (e.target.closest('#mb-padd')) {
+    const text = $('#mb-text')?.value.trim();
+    const odds = Number($('#mb-odds')?.value);
+    if (!text || !odds || Math.abs(odds) < 100) { alert('A parlay leg needs a description and American odds (e.g. -120 or +100).'); return; }
+    const b = odds > 0 ? odds / 100 : 100 / -odds;
+    state.mbLegs.push({ t: `${text} ${fmtML(odds)}`, b });
+    renderMyBets();
+    setTimeout(() => { const t = $('#mb-text'); if (t) t.focus(); }, 20);
+    return;
+  }
+  // 🎰 log the staged legs as one manual parlay ticket
+  if (e.target.closest('#mb-plog')) {
+    const stake = Number($('#mb-pstake')?.value);
+    if (!(stake > 0)) { alert('Set the parlay stake (units above 0).'); return; }
+    if (state.mbLegs.length < 2) { alert('A parlay needs at least 2 legs — add another with ＋ to parlay.'); return; }
+    MyBets.addParlay(state.mbLegs, stake);
+    state.mbLegs = [];
+    renderMyBets(); renderBrain();
+    return;
+  }
+  if (e.target.closest('#mb-pclear')) { state.mbLegs = []; renderMyBets(); return; }
   if (e.target.closest('#mb-add')) {
     const text = $('#mb-text')?.value.trim();
     const odds = Number($('#mb-odds')?.value);
@@ -6136,7 +6217,7 @@ $('#mybetspanel').addEventListener('click', e => {
       return;
     }
     MyBets.addManual(text, odds, stake);
-    renderBrain();
+    renderMyBets(); renderBrain();
   }
 });
 
