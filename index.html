@@ -702,6 +702,9 @@
   .mb-parlayrow { flex-direction: column; align-items: stretch; gap: 3px; }
   .mb-phead { display: flex; align-items: center; gap: 8px; }
   .mb-phead .h-match { flex: 1; }
+  .sgpval { display: block; margin-top: 4px; padding: 5px 8px; border-radius: 8px; font-size: 10.5px;
+    color: #8affc0; background: rgba(0,255,136,.10); border: 1px solid rgba(0,255,136,.4); line-height: 1.5; }
+  .sgpval b { color: #d5ffe6; }
   .slip .s-actions .logbets { background: rgba(255,209,102,.12); border-color: rgba(255,209,102,.45); color: var(--gold); }
 
   /* ── Filter bar ── */
@@ -936,7 +939,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.2';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.3';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1207,6 +1210,23 @@ function spreadToProb(spread, sigma, sportId) {
   // a -3 NFL favorite wins more often than a smooth Normal admits because margins PILE on 3
   const pmf = sportId ? marginPMF(sportId, Math.abs(spread), sigma) : null;
   return pmf ? pmfHomeCover(pmf, 0) : normalCdf(Math.abs(spread) / sigma);
+}
+
+// Bivariate standard-normal CDF P(X≤h, Y≤k; ρ) — Drezner-Wesolowsky, 5-node Gauss-Legendre.
+// Powers the SGP correlation estimator: two legs' probs map to latent normal thresholds,
+// and the correlated joint hit-probability comes off this instead of a naive product.
+const BVN_X = [0.0469100770, 0.2307653449, 0.5, 0.7692346551, 0.9530899230];
+const BVN_W = [0.1184634425, 0.2393143352, 0.2844444444, 0.2393143352, 0.1184634425];
+function biNormCdf(h, k, rho) {
+  const r = Math.max(-0.9999, Math.min(0.9999, rho));
+  if (Math.abs(r) < 1e-6) return normalCdf(h) * normalCdf(k);
+  const hk = h * k, h2 = h * h, k2 = k * k;
+  let sum = 0;
+  for (let i = 0; i < 5; i++) {
+    const t = r * BVN_X[i], d = 1 - t * t;
+    sum += BVN_W[i] * Math.exp((2 * hk * t - h2 - k2) / (2 * d)) / Math.sqrt(d);
+  }
+  return Math.max(0, Math.min(1, normalCdf(h) * normalCdf(k) + r * sum / (2 * Math.PI)));
 }
 
 // ── Empirical "key numbers" margin engine (v15.2) ───────────────────────
@@ -5456,18 +5476,57 @@ function addLeg(leg) {
   saveSlip(); renderSlip();
 }
 
+// which game a leg belongs to (props encode game id in the 3rd gid segment)
+const gameOf = l => String(l.gid || '').startsWith('prop|') ? String(l.gid).split('|')[2] : String(l.gid);
+// a prop leg's over/under is the last gid segment
+const propSide = l => String(l.gid || '').startsWith('prop|') ? String(l.gid).split('|').pop() : null;
+
+// 🔗 SGP correlation coefficient between two legs IN THE SAME GAME. Only pairs whose sign
+// we can defend from structure get a non-zero ρ — ML↔spread move together (or against),
+// and game-total ↔ any player scoring-prop share the game's pace. Player↔team pairs are
+// left at 0 (the slip leg doesn't carry which side the player is on, so the sign isn't
+// safe to assume). Positive ρ ⇒ the true joint is HIGHER than an independent multiply.
+function sgpRho(a, b) {
+  const pair = (x, y) => (a.bt === x && b.bt === y) || (a.bt === y && b.bt === x);
+  const sameSide = a.side && b.side && a.side === b.side;
+  if (pair('ml', 'spread')) return sameSide ? 0.55 : -0.55;
+  if (pair('spread', 'total')) { const t = a.bt === 'total' ? a : b; return t.side === 'over' ? 0.18 : -0.18; }
+  if (pair('ml', 'total')) { const t = a.bt === 'total' ? a : b; return t.side === 'over' ? 0.12 : -0.12; }
+  // game total ↔ a scoring player prop: more/less game scoring lifts/dents any over
+  const totalLeg = a.bt === 'total' ? a : b.bt === 'total' ? b : null;
+  const propLeg = a.k === 'props' ? a : b.k === 'props' ? b : null;
+  if (totalLeg && propLeg) { const ps = propSide(propLeg); return (totalLeg.side === 'over') === (ps !== 'under') ? 0.30 : -0.30; }
+  // two player props in the same game: shared game pace, mild
+  if (a.k === 'props' && b.k === 'props') return (propSide(a) === 'under') === (propSide(b) === 'under') ? 0.20 : -0.20;
+  return 0;
+}
+
+// correlation-adjusted joint hit probability. Independent product, then each signable
+// same-game pair multiplies in its bivariate-normal ratio vs independence. Exact for a
+// single correlated pair; a well-behaved approximation for more.
+function sgpJoint(legs) {
+  const P = legs.reduce((p, l) => p * clamp(l.p, 0.01, 0.99), 1);
+  const groups = {};
+  legs.forEach(l => { const g = gameOf(l); (groups[g] = groups[g] || []).push(l); });
+  let ratio = 1, pairs = 0, netRho = 0;
+  for (const g in groups) {
+    const gl = groups[g];
+    for (let i = 0; i < gl.length; i++) for (let j = i + 1; j < gl.length; j++) {
+      const rho = sgpRho(gl[i], gl[j]);
+      if (!rho) continue;
+      const pi = clamp(gl[i].p, 0.01, 0.99), pj = clamp(gl[j].p, 0.01, 0.99);
+      ratio *= biNormCdf(invNorm(pi), invNorm(pj), rho) / (pi * pj);
+      pairs++; netRho += rho;
+    }
+  }
+  const Padj = Math.max(0.0001, Math.min(0.9999, P * ratio));
+  return { P, Padj, pairs, netRho };
+}
+
 function slipMath() {
   const D = state.slip.reduce((d, l) => d * (1 + l.b), 1);  // combined decimal odds
-  let P = state.slip.reduce((p, l) => p * l.p, 1);          // model prob (assumes independence)
-  // same-game legs are CORRELATED — a flat independence product overstates the combo.
-  // We can't sign the correlation cheaply, so take the conservative 5%-per-pairing
-  // haircut on the combined probability (the bookmaker-style treatment).
-  const gameOf = l => String(l.gid || '').startsWith('prop|') ? String(l.gid).split('|')[2] : String(l.gid);
-  const counts = {};
-  state.slip.forEach(l => { const g = gameOf(l); counts[g] = (counts[g] || 0) + 1; });
-  const sgPairs = Object.values(counts).reduce((s, n) => s + n * (n - 1) / 2, 0);
-  if (sgPairs) P *= Math.pow(0.95, sgPairs);
-  return { D, P, ev: P * D - 1, sgPairs };
+  const { P: Pind, Padj, pairs, netRho } = sgpJoint(state.slip);
+  return { D, P: Padj, Pind, sgPairs: pairs, netRho, ev: Padj * D - 1, evInd: Pind * D - 1 };
 }
 
 function handleParlay(btn) {
@@ -5500,14 +5559,28 @@ function renderSlip() {
   const legs = state.slip.map(l => `<div class="s-leg"><span>${SPORT_ICON[l.k] || '🎯'}</span>
     <span><b>${esc(l.t)}</b><div class="lg-m">${esc(l.m)} · ${esc(l.tm)} · model ${pct(l.p)}</div></span>
     <button class="rmleg" data-gid="${esc(l.gid)}">✕</button></div>`).join('');
-  const { D, P, ev, sgPairs } = slipMath();
+  const { D, P, Pind, ev, evInd, sgPairs, netRho } = slipMath();
   // singles use the same 5u cap as the cards; multi-leg parlays stay conservative at 2u
   const kelly = ev > 0 ? Math.min(n === 1 ? 5 : 2, Math.max(0.5, Math.round((D * P - 1) / (D - 1) * 0.25 * 1000) / 10)) : 0;
   const evStr = `<b class="${ev >= 0 ? 'pos' : 'neg'}">${(ev * 100).toFixed(1)}%</b>`;
+  // 🔗 SGP correlation read: naive independence vs the correlation-adjusted true joint.
+  // Positive net correlation lifts the true hit prob above the multiply → an SGP priced
+  // like independent legs is +EV; negative correlation is the classic parlay trap.
+  let sgpLine = '';
+  if (sgPairs) {
+    const lift = P - Pind;
+    if (netRho > 0 && ev > 0) {
+      sgpLine = `<br><span class="sgpval">🔗 SGP CORRELATION VALUE +${(ev * 100).toFixed(1)}% — the legs move together, so the true hit prob (<b>${pct(P)}</b>) beats the independent multiply (${pct(Pind)}). A book pricing this like separate legs is paying you the correlation.</span>`;
+    } else if (netRho > 0) {
+      sgpLine = `<br><span class="h-pick">🔗 positively correlated: true hit prob <b>${pct(P)}</b> vs ${pct(Pind)} independent (+${(lift * 100).toFixed(1)}%) — better than a naive parlay, but still ${(ev * 100).toFixed(1)}% EV at this price.</span>`;
+    } else {
+      sgpLine = `<br><span class="neg">⚠️ negatively correlated: true hit prob <b>${pct(P)}</b> vs ${pct(Pind)} independent (${(lift * 100).toFixed(1)}%) — these legs fight each other, the SGP is worse than it looks.</span>`;
+    }
+  }
   const math = n === 1
     ? `<div class="s-math">model ${pct(P)} to hit · EV ${evStr}${kelly ? ` · stake <b>${fmtStake(kelly)}</b>` : ''}</div>`
     : `<div class="s-math">${n}-leg parlay ≈ <b>${fmtML(probToAmerican(clamp(1 / D)))}</b> · model <b>${pct(P)}</b> to hit<br>
-       EV ${evStr}${kelly ? ` · stake <b>${fmtStake(kelly)}</b>` : ' · <span class="neg">−EV — parlays stack vig, skip it</span>'}${sgPairs ? '<br><span class="neg">⚠️ same-game legs are correlated — hit prob discounted 5%/pairing</span>' : ''}</div>`;
+       EV ${evStr}${kelly ? ` · stake <b>${fmtStake(kelly)}</b>` : ' · <span class="neg">−EV — parlays stack vig, skip it</span>'}${sgpLine}</div>`;
   box.innerHTML = `<div class="slip">
     <div class="s-head" id="sliphead">🎟️ BET SLIP · ${n}<span class="x">— minimize</span></div>
     ${legs}${math}
