@@ -942,7 +942,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.5';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.6';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1537,13 +1537,18 @@ const Brain = (() => {
   // whichever has the lower historical Brier score (bb = baseline, be = Elo). Until then
   // it falls back to the caller's maxW. It's always further throttled by sample size, so
   // a barely-seen team never gets a big Elo weight.
-  function adjust(sport, home, away, pRaw, hfaLogit, maxW = 0.65, calibrate = true, surf = null) {
-    const { p: pElo, eH, eA } = eloProb(sport, teamKey(home), teamKey(away), hfaLogit, surf);
-    const nMin = Math.min(eH.n, eA.n);
+  // how much of the forecast comes from Elo vs the record-based prior. Shared by adjust()
+  // and learn() so the calibration layer is FIT on exactly the quantity it's APPLIED to.
+  const LEARN_MAXW = { tennis: 0.6, mma: 0.6 };   // mirrors the adjust() call sites
+  const blendW = (sport, nMin, maxW) => {
     const perf = db.perf[sport];
     const topW = (perf && perf.n >= 30 && perf.bb + perf.be > 0)
-      ? clamp(perf.bb / (perf.bb + perf.be), 0.2, 0.85) : maxW;
-    const w = Math.min(topW, nMin / (nMin + 12));
+      ? clamp(perf.bb / (perf.bb + perf.be), 0.2, 0.85) : (maxW ?? LEARN_MAXW[sport] ?? 0.65);
+    return Math.min(topW, nMin / (nMin + 12));
+  };
+  function adjust(sport, home, away, pRaw, hfaLogit, maxW = 0.65, calibrate = true, surf = null) {
+    const { p: pElo, eH, eA } = eloProb(sport, teamKey(home), teamKey(away), hfaLogit, surf);
+    const w = blendW(sport, Math.min(eH.n, eA.n), maxW);
     let x = (1 - w) * logit(clamp(pRaw)) + w * logit(clamp(pElo));
     if (calibrate) { const c = getCalib(sport); x = c.a + c.b * x; }
     return clamp(invlogit(x));
@@ -1562,6 +1567,8 @@ const Brain = (() => {
 
   function learn(sport, kH, kA, hfaLogit, scoreH, mov = 1, day = null, surf = null, pRaw = null, wt = 1) {
     const { p: pElo, eH, eA } = eloProb(sport, kH, kA, hfaLogit, surf, day);
+    const nMinPre = Math.min(eH.n, eA.n);   // pre-update sample size — the calibration fit
+                                            // must see the same weight the forecast used
     // MOV multiplier — logarithmic diminishing returns scaled to the sport's typical
     // margin (so a blowout can't distort a team's structural rating), capped at 2×, and
     // damped by the 538 autocorrelation term so a big favorite winning big doesn't runaway.
@@ -1609,7 +1616,14 @@ const Brain = (() => {
     }
     if (scoreH !== 0.5) {
       const c = getCalib(sport);
-      const x = logit(clamp(pElo));
+      // (v16.6) FIT ON WHAT WE APPLY IT TO. This used to fit the recalibration map on the
+      // raw Elo logit while adjust() applied it to the Elo/prior BLEND — a train/apply
+      // mismatch, so the learned slope was scaled for a different input distribution.
+      // Now both sides use the identical blended logit.
+      const w = blendW(sport, nMinPre);
+      const x = pRaw != null
+        ? (1 - w) * logit(clamp(pRaw)) + w * logit(clamp(pElo))
+        : logit(clamp(pElo));
       const p = clamp(invlogit(c.a + c.b * x));
       c.a = Math.max(-0.6, Math.min(0.6, c.a + LR * (scoreH - p)));
       c.b = Math.max(0.5, Math.min(1.6, c.b + LR * (scoreH - p) * x));
@@ -5366,6 +5380,30 @@ function renderCalibration() {
   });
   brier /= log.length;
   const meanPred = pSum / log.length, actual = hitSum / log.length, gap = actual - meanPred;
+  // ── Murphy decomposition (v16.6): Brier ≈ Reliability − Resolution + Uncertainty ──
+  // The standard forecast-verification test, and it answers a question the reliability
+  // curve alone cannot: does this model actually DISCRIMINATE, or is it just honest?
+  // (Binned form — with continuous forecasts the identity carries a small within-bin
+  // variance residual, ~0.0007 here, so treat these as the standard estimates.)
+  // Reliability = calibration error (lower better). Resolution = how far each confidence
+  // bucket's real hit-rate strays from the overall base rate (higher better) — a model
+  // that predicts the base rate every single time is perfectly calibrated and completely
+  // useless, and only resolution exposes that. Skill = (Resolution − Reliability) ÷ Uncertainty.
+  let rel = 0, res = 0;
+  buckets.forEach(b => {
+    if (!b.n) return;
+    const pk = b.psum / b.n, ok = b.hit / b.n;
+    rel += b.n * (pk - ok) ** 2;
+    res += b.n * (ok - actual) ** 2;
+  });
+  rel /= log.length; res /= log.length;
+  const unc = actual * (1 - actual);
+  const bss = unc > 0 ? (res - rel) / unc : 0;
+  const skillChip = bss >= 0.04
+    ? `<span class="chip hit">🧠 real skill · +${(bss * 100).toFixed(1)}%</span>`
+    : bss >= 0.005
+      ? `<span class="chip lean">slim skill · +${(bss * 100).toFixed(1)}%</span>`
+      : `<span class="chip miss">no discrimination · ${(bss * 100).toFixed(1)}%</span>`;
   // reliability diagram: model-said (x) vs actually-hit (y); dashed diagonal = perfect
   const X = p => ((p - 0.5) / 0.5) * 100, Y = a => 100 - ((a - 0.5) / 0.5) * 100;
   const dots = buckets.filter(b => b.n > 0).map(b => {
@@ -5387,6 +5425,7 @@ function renderCalibration() {
   el.innerHTML = `<div class="hist">
     <div class="h-date">📊 CALIBRATION — does the model's confidence match reality?</div>
     <div class="bo-fair">Across ${log.length} finished picks it claims <b>${(meanPred * 100).toFixed(1)}%</b> on average and actually hits <b>${(actual * 100).toFixed(1)}%</b> · Brier <b>${brier.toFixed(3)}</b>. ${verdict}</div>
+    <div class="bo-fair" title="Murphy decomposition — the standard forecast-verification breakdown. Reliability is calibration error (lower is better). Resolution measures how far each confidence bucket's real hit-rate strays from the base rate — that's genuine discrimination, and it's the number that proves the model knows something rather than just parroting the average. Skill = (Resolution − Reliability) ÷ Uncertainty, i.e. how much better than always predicting the base rate of these same picks.">🔬 <b>skill breakdown</b> · reliability <b>${rel.toFixed(4)}</b> (calibration error, lower better) · resolution <b>${res.toFixed(4)}</b> (discrimination, higher better) · base-rate uncertainty ${unc.toFixed(4)} → ${skillChip} <span style="opacity:.75">vs always guessing the base rate. Resolution near zero would mean it's honest but says nothing — it's the number that proves the model has real information.</span></div>
     <svg viewBox="-8 -8 116 122" style="width:100%;max-width:340px;height:230px;margin:8px 0">
       <line x1="0" y1="100" x2="100" y2="0" stroke="var(--muted)" stroke-dasharray="3 3" stroke-width="0.8"/>
       ${dots}
