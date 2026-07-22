@@ -708,6 +708,8 @@
   .tierbar { margin-top: -6px; }
   .tierbtn b { color: var(--accent); font-weight: 700; margin-left: 2px; }
   .tierbtn.on b { color: var(--bg); }
+  .tierhint { font-size: 10.5px; color: #ffd75e; background: rgba(255,190,40,.08);
+    border: 1px solid rgba(255,190,60,.30); border-radius: 8px; padding: 4px 9px; cursor: help; }
   .slip .s-actions .logbets { background: rgba(255,209,102,.12); border-color: rgba(255,209,102,.45); color: var(--gold); }
 
   /* ── Filter bar ── */
@@ -942,7 +944,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.6';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.7';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -5467,10 +5469,15 @@ function tierBar(sport, events) {
     `<button class="f-btn tierbtn ${state.tennisTier === v ? 'on' : ''}" data-tier="${esc(v)}">${label}${count != null ? ` <b>${count}</b>` : ''}</button>`;
   const pills = TIERS.filter(t => n(t)).map(t => chip(t, t, n(t))).join('');
   const kOnly = events.filter(g => g.kalshiOnly).length;
+  // ESPN's tennis scoreboards only carry the ATP/WTA MAIN tours — Challenger and ITF
+  // (the bulk of the daily calendar, ~250 matches) exist only through Kalshi. Without the
+  // relay those tiers just silently don't appear, which reads like a bug. Say so instead.
+  const missing = !Kalshi.proxy() && !TIERS.slice(2).some(t => n(t));
   return `<div class="fbar tierbar">
     <span class="f-sep">TOUR</span>
     ${chip('all', 'All', events.length)}${pills}
     ${kOnly ? `<span class="f-sep" title="Matches ESPN doesn't list — pulled from Kalshi's ATP/WTA/Challenger/ITF markets. Cards without ranking history show the market price only, never a model edge.">💹 ${kOnly} via Kalshi</span>` : ''}
+    ${missing ? `<span class="tierhint" title="ESPN's tennis feed only publishes the ATP and WTA main tours. Challenger and ITF draws — usually 250+ matches a day — are only available through Kalshi, so they appear here once the 💹 relay URL is set in the top bar.">💤 no Challenger/ITF — those come from Kalshi · add your 💹 relay URL up top to pull them in</span>` : ''}
   </div>`;
 }
 
