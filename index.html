@@ -705,6 +705,9 @@
   .sgpval { display: block; margin-top: 4px; padding: 5px 8px; border-radius: 8px; font-size: 10.5px;
     color: #8affc0; background: rgba(0,255,136,.10); border: 1px solid rgba(0,255,136,.4); line-height: 1.5; }
   .sgpval b { color: #d5ffe6; }
+  .tierbar { margin-top: -6px; }
+  .tierbtn b { color: var(--accent); font-weight: 700; margin-left: 2px; }
+  .tierbtn.on b { color: var(--bg); }
   .slip .s-actions .logbets { background: rgba(255,209,102,.12); border-color: rgba(255,209,102,.45); color: var(--gold); }
 
   /* ── Filter bar ── */
@@ -939,7 +942,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.4';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.5';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1022,6 +1025,7 @@ const state = {
   liveProps: { key: null, items: null, loading: false },
   propLegs: [],
   mbLegs: [],                  // manual parlay builder: staged legs before logging
+  tennisTier: 'all',           // 🎾 tour-tier filter: all | ATP | WTA | ATP Ch | WTA Ch | ITF
 };
 try { state.slip = JSON.parse(localStorage.getItem('de-slip-v1')) || []; } catch {}
 try { Object.assign(state.esports, JSON.parse(localStorage.getItem('de-elab-v1')) || {}); } catch {}
@@ -2041,9 +2045,14 @@ const Kalshi = (() => {
   const KEY = 'de-kalshi-proxy';
   const SERIES = { mlb: 'KXMLBGAME', wnba: 'KXWNBAGAME', nba: 'KXNBAGAME', nhl: 'KXNHLGAME',
                    nfl: 'KXNFLGAME', mma: 'KXUFCFIGHT', mls: 'KXMLSGAME' };
-  // 🎾 tennis is the one sport ESPN prices NOWHERE, so Kalshi IS its market. Four series
-  // cover tour + challenger for both tours; markets are titled with full player names.
-  const TENNIS_SERIES = ['KXATPMATCH', 'KXWTAMATCH', 'KXATPCHALLENGERMATCH', 'KXWTACHALLENGERMATCH'];
+  // 🎾 tennis is the one sport ESPN prices NOWHERE, so Kalshi IS its market — and it also
+  // covers FAR more of the sport than ESPN's atp/wta scoreboards (ITF alone runs ~250
+  // matches a day). Six singles series, each mapping to a tour tier.
+  const TENNIS_SERIES = {
+    KXATPMATCH: 'ATP', KXWTAMATCH: 'WTA',
+    KXATPCHALLENGERMATCH: 'ATP Ch', KXWTACHALLENGERMATCH: 'WTA Ch',
+    KXITFMATCH: 'ITF', KXITFWMATCH: 'ITF',
+  };
   // per-game PLAYER milestone series (probed live: markets titled "Player: 15+", one per
   // player-threshold, ladders like 10+/15+/20+) — powers the prop LINE PICKER
   const PROP_SERIES = {
@@ -2123,11 +2132,36 @@ const Kalshi = (() => {
       return out.sort((a, b) => a.thr - b.thr);
     },
     hasPropSeries: (sportId, stat) => !!PROP_SERIES[sportId]?.[stat],
+    // 🎾 every tennis match Kalshi prices on a given date, across all six singles series.
+    // ESPN's scoreboards only carry ATP/WTA main tours, so this is where Challenger and
+    // ITF play (the bulk of the daily calendar) actually comes from.
+    async tennisMatches(date) {
+      if (!base()) return [];
+      const series = Object.keys(TENNIS_SERIES);
+      const lists = await Promise.all(series.map(s => seriesEvents(s)));
+      const code = dayCode(date);
+      const out = [];
+      lists.forEach((events, i) => {
+        const tier = TENNIS_SERIES[series[i]];
+        (events || []).forEach(e => {
+          const dpart = (e.event_ticker || '').split('-')[1] || '';
+          if (!dpart.startsWith(code)) return;
+          const mk = (e.markets || []).filter(m => m.yes_sub_title);
+          if (mk.length !== 2) return;
+          // title reads "A vs B" — keep that order (A on top, like the ESPN cards)
+          out.push({ ticker: e.event_ticker, tier, title: e.title || '',
+                     away: { name: mk[0].yes_sub_title, q: px(mk[0]) },
+                     home: { name: mk[1].yes_sub_title, q: px(mk[1]) },
+                     rules: mk[0].rules_primary || '' });
+        });
+      });
+      return out;
+    },
     async attach(sport, evs) {
       if (!base()) return false;
       // 🎾 tennis: match on PLAYER names across the four match series
       if (sport.tennis) {
-        const lists = await Promise.all(TENNIS_SERIES.map(s => seriesEvents(s)));
+        const lists = await Promise.all(Object.keys(TENNIS_SERIES).map(s => seriesEvents(s)));
         const events = lists.filter(Boolean).flat();
         if (!events.length) return false;
         let hit = false;
@@ -2800,6 +2834,13 @@ async function fetchSport(sport, date, force = false) {
       getRankings(),
     ]);
     events = parseTennis(jsons, ranks, date);
+    // 🎾 fold in every match Kalshi prices that ESPN doesn't list (Challenger + ITF are
+    // the bulk of the daily calendar and never appear on ESPN's atp/wta scoreboards)
+    try {
+      const rows = await Kalshi.tennisMatches(date);
+      if (rows.length) events = events.concat(kalshiTennisGames(rows, events, date));
+    } catch {}
+    events.sort((a, b) => (STATE_ORDER[a.state] - STATE_ORDER[b.state]) || (a.start - b.start));
   } else if (sport.mma) {
     const res = await fetchRetry(`${API}/${sport.path}/scoreboard?dates=${ymd(date)}`);
     events = parseMMA(await res.json(), sport);
@@ -3147,6 +3188,10 @@ function computeBestPick(g, sport) {
   const v = g.vegas;
   // 🎾 tennis prices come from Kalshi (ESPN carries none)
   if (g.tennis) {
+    // no Elo history on one or both players → we have no independent read, so the only
+    // honest thing to show is the market. Never bet a 50/50 default against a real price.
+    if (g.noModel) return { kind: 'model', text: `${pickName} to win`,
+      sub: 'Kalshi market price · no ranking history for these players — no model edge' };
     const tc = tennisCands(g);
     if (!tc.length) return { kind: 'model', text: `${pickName} to win`,
       sub: Kalshi.proxy() ? 'ranking model · no Kalshi market matched' : 'ranking model · connect the 💹 relay for live tennis prices' };
@@ -3256,7 +3301,7 @@ function finishPick(g, sport, cands) {
   // pick strip (same precedent as the portfolio guard); the canonical logged stake stays a
   // pure function of price+edge so the ⭐ ledger reads identically on every device.
   let slip = null;
-  const vel = typeof Open !== 'undefined' ? Open.velocity(sport.id, g) : null;
+  const vel = typeof Open !== 'undefined' && sport?.id ? Open.velocity(sport.id, g) : null;
   if (vel && best.units) {
     const decay = Math.min(0.20, 0.10 + Math.abs(vel.dp) * 2);   // 1.5-pt move → −13%, 5-pt → −20%
     slip = { pct: Math.round(decay * 100), dp: vel.dp, mins: vel.mins,
@@ -3748,9 +3793,11 @@ function parseTennis(jsons, ranks, date) {
       if (!/Singles/i.test(gname) || /Doubles/i.test(gname)) return;
       const tour = /Women/i.test(gname) ? 'WTA' : 'ATP';
       const evName = ev.name || ev.shortName || '';
+      // tier keys are shared with the Kalshi ingest so the tab's filter pills line up:
+      // ATP · WTA · ATP Ch · WTA Ch · ITF (WTA 125 is the WTA challenger tier)
       const tier = /davis cup|billie jean king cup|fed cup|united cup|hopman cup|\bitf\b/i.test(evName) ? 'ITF'
-        : /challenger/i.test(evName) ? `${tour} Challenger`
-        : /\b125\b/.test(evName) ? 'WTA 125'
+        : /challenger/i.test(evName) ? `${tour} Ch`
+        : /\b125\b/.test(evName) ? 'WTA Ch'
         : tour;
       (grp.competitions || []).forEach(comp => {
         if (seen.has(comp.id)) return;
@@ -3809,17 +3856,78 @@ function parseTennis(jsons, ranks, date) {
           start,
           venue: [tier, ev.shortName || ev.name, { grass: '🌿 grass', clay: '🧱 clay', hard: '🏟️ hard' }[surf], round, comp.venue?.court].filter(Boolean).join(' · '),
           tv: '',
-          tennis: true,
+          tennis: true, tier,
           surface: surf,
           correct: null,
         };
         if (g.state === 'post') g.correct = g.pick === (home.winner ? 'home' : 'away');
-        g.bp = computeBestPick(g);
+        g.bp = computeBestPick(g, SPORTS.find(s => s.tennis));
         out.push(g);
       });
     });
   }));
   return out.sort((a, b) => (STATE_ORDER[a.state] - STATE_ORDER[b.state]) || (a.start - b.start));
+}
+
+// Kalshi titles players in full ("Anhelina Kalinina"); ESPN — and therefore the tennis
+// Elo brain — keys them short ("A. Kalinina"). Convert so we can look up real history.
+function espnStyleName(full) {
+  const w = String(full || '').trim().split(/\s+/);
+  if (w.length < 2) return String(full || '');
+  return `${w[0][0]}. ${w.slice(1).join(' ')}`;
+}
+
+// 🎾 (v16.5) Kalshi-sourced tennis matches. ESPN's scoreboards only carry the ATP/WTA
+// main tours, so Challenger and ITF play — the bulk of the daily calendar — never showed
+// up. These synthesize into real cards with live prices.
+// HONESTY GUARD: a card only earns a model read (and therefore a bet) when BOTH players
+// have real Elo history. Without it the "model" would be a 50/50 default, and a 50/50
+// default disagreeing with a 70/30 market manufactures fake edge on every longshot — so
+// those matches are shown as market-only and never produce a pick.
+function kalshiTennisGames(rows, espnGames, date) {
+  const key = n => String(n || '').toLowerCase().replace(/[^a-z]/g, '').slice(-12);
+  const taken = new Set();
+  espnGames.forEach(g => taken.add([key(g.home.name), key(g.away.name)].sort().join('|')));
+  const out = [];
+  rows.forEach(row => {
+    const k = [key(row.home.name), key(row.away.name)].sort().join('|');
+    if (taken.has(k)) return;            // ESPN already lists it — keep the richer card
+    taken.add(k);
+    const mkSide = s => {
+      const short = espnStyleName(s.name);
+      const e = Brain.rating('tennis', { name: short, flagLogo: true });
+      return { name: short, full: s.name, abbr: String(s.name).split(' ').pop(),
+               logo: '', flagLogo: true, elo: e,
+               recSummary: e && e.n >= 3 ? `⚡${Math.round(e.r)} · ${e.n} logged` : 'no ranking history',
+               pts: null, sets: [], score: '', winner: false };
+    };
+    const home = mkSide(row.home), away = mkSide(row.away);
+    const cents = q => q && (q.ask || q.bid || q.last) ? ((q.bid && q.ask) ? (q.bid + q.ask) / 2 : (q.ask || q.bid || q.last)) : null;
+    const ch = cents(row.home.q), ca = cents(row.away.q);
+    const priorH = ch != null && ca != null ? ch / (ch + ca) : ch != null ? ch / 100 : ca != null ? 1 - ca / 100 : 0.5;
+    const known = home.elo && away.elo && home.elo.n >= 3 && away.elo.n >= 3;
+    const p = known ? clamp(1 / (1 + Math.pow(10, (away.elo.r - home.elo.r) / 400)), 0.03, 0.97)
+                    : clamp(priorH, 0.02, 0.98);
+    const model = { home: p, away: 1 - p, draw: 0 };
+    const pick = p >= 0.5 ? 'home' : 'away';
+    const tourney = (row.rules.match(/in the (.+?) (?:Round|Quarter|Semi|Final|R\d)/i)?.[1] || '').trim();
+    const g = {
+      id: 'k|' + row.ticker, home, away, model, pick, pickProb: model[pick],
+      vegas: null, edge: null, marketPrior: !known, proj: null,
+      // Kalshi's ticker gives the DATE but no start time — anchor to midday so the card
+      // sorts sanely without claiming a precise tip-off it doesn't know
+      state: 'pre', statusText: 'time TBD',
+      start: (() => { const d = new Date(date); d.setHours(12, 0, 0, 0); return d; })(),
+      venue: [row.tier, tourney, '💹 Kalshi'].filter(Boolean).join(' · '),
+      tv: '', tennis: true, tier: row.tier, kalshiOnly: true, noModel: !known,
+      kalshi: { home: row.home.q, away: row.away.q, ticker: row.ticker, t: Date.now() },
+      surface: null, correct: null,
+    };
+    g.sportId = 'tennis';
+    g.bp = computeBestPick(g, SPORTS.find(s => s.tennis));
+    out.push(g);
+  });
+  return out;
 }
 
 // ── Rendering ──────────────────────────────────────────────────────────
@@ -5297,16 +5405,34 @@ function renderContent(sport, entry) {
     return;
   }
   let grid = entry.events;
+  // 🎾 tour-tier filter (ATP / WTA / Challengers / ITF) — the tennis calendar is huge
+  if (sport.tennis && state.tennisTier !== 'all') grid = grid.filter(g => g.tier === state.tennisTier);
   if (state.filter === 'ev') grid = grid.filter(g => g.bp?.kind === 'ev');
   else if (state.filter !== 'all') grid = grid.filter(g => g.state === state.filter);
   if (state.sort === 'ev') grid = [...grid].sort((a, b) => (b.bp?.ev ?? -9) - (a.bp?.ev ?? -9));
   else if (state.sort === 'conf') grid = [...grid].sort((a, b) => b.pickProb - a.pickProb);
   c.innerHTML = summaryBar(entry.events, sport) + heroCard(entry.events) + bestBets(entry.events)
-    + filterBar()
+    + filterBar() + tierBar(sport, entry.events)
     + (grid.length
         ? `<div class="games">${grid.map((g, i) => gameCard(g, i, sport)).join('')}</div>`
         : '<div class="empty">no games match this filter</div>');
   applySearch();
+}
+
+// 🎾 tour-tier pills, with a live count per tier so an empty tier is obvious before you tap
+function tierBar(sport, events) {
+  if (!sport.tennis) return '';
+  const TIERS = ['ATP', 'WTA', 'ATP Ch', 'WTA Ch', 'ITF'];
+  const n = t => events.filter(g => g.tier === t).length;
+  const chip = (v, label, count) =>
+    `<button class="f-btn tierbtn ${state.tennisTier === v ? 'on' : ''}" data-tier="${esc(v)}">${label}${count != null ? ` <b>${count}</b>` : ''}</button>`;
+  const pills = TIERS.filter(t => n(t)).map(t => chip(t, t, n(t))).join('');
+  const kOnly = events.filter(g => g.kalshiOnly).length;
+  return `<div class="fbar tierbar">
+    <span class="f-sep">TOUR</span>
+    ${chip('all', 'All', events.length)}${pills}
+    ${kOnly ? `<span class="f-sep" title="Matches ESPN doesn't list — pulled from Kalshi's ATP/WTA/Challenger/ITF markets. Cards without ranking history show the market price only, never a model edge.">💹 ${kOnly} via Kalshi</span>` : ''}
+  </div>`;
 }
 
 function filterBar() {
@@ -6282,6 +6408,7 @@ function contentClick(e) {
   }
   const fb = e.target.closest('.f-btn');
   if (fb) {
+    if (fb.dataset.tier) state.tennisTier = fb.dataset.tier;
     if (fb.dataset.f) state.filter = fb.dataset.f;
     if (fb.dataset.s) state.sort = fb.dataset.s;
     renderActive(); return;
