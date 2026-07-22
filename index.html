@@ -939,7 +939,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.3';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.4';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -2040,7 +2040,10 @@ const LiveTape = (() => {
 const Kalshi = (() => {
   const KEY = 'de-kalshi-proxy';
   const SERIES = { mlb: 'KXMLBGAME', wnba: 'KXWNBAGAME', nba: 'KXNBAGAME', nhl: 'KXNHLGAME',
-                   nfl: 'KXNFLGAME', mma: 'KXUFCFIGHT' };
+                   nfl: 'KXNFLGAME', mma: 'KXUFCFIGHT', mls: 'KXMLSGAME' };
+  // 🎾 tennis is the one sport ESPN prices NOWHERE, so Kalshi IS its market. Four series
+  // cover tour + challenger for both tours; markets are titled with full player names.
+  const TENNIS_SERIES = ['KXATPMATCH', 'KXWTAMATCH', 'KXATPCHALLENGERMATCH', 'KXWTACHALLENGERMATCH'];
   // per-game PLAYER milestone series (probed live: markets titled "Player: 15+", one per
   // player-threshold, ladders like 10+/15+/20+) — powers the prop LINE PICKER
   const PROP_SERIES = {
@@ -2121,7 +2124,30 @@ const Kalshi = (() => {
     },
     hasPropSeries: (sportId, stat) => !!PROP_SERIES[sportId]?.[stat],
     async attach(sport, evs) {
-      if (!base() || !SERIES[sport.id]) return false;
+      if (!base()) return false;
+      // 🎾 tennis: match on PLAYER names across the four match series
+      if (sport.tennis) {
+        const lists = await Promise.all(TENNIS_SERIES.map(s => seriesEvents(s)));
+        const events = lists.filter(Boolean).flat();
+        if (!events.length) return false;
+        let hit = false;
+        evs.forEach(g => {
+          if (g.state === 'post' || g.kalshi?.t > Date.now() - 40000) return;
+          const codes = [dayCode(g.start), dayCode(new Date(g.start.getTime() + 864e5))];
+          for (const e of events) {
+            const dpart = (e.event_ticker || '').split('-')[1] || '';
+            if (!codes.some(c => dpart.startsWith(c))) continue;
+            const mh = (e.markets || []).find(m => samePlayer(m.yes_sub_title, g.home.name));
+            const ma = (e.markets || []).find(m => samePlayer(m.yes_sub_title, g.away.name));
+            if (mh && ma && mh !== ma) {
+              g.kalshi = { home: px(mh), away: px(ma), ticker: e.event_ticker, t: Date.now() };
+              hit = true; break;
+            }
+          }
+        });
+        return hit;
+      }
+      if (!SERIES[sport.id]) return false;
       const events = await eventsFor(sport.id);
       if (!events) return false;
       let hit = false;
@@ -2154,9 +2180,14 @@ const MyBets = (() => {
       if (t === leg.line) return 'push';
       return (leg.side === 'over' ? t > leg.line : t < leg.line) ? 'won' : 'lost';
     }
+    const soccer = SPORTS.find(s => s.id === leg.k)?.soccer;
+    if (leg.bt === 'draw') {   // 3-way draw ticket: wins only when neither side wins
+      return (g.home.winner !== true && g.away.winner !== true) ? 'won' : 'lost';
+    }
     if (leg.bt === 'ml') {
       const hw = g.home.winner === true, aw = g.away.winner === true;
-      if (!hw && !aw) return 'push';
+      // a draw PUSHES a 2-way moneyline but LOSES a 3-way (soccer) one
+      if (!hw && !aw) return soccer ? 'lost' : 'push';
       return (leg.side === 'home' ? hw : aw) ? 'won' : 'lost';
     }
     return null;
@@ -2821,7 +2852,13 @@ async function fetchSport(sport, date, force = false) {
   MyBets.trackClose(sport, events);      // capture closing market line on open ml legs (CLV)
   LiveTape.record(sport, events);        // score snapshots → live momentum runs
   // live Kalshi prices via the user's proxy Worker (fire-and-forget: re-render on arrival)
-  Kalshi.attach(sport, events).then(hit => { if (hit && state.tab === sport.id) renderActive(); }).catch(() => {});
+  Kalshi.attach(sport, events).then(hit => {
+    if (!hit) return;
+    // tennis has no ESPN price, so its pick can only be graded once Kalshi arrives —
+    // recompute the board now that the match actually has a market
+    if (sport.tennis) events.forEach(g => { if (g.kalshi && g.state === 'pre') g.bp = computeBestPick(g, sport); });
+    if (state.tab === sport.id || state.tab === 'card') renderActive();
+  }).catch(() => {});
   return entry;
 }
 
@@ -2830,7 +2867,38 @@ function parseVegas(comp, sport, home) {
   if (!odds) return null;
   const v = { detail: odds.details || '', ou: odds.overUnder, homeProb: null,
               mlHome: null, mlAway: null, mlFav: null, spread: null, favIsHome: null };
-  const hML = odds.homeTeamOdds?.moneyLine, aML = odds.awayTeamOdds?.moneyLine;
+  // (v16.4) NESTED ODDS BLOCK — the richest thing in the feed and previously unused.
+  // It carries real prices for both sides, THE DRAW (the only place soccer 3-way lives),
+  // and the total's actual juice instead of our −110 assumption.
+  const num = s => { const n = Number(String(s ?? '').replace('+', '')); return isFinite(n) && Math.abs(n) >= 100 ? n : null; };
+  const px = o => num(o?.close?.odds) ?? num(o?.open?.odds);
+  if (odds.moneyline) {
+    const h = px(odds.moneyline.home), a = px(odds.moneyline.away), d = px(odds.moneyline.draw);
+    if (h && a) { v.mlHome = h; v.mlAway = a; }
+    if (d) v.mlDraw = d;
+  }
+  if (!v.mlDraw && num(odds.drawOdds?.moneyLine)) v.mlDraw = num(odds.drawOdds.moneyLine);
+  if (odds.total) {
+    const ov = px(odds.total.over), un = px(odds.total.under);
+    const ln = parseFloat(String(odds.total.over?.close?.line ?? odds.total.over?.open?.line ?? '').replace(/[^0-9.]/g, ''));
+    if (ov && un) { v.ouOver = ov; v.ouUnder = un; if (isFinite(ln)) v.ou = ln; }
+  }
+  if (odds.pointSpread) {
+    const sh = px(odds.pointSpread.home), sa = px(odds.pointSpread.away);
+    if (sh && sa) { v.spOver = sh; v.spUnder = sa; }   // real spread juice, both sides
+  }
+  // 3-way (soccer): proportional de-vig across all three outcomes → fair market prior
+  if (v.mlHome && v.mlAway && v.mlDraw) {
+    const ih = mlToProb(v.mlHome), ia = mlToProb(v.mlAway), id = mlToProb(v.mlDraw);
+    const s = ih + ia + id;
+    if (s > 0) {
+      v.fair3 = { home: ih / s, draw: id / s, away: ia / s };
+      v.hold3 = s - 1;                                  // the book's 3-way hold
+      v.homeProb = v.fair3.home;
+      return v;
+    }
+  }
+  const hML = odds.homeTeamOdds?.moneyLine ?? v.mlHome, aML = odds.awayTeamOdds?.moneyLine ?? v.mlAway;
   if (hML && aML) {
     v.mlHome = hML; v.mlAway = aML;
     // the book's posted spread magnitude rides along → synthetic cross-asset bridge
@@ -2989,17 +3057,113 @@ const OVERROUND = 1.045;       // assumed two-way book margin when only one pric
 // never a parallel universe. This is the clamp that makes rogue data physically unable
 // to manufacture a giant fake edge.
 const ALPHA_CAP = 0.05;
+// (v16.4) Soccer and tennis earn a TIGHTER alpha than the ball sports, for three honest
+// reasons: their models are cruder (points-per-game + Pythagorean / ranking Elo, no xG or
+// serve data), three-way soccer books hold ~8% vs ~4.5% two-way — so the same alpha clears
+// the vig far too easily — and neither sport feeds the edge-trust learner yet. Measured on
+// a live 15-game MLS slate: a 5% cap flagged 10 of 15 games (+EV in 67% of a liquid market
+// is not credible); 3% flags 4 with a 5.1% top edge, which is a defensible edge profile.
+const SOFT_ALPHA_CAP = 0.03;
 const PORTFOLIO_CAP = 12;      // max correlated units at risk simultaneously (12% bankroll)
+
+// ⚽ (v16.4) soccer candidates from the REAL 3-way prices in the nested odds block.
+// Same Bayesian discipline as the ball sports: the de-vigged 3-way market is the prior,
+// the Dixon-Coles model earns a bounded alpha per outcome, then we renormalize so the
+// three posteriors still sum to 1. Totals come off the Poisson goal sum at the real price.
+function soccerCands(g, v) {
+  const cands = [];
+  if (!v) return cands;
+  if (v.fair3) {
+    const prior = v.fair3, mdl = g.model || {};
+    const post = {};
+    ['home', 'draw', 'away'].forEach(k => {
+      const pr = prior[k], m = mdl[k];
+      post[k] = m == null ? pr : Math.max(0.005, pr + Math.max(-SOFT_ALPHA_CAP, Math.min(SOFT_ALPHA_CAP, m - pr)));
+    });
+    const s = post.home + post.draw + post.away;
+    ['home', 'draw', 'away'].forEach(k => post[k] /= s);
+    const priceOf = { home: v.mlHome, draw: v.mlDraw, away: v.mlAway };
+    const nameOf = { home: g.home.abbr, draw: 'Draw', away: g.away.abbr };
+    ['home', 'draw', 'away'].forEach(k => {
+      const ml = priceOf[k];
+      if (!ml) return;
+      cands.push({ side: k, type: k === 'draw' ? 'draw' : 'ml', p: post[k], fair: prior[k],
+        b: ml > 0 ? ml / 100 : 100 / -ml, imp: mlToProb(ml),
+        text: `${nameOf[k]} ${fmtML(ml)}`,
+        subText: `3-way mkt ${pct(prior[k])} ${post[k] >= prior[k] ? '+' : '−'}${Math.abs((post[k] - prior[k]) * 100).toFixed(1)}α vs implied ${pct(mlToProb(ml))}` });
+    });
+  }
+  // totals off the model's Poisson goal sum, priced at the book's real over/under juice
+  if (v.ou != null && g.proj?.soccer && v.ouOver && v.ouUnder) {
+    const lam = Math.max(0.2, (g.proj.h || 0) + (g.proj.a || 0));
+    const rawOver = poissonOver(v.ou, lam);
+    const impO = mlToProb(v.ouOver), impU = mlToProb(v.ouUnder), tot = impO + impU;
+    const priorO = tot > 0 ? impO / tot : 0.5;
+    const pOver = clamp(priorO + Math.max(-SOFT_ALPHA_CAP, Math.min(SOFT_ALPHA_CAP, rawOver - priorO)));
+    cands.push({ side: 'over', type: 'total', line: v.ou, p: pOver, imp: impO,
+      b: v.ouOver > 0 ? v.ouOver / 100 : 100 / -v.ouOver, text: `Over ${v.ou} ${fmtML(v.ouOver)}`,
+      subText: `mkt ${pct(priorO)} · model goals ${lam.toFixed(2)}` });
+    cands.push({ side: 'under', type: 'total', line: v.ou, p: 1 - pOver, imp: impU,
+      b: v.ouUnder > 0 ? v.ouUnder / 100 : 100 / -v.ouUnder, text: `Under ${v.ou} ${fmtML(v.ouUnder)}`,
+      subText: `mkt ${pct(1 - priorO)} · model goals ${lam.toFixed(2)}` });
+  }
+  return cands;
+}
+
+// 🎾 (v16.4) tennis candidates. ESPN lists no tennis prices at all, so the market here is
+// KALSHI (via the user's relay): cents ARE the implied probability, and the contract pays
+// 100¢. Same discipline — the de-vigged mid is the prior, the ranking/Elo model earns a
+// bounded alpha, and we only bet at the ask we could actually hit.
+function tennisCands(g) {
+  const cands = [];
+  const k = g.kalshi;
+  if (!k) return cands;
+  const mid = s => {
+    const q = k[s]; if (!q) return null;
+    if (q.bid && q.ask) return (q.bid + q.ask) / 200;      // de-vigged mid, in probability
+    return (q.ask || q.bid || q.last) ? (q.ask || q.bid || q.last) / 100 : null;
+  };
+  const mh = mid('home'), ma = mid('away');
+  if (mh == null && ma == null) return cands;
+  // normalize the two mids into a coherent 2-way prior
+  let priorH = mh != null && ma != null ? mh / (mh + ma) : (mh != null ? mh : 1 - ma);
+  priorH = clamp(priorH, 0.02, 0.98);
+  ['home', 'away'].forEach(side => {
+    const buy = Kalshi.buy(k[side]);                        // the ask — what you'd actually pay
+    if (!buy || buy < 1 || buy > 99) return;
+    const prior = side === 'home' ? priorH : 1 - priorH;
+    const raw = clamp(side === 'home' ? g.model.home : g.model.away, 0.02, 0.98);
+    const p = clamp(prior + Math.max(-SOFT_ALPHA_CAP, Math.min(SOFT_ALPHA_CAP, raw - prior)));
+    cands.push({ side, type: 'ml', p, fair: prior, imp: buy / 100, b: (100 - buy) / buy,
+      text: `${g[side].abbr || g[side].name} ${buy}¢ (Kalshi)`,
+      subText: `Kalshi mkt ${pct(prior)} ${p >= prior ? '+' : '−'}${Math.abs((p - prior) * 100).toFixed(1)}α vs ask ${buy}¢` });
+  });
+  return cands;
+}
 
 function computeBestPick(g, sport) {
   if (g.state !== 'pre') return null;
   const pickName = g.pick === 'draw' ? 'Draw' : g[g.pick].name;
-  if (g.tennis) return { kind: 'model', text: `${pickName} to win`, sub: 'ranking model · no line listed' };
   const v = g.vegas;
-  if (sport.soccer || !v) {
-    const sub = g.marketPrior ? 'tracks the market — no separate edge'
-      : 'model lean · 3-way prices not listed';
-    return { kind: 'model', text: g.pick === 'draw' ? 'Draw' : `${pickName} to win`, sub };
+  // 🎾 tennis prices come from Kalshi (ESPN carries none)
+  if (g.tennis) {
+    const tc = tennisCands(g);
+    if (!tc.length) return { kind: 'model', text: `${pickName} to win`,
+      sub: Kalshi.proxy() ? 'ranking model · no Kalshi market matched' : 'ranking model · connect the 💹 relay for live tennis prices' };
+    return finishPick(g, sport, tc);
+  }
+  // ⚽ soccer: real 3-way prices when the book posts them
+  if (sport.soccer) {
+    const sc = soccerCands(g, v);
+    if (!sc.length) {
+      const sub = g.marketPrior ? 'tracks the market — no separate edge' : 'model lean · 3-way prices not listed';
+      return { kind: 'model', text: g.pick === 'draw' ? 'Draw' : `${pickName} to win`, sub };
+    }
+    return finishPick(g, sport, sc);
+  }
+  if (!v) {
+    const sub = g.marketPrior ? 'tracks the market — no separate edge' : 'model lean · prices not listed';
+    return { kind: 'model', text: `${pickName} to win`, sub };
   }
   const cands = [];
   const addML = (side, ml, est = false, fair = null) => {
@@ -3037,17 +3201,32 @@ function computeBestPick(g, sport) {
     }
     // the posted spread IS the market's median margin — cover prob = 0.5 + clamped alpha
     pHome = 0.5 + Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, pHome - 0.5));
-    const b = 100 / 110, imp = 0.524;                       // spread bets priced -110
+    // (v16.4) use the book's REAL spread juice when the nested block carries it —
+    // assuming −110 both ways silently mis-states EV whenever the price is −105 or −120
     const s = n => (n > 0 ? '+' : '') + n;
-    cands.push({ side: 'home', type: 'spread', homeSpread, p: pHome, b, imp, text: `${g.home.abbr} ${s(homeSpread)}` });
-    cands.push({ side: 'away', type: 'spread', homeSpread, p: 1 - pHome, b, imp, text: `${g.away.abbr} ${s(-homeSpread)}` });
+    const mk = (ml, side, p, txt) => {
+      const b = ml ? (ml > 0 ? ml / 100 : 100 / -ml) : 100 / 110;
+      const imp = ml ? mlToProb(ml) : 0.524;
+      cands.push({ side, type: 'spread', homeSpread, p, b, imp, text: txt + (ml ? ` ${fmtML(ml)}` : '') });
+    };
+    mk(v.spOver, 'home', pHome, `${g.home.abbr} ${s(homeSpread)}`);
+    mk(v.spUnder, 'away', 1 - pHome, `${g.away.abbr} ${s(-homeSpread)}`);
   }
   if (g.total) {
-    const b = 100 / 110, imp = 0.524;                       // totals priced -110
-    cands.push({ side: 'over', type: 'total', line: g.total.line, p: g.total.pOver, b, imp, text: `Over ${g.total.line}` });
-    cands.push({ side: 'under', type: 'total', line: g.total.line, p: 1 - g.total.pOver, b, imp, text: `Under ${g.total.line}` });
+    const mk = (ml, side, p, txt) => {
+      const b = ml ? (ml > 0 ? ml / 100 : 100 / -ml) : 100 / 110;
+      const imp = ml ? mlToProb(ml) : 0.524;
+      cands.push({ side, type: 'total', line: g.total.line, p, b, imp, text: txt + (ml ? ` ${fmtML(ml)}` : '') });
+    };
+    mk(v.ouOver, 'over', g.total.pOver, `Over ${g.total.line}`);
+    mk(v.ouUnder, 'under', 1 - g.total.pOver, `Under ${g.total.line}`);
   }
   if (!cands.length) return { kind: 'model', text: `${pickName} to win`, sub: 'model lean · line not parseable' };
+  return finishPick(g, sport, cands);
+}
+
+// shared EV → Kelly → grade → slippage tail for every sport's candidate board
+function finishPick(g, sport, cands) {
   // (v14) NO downstream anchor here anymore: every candidate probability arrives already
   // market-anchored at the DISTRIBUTION level — ML sides carry prior+clamped-alpha from
   // parseEvents, spread/total sides are clamped around the posted line's 50/50 above.
@@ -3092,8 +3271,10 @@ function computeBestPick(g, sport) {
     fairLine = ` · model line ${g.home.abbr} ${m > 0 ? '+' : ''}${m.toFixed(1)}`;
   }
   // sub line speaks the new paradigm: market prior ± the alpha our features earned
+  // (soccer/tennis candidates carry their own subText — their prior isn't g.alphaInfo)
   const ai = g.alphaInfo;
-  const sub = best.type === 'ml' && ai
+  const sub = best.subText ? best.subText + fairLine
+    : best.type === 'ml' && ai
     ? `mkt prior ${pct(ai.prior)} ${ai.alpha >= 0 ? '+' : '−'}${Math.abs(ai.alpha * 100).toFixed(1)}α vs implied ${pct(best.imp)}${fairLine}`
     : `line prior 50% +${((best.p - 0.5) * 100).toFixed(1)}α vs implied ${pct(best.imp)}${fairLine}`;
   return { kind: 'ev', text: best.text, ev: best.ev, board: cands,
