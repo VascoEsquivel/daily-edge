@@ -944,7 +944,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.7';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.8';  // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -2942,8 +2942,12 @@ function parseVegas(comp, sport, home) {
   }
   if (odds.pointSpread) {
     const sh = px(odds.pointSpread.home), sa = px(odds.pointSpread.away);
-    if (sh && sa) { v.spOver = sh; v.spUnder = sa; }   // real spread juice, both sides
+    if (sh && sa) { v.spHome = sh; v.spAway = sa; }    // real juice on each side of the spread
+    const hl = parseFloat(String(odds.pointSpread.home?.close?.line ?? odds.pointSpread.home?.open?.line ?? '').replace(/[^0-9.+-]/g, ''));
+    if (isFinite(hl)) v.homeSpread = hl;               // signed HOME line (−7.5 = home laying 7.5)
   }
+  // odds.spread is ALSO the signed home line — use it when the nested block is absent
+  if (v.homeSpread == null && odds.spread != null && !isNaN(Number(odds.spread))) v.homeSpread = Number(odds.spread);
   // 3-way (soccer): proportional de-vig across all three outcomes → fair market prior
   if (v.mlHome && v.mlAway && v.mlDraw) {
     const ih = mlToProb(v.mlHome), ia = mlToProb(v.mlAway), id = mlToProb(v.mlDraw);
@@ -3243,35 +3247,44 @@ function computeBestPick(g, sport) {
     addML(v.favIsHome ? 'home' : 'away', v.mlFav, false, mlToProb(v.mlFav) / OVERROUND);
     const dogImp = Math.min(0.97, Math.max(0.03, OVERROUND - mlToProb(v.mlFav)));
     addML(v.favIsHome ? 'away' : 'home', probToAmerican(dogImp), true, dogImp / OVERROUND);
-  } else if (v.spread != null && (sport.spreadSigma || g.sim)) {
-    const homeSpread = v.favIsHome ? v.spread : -v.spread;  // favorite's line is negative
-    // empirical cover prob from the Monte Carlo margin distribution when available,
-    // else the analytic Normal fallback
-    // MLB run margins are discrete & skewed → read the cover prob off the simulation;
-    // basketball margins are near-Normal and spreadSigma is already calibrated to them,
-    // so keep the analytic Normal there (the sim adds value on basketball TOTALS, not spreads)
-    let pHome;
-    if (g.sim && sport.id === 'mlb') pHome = g.sim.pHomeCover(homeSpread);
+  }
+  // 📐 SPREAD candidates — evaluated INDEPENDENTLY of the moneyline (v16.8). These used to
+  // sit in the same else-if chain as the ML branches, so any game that listed a moneyline
+  // (i.e. essentially every game) never had its spread priced at all. Now every posted
+  // spread gets graded, which is where a lot of the real value lives.
+  const hs = v.homeSpread ?? (v.spread != null && v.favIsHome != null ? (v.favIsHome ? v.spread : -v.spread) : null);
+  if (hs != null && (sport.spreadSigma || g.sim)) {
+    // empirical cover prob: MLB run margins are discrete and skewed → read it off the
+    // Monte Carlo; otherwise the key-numbers PMF (crossing 3/7 in the NFL or the one-run
+    // pile in MLB moves the price in steps, not linearly), with a Normal fallback.
+    let raw;
+    if (g.sim && sport.id === 'mlb') raw = g.sim.pHomeCover(hs);
     else {
-      // (v15.2) cover prob off the empirical key-numbers PMF where the sport has one —
-      // crossing 3/7 in the NFL or the one-run pile in MLB moves the price in steps,
-      // not linearly. Normal fallback for sports without a margin map.
-      const sigma = sport.spreadSigma, mu = invNorm(g.model.home) * sigma;
+      const sigma = sport.spreadSigma, mu = invNorm(clamp(g.model.home)) * sigma;
       const pmf = marginPMF(sport.id, mu, sigma);
-      pHome = pmf ? pmfHomeCover(pmf, homeSpread) : normalCdf((mu + homeSpread) / sigma);
+      raw = pmf ? pmfHomeCover(pmf, hs) : normalCdf((mu + hs) / sigma);
     }
-    // the posted spread IS the market's median margin — cover prob = 0.5 + clamped alpha
-    pHome = 0.5 + Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, pHome - 0.5));
-    // (v16.4) use the book's REAL spread juice when the nested block carries it —
-    // assuming −110 both ways silently mis-states EV whenever the price is −105 or −120
+    // market prior for the COVER: de-vig the two posted spread prices when the book gives
+    // them (−108/−112 is NOT a 50/50 line), else fall back to the classic assumption that
+    // the posted number is the market's median margin.
+    let prior = 0.5;
+    if (v.spHome && v.spAway) {
+      const ih = mlToProb(v.spHome), ia = mlToProb(v.spAway), tot = ih + ia;
+      if (tot > 0) prior = ih / tot;
+    }
+    // The spread read is a TRANSFORMATION of the same win-probability the moneyline
+    // already prices — not independent information — so it earns the softer alpha.
+    const pHome = clamp(prior + Math.max(-SOFT_ALPHA_CAP, Math.min(SOFT_ALPHA_CAP, raw - prior)));
     const s = n => (n > 0 ? '+' : '') + n;
     const mk = (ml, side, p, txt) => {
       const b = ml ? (ml > 0 ? ml / 100 : 100 / -ml) : 100 / 110;
       const imp = ml ? mlToProb(ml) : 0.524;
-      cands.push({ side, type: 'spread', homeSpread, p, b, imp, text: txt + (ml ? ` ${fmtML(ml)}` : '') });
+      const pr = side === 'home' ? prior : 1 - prior;
+      cands.push({ side, type: 'spread', homeSpread: hs, p, b, imp, text: txt + (ml ? ` ${fmtML(ml)}` : ''),
+        subText: `spread mkt ${pct(pr)} ${p >= pr ? '+' : '−'}${Math.abs((p - pr) * 100).toFixed(1)}α vs implied ${pct(imp)}` });
     };
-    mk(v.spOver, 'home', pHome, `${g.home.abbr} ${s(homeSpread)}`);
-    mk(v.spUnder, 'away', 1 - pHome, `${g.away.abbr} ${s(-homeSpread)}`);
+    mk(v.spHome, 'home', pHome, `${g.home.abbr} ${s(hs)}`);
+    mk(v.spAway, 'away', 1 - pHome, `${g.away.abbr} ${s(-hs)}`);
   }
   if (g.total) {
     const mk = (ml, side, p, txt) => {
@@ -4550,8 +4563,10 @@ function crossAssetRow(g) {
   const sport = SPORTS.find(s => s.id === g.sportId);
   const v = g.vegas;
   if (g.state !== 'pre' || !sport?.spreadSigma || !v || v.mlHome == null || v.mlAway == null
-      || v.altSpread == null || v.homeProb == null) return '';
-  const hs = (v.homeProb >= 0.5 ? -1 : 1) * v.altSpread;    // home-relative posted spread
+      || v.homeProb == null) return '';
+  // signed home line straight from the feed (v16.8); older path inferred it from the favorite
+  const hs = v.homeSpread ?? (v.altSpread != null ? (v.homeProb >= 0.5 ? -1 : 1) * v.altSpread : null);
+  if (hs == null) return '';
   const mu = invNorm(clamp(v.homeProb)) * sport.spreadSigma;
   const pmf = marginPMF(sport.id, mu, sport.spreadSigma);
   const pH = pmf ? pmfHomeCover(pmf, hs) : normalCdf((mu + hs) / sport.spreadSigma);
