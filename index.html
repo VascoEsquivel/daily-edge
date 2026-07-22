@@ -944,7 +944,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.8';  // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.10'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -3668,10 +3668,19 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
       expTotal = exp;   // keep the projected total even when no O/U line is posted
       if (vegas?.ou) {
         const pOverRaw = sim ? sim.pOver(vegas.ou) : clamp(normalCdf((exp - vegas.ou) / TOTAL_SIGMA[sport.id]));
-        // market-median prior: the posted total IS the market's 50/50 point — the
-        // simulation only supplies a bounded alpha around it
-        const pOver = clamp(0.5 + Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, pOverRaw - 0.5)));
-        total = { exp, line: vegas.ou, pOver, pOverRaw, notes };
+        // (v16.9) market prior from the REAL posted juice. We used to anchor at a flat
+        // 0.5 — "the posted total is the market's 50/50 point" — but that's only true
+        // when both sides are priced identically. Over −114 / Under −106 de-vigs to a
+        // 50.9% over, so anchoring at 50% silently handed every such game a ~1-point
+        // tilt toward the under before the model said anything. Same class of bug as
+        // the spread prior, and it compounded the under-heavy slates.
+        let priorO = 0.5;
+        if (vegas.ouOver && vegas.ouUnder) {
+          const io = mlToProb(vegas.ouOver), iu = mlToProb(vegas.ouUnder), t = io + iu;
+          if (t > 0) priorO = io / t;
+        }
+        const pOver = clamp(priorO + Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, pOverRaw - priorO)));
+        total = { exp, line: vegas.ou, pOver, pOverRaw, priorO, notes };
       }
     }
     // soccer without season rates (World Cup knockouts) still gets a scoreline, derived
@@ -3711,6 +3720,38 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
     g.bp = computeBestPick(g, sport);
     return g;
   });
+  // ── (v16.10) slate-level totals de-bias ─────────────────────────────────
+  // The alpha clamp bounds how FAR a pick may stray from the market but not which WAY,
+  // so a model whose totals sit systematically below the posted lines pins every game at
+  // the same cap and prints an all-under slate. Measured live: MLB projected 1.12 runs
+  // under the line on 11 of 12 games — a common offset shared by the whole slate is model
+  // error, not 11 simultaneous edges. The real signal is each game's deviation RELATIVE
+  // to its peers, so we subtract the slate mean and keep the residual. Needs several
+  // priced games to estimate, ignores trivial offsets, and is capped so it can't run away.
+  // De-biasing happens in PROBABILITY space, not in runs/points. A betting line sits at
+  // the market's MEDIAN outcome, while our exp is a MEAN — and scoring distributions are
+  // right-skewed, so mean > median and matching the two still understates the over. Worse,
+  // integer lines carry push mass that the market prices as a refund. Comparing
+  // P(over) directly to the market's implied is only meaningful after both sides speak the
+  // same language, so we simply centre the model's DISAGREEMENT with the market across the
+  // slate and keep each game's residual — no assumption about skew or pushes required.
+  const priced = games.filter(g => g.total && g.total.line != null && g.total.pOverRaw != null);
+  if (priced.length >= 4) {
+    const devs = priced.map(g => g.total.pOverRaw - (g.total.priorO ?? 0.5));
+    const mean = devs.reduce((a, b) => a + b, 0) / devs.length;
+    const shift = Math.max(-0.25, Math.min(0.25, mean));
+    if (Math.abs(shift) >= 0.02) {
+      priced.forEach(g => {
+        const t = g.total;
+        t.slateDebias = +(-shift * 100).toFixed(1);   // in points of over-probability
+        t.pOverRaw = clamp(t.pOverRaw - shift, 0.01, 0.99);
+        const pr = t.priorO != null ? t.priorO : 0.5;
+        t.pOver = clamp(pr + Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, t.pOverRaw - pr)));
+        t.notes = [...(t.notes || []), `slate de-bias ${shift > 0 ? '−' : '+'}${Math.abs(shift * 100).toFixed(0)}pts`];
+        if (g.state === 'pre') g.bp = computeBestPick(g, sport);
+      });
+    }
+  }
   return games.sort((a, b) => (STATE_ORDER[a.state] - STATE_ORDER[b.state]) || (a.start - b.start));
 }
 
@@ -4486,7 +4527,10 @@ function whatIf(g, sport, adj) {
         const prior = bp.side === 'home' ? g.alphaInfo.prior : 1 - g.alphaInfo.prior;
         betP = clamp(prior + Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, pickP - prior)));
       } else if (bp.betType === 'total' || bp.betType === 'spread') {
-        betP = 0.5 + Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, pickP - 0.5));
+        // anchor to the same market prior the Card used (real juice when posted)
+        const anch = bp.betType === 'total' && g.total?.priorO != null ? g.total.priorO : 0.5;
+        const pr = bp.side === 'under' || bp.side === 'away' ? 1 - anch : anch;
+        betP = clamp(pr + Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, pickP - pr)));
       }
       const ev = betP * bp.b - (1 - betP);
       const kf = KELLY_FRACTION * (bp.b * betP - (1 - betP)) / bp.b;
