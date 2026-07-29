@@ -441,6 +441,7 @@
     font-family: 'JetBrains Mono', monospace; letter-spacing: .3px;
   }
   .projline b { color: var(--text); }
+  .projline .fair { color: var(--accent); font-weight: 700; }
   .steam {
     display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: .4px;
     color: #ffcf5c; background: rgba(255, 180, 40, .12); border: 1px solid rgba(255, 180, 40, .42);
@@ -944,7 +945,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.10'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.11'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -3107,6 +3108,29 @@ const MonteCarlo = (() => {
   };
 })();
 
+// ⚾ YRFI / NRFI — will a run score in the FIRST inning (Yes/No Run First Inning)? A popular
+// standalone MLB market. Reuses the sim's own geometric per-inning run model so it stays
+// consistent with the rest of the MLB engine: a team's runs in an inning are geometric with
+// P(0 runs)=1/(1+λ), so P(they score at least once) = λ/(1+λ). The league-average first
+// inning is CALIBRATED to the real base rate — an average team scores in the 1st ~27% of the
+// time, and the geometric mean that reproduces that is 0.37, well below a naive runs/9,
+// because a single inning is far more zero-heavy than the full-game rate implies. Each team's
+// first-inning λ scales that base by its model-projected runs relative to league average, so
+// an ace-vs-ace duel leans NRFI and a bandbox slugfest leans YRFI. proj.h/proj.a already fold
+// in the probable starters' xERA, the park factor and the weather — exactly what drives
+// first-inning scoring — and the starter always throws the 1st, so no bullpen dilution here.
+const RFI_LG_RUNS = 4.4;    // league-average team runs per game (2023-25 MLB ≈ 4.3-4.5)
+const RFI_BASE_LAM = 0.37;  // first-inning geometric mean for a league-average team → P(score)≈0.27
+function firstInningRun(projH, projA) {
+  if (!(projH > 0) || !(projA > 0)) return null;
+  const pScore = runs => { const lam = RFI_BASE_LAM * runs / RFI_LG_RUNS; return lam / (1 + lam); };
+  const pH = pScore(projH), pA = pScore(projA);
+  const yrfi = 1 - (1 - pH) * (1 - pA);
+  return { yrfi, nrfi: 1 - yrfi, pH, pA };
+}
+// prob → fair American odds (no vig). Feed through fmtML for the leading + sign.
+const fairAm = p => { const c = clamp(p, 0.02, 0.98); return c >= 0.5 ? Math.round(-100 * c / (1 - c)) : Math.round(100 * (1 - c) / c); };
+
 // ── Best pick per game: highest-EV wager at the listed price, or PASS ──
 const KELLY_FRACTION = 0.25;   // fraction of full Kelly for stake sizing
 const MIN_EV = 0.02;           // minimum EV to recommend a bet
@@ -3702,6 +3726,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
     return {
       id: ev.id, home, away, model, pick, pickProb, vegas, edge, marketPrior, noLearn,
       alphaInfo: typeof alphaInfo !== 'undefined' ? alphaInfo : null,
+      rfi: (sport.id === 'mlb' && (st.state || 'pre') === 'pre' && proj) ? firstInningRun(proj.h, proj.a) : null,
       total, sim, proj, wx, why: typeof whyDrivers !== 'undefined' ? whyDrivers : [],
       pRaw: typeof pRawHome !== 'undefined' ? pRawHome : null,
       state: st.state || 'pre',                       // pre | in | post
@@ -3847,6 +3872,7 @@ function parseMMA(json, sport) {
       out.push(g);
     });
   });
+  markSharedStarts(out);   // every bout on a card inherits its segment's open time
   return out.sort((a, b) => (STATE_ORDER[a.state] - STATE_ORDER[b.state]) || (a.start - b.start));
 }
 
@@ -3936,6 +3962,7 @@ function parseTennis(jsons, ranks, date) {
       });
     });
   }));
+  markSharedStarts(out);   // follow-on matches inherit the court's order-of-play anchor
   return out.sort((a, b) => (STATE_ORDER[a.state] - STATE_ORDER[b.state]) || (a.start - b.start));
 }
 
@@ -3986,7 +4013,7 @@ function kalshiTennisGames(rows, espnGames, date) {
       vegas: null, edge: null, marketPrior: !known, proj: null,
       // Kalshi's ticker gives the DATE but no start time — anchor to midday so the card
       // sorts sanely without claiming a precise tip-off it doesn't know
-      state: 'pre', statusText: 'time TBD',
+      state: 'pre', statusText: 'time TBD', timeTBD: true,
       start: (() => { const d = new Date(date); d.setHours(12, 0, 0, 0); return d; })(),
       venue: [row.tier, tourney, '💹 Kalshi'].filter(Boolean).join(' · '),
       tv: '', tennis: true, tier: row.tier, kalshiOnly: true, noModel: !known,
@@ -4013,6 +4040,26 @@ const startLabel = d => {
   }
   return timeOf(d);
 };
+// Honest start label for a pre-game. Two feed quirks make a raw clock time a lie:
+//  · Kalshi-only cards (Challenger/ITF tennis) carry a DATE but no tip-off  → timeTBD
+//  · UFC bouts all inherit their card-segment's open time, and tennis follow-on
+//    matches inherit the court's order-of-play "not before" anchor, so ≥2 events
+//    share one exact timestamp — only the first actually starts then → timeApprox
+// 'rel' allows the "in 2h 10m" countdown; 'clock' forces a wall-clock time.
+function preStart(g, style) {
+  if (g.timeTBD) return 'TBD';
+  if (g.timeApprox) return '~' + timeOf(g.start);
+  return style === 'clock' ? timeOf(g.start) : startLabel(g.start);
+}
+// Flag events that merely inherit a shared session/card-segment start time. Only safe
+// for sports where a shared timestamp means "order of play", never simultaneous play —
+// i.e. tennis (one match per court, follow-ons) and MMA (one bout at a time). Never call
+// it on team sports, where two games legitimately start at the same clock time.
+function markSharedStarts(games) {
+  const cnt = {};
+  games.forEach(g => { if (g.state === 'pre') { const t = +g.start; cnt[t] = (cnt[t] || 0) + 1; } });
+  games.forEach(g => { if (g.state === 'pre' && cnt[+g.start] >= 2) g.timeApprox = true; });
+}
 // stake display: units, plus dollars when a bankroll is set (1u = 1% of bankroll)
 function fmtStake(units) {
   const bank = Number(localStorage.getItem('de-bank')) || 0;
@@ -4879,6 +4926,19 @@ function projLineHtml(g) {
   return `<div class="projline">📊 proj <b>${esc(g.away.abbr)} ${Math.round(P.a)}–${Math.round(P.h)} ${esc(g.home.abbr)}</b>${P.total ? ` · total ${P.total.toFixed(1)}` : ''}</div>`;
 }
 
+// ⚾ YRFI / NRFI strip for MLB cards. There's no NRFI price in our feeds (ESPN doesn't list
+// it), so this is a model read, not a graded +EV bet — it prints fair no-vig odds for BOTH
+// sides so the user can shop them against Kalshi or a book's 1st-inning market themselves.
+function rfiStrip(g) {
+  const r = g.rfi;
+  if (!r) return '';
+  const lean = r.nrfi >= r.yrfi ? 'NRFI' : 'YRFI';
+  const lp = Math.max(r.nrfi, r.yrfi);
+  const strength = lp >= 0.58 ? 'strong' : lp >= 0.53 ? 'lean' : 'coin-flip';
+  const tip = `Model probability a run scores in the 1st inning — NRFI = neither team scores, YRFI = at least one does. Built from each team's model-projected runs (probable starter's xERA, park factor and weather already folded in) through the sim's geometric per-inning run model, calibrated to the league ~53% NRFI base rate. ${g.away.abbr} score-in-1st ${pct(r.pA)} · ${g.home.abbr} score-in-1st ${pct(r.pH)}. No book price in our feed — compare these fair odds to your NRFI/YRFI market to spot value.`;
+  return `<div class="projline" title="${esc(tip)}">🥎 1st inning · NRFI <b>${pct(r.nrfi)}</b> <span class="fair">${fmtML(fairAm(r.nrfi))}</span> · YRFI <b>${pct(r.yrfi)}</b> <span class="fair">${fmtML(fairAm(r.yrfi))}</span> — ${strength === 'coin-flip' ? 'coin-flip' : `<b>${strength} ${lean}</b>`}</div>`;
+}
+
 // 📈 inline price sparkline (v16.1): the Open price tape drawn as a tiny time-scaled
 // SVG next to the steam/velocity readout — neon-emerald when the market is steaming the
 // pregame favorite, neon-crimson when the money is on the dog, muted when flat. One
@@ -4904,9 +4964,17 @@ function priceSpark(opened, g) {
 
 function gameCard(g, i, sport, bare = false) {   // bare = focus-sheet header (no panel/hint)
   const live = g.state === 'in';
+  const approxNote = g.mma
+    ? 'Card-segment start (prelims / main card). Bouts run in order from here — later fights begin well after this time.'
+    : 'Order-of-play “not before” time — the court/session start. Follow-on matches begin after the earlier ones finish.';
+  const preBadge = g.timeTBD
+    ? '<span class="badge pre" title="Start time not published yet — this market lists the date only.">TBD</span>'
+    : g.timeApprox
+    ? `<span class="badge pre" title="${esc(approxNote)}">${esc(preStart(g, 'rel'))}</span>`
+    : `<span class="badge pre">${esc(startLabel(g.start))}</span>`;
   const badge = live ? '<span class="badge in">● LIVE</span>'
     : g.state === 'post' ? '<span class="badge post">FINAL</span>'
-    : `<span class="badge pre">${esc(startLabel(g.start))}</span>`;
+    : preBadge;
 
   const pickName = g.pick === 'draw' ? 'Draw' : g[g.pick].name;
   let verdict;
@@ -5022,6 +5090,7 @@ function gameCard(g, i, sport, bare = false) {   // bare = focus-sheet header (n
     ${suggestedStrip(g)}
     ${live ? hedgePanel(g, sport) + liveEdgePanel(g, sport, lp) : ''}
     ${projLineHtml(g)}
+    ${rfiStrip(g)}
     ${g.state === 'pre' && g.bp?.kind === 'ev' && g.why?.length
       ? `<div class="whyline">🧠 why: ${esc(g.why.slice(0, 3).join(' · '))}</div>` : ''}
     ${hint}
@@ -5048,7 +5117,7 @@ function heroCard(events) {
       ${sideBlock(g.away, g.model.away, favSide === 'away' ? 'fav' : 'dog')}
       <div class="hero-mid">
         <div class="at">VS</div>
-        <div class="htime">${esc(timeOf(g.start))}${g.tv ? ' · ' + esc(g.tv) : ''}</div>
+        <div class="htime">${esc(g.state === 'pre' ? preStart(g, 'clock') : timeOf(g.start))}${g.tv ? ' · ' + esc(g.tv) : ''}</div>
         <div class="hvenue">${esc(g.venue)}</div>
         <div class="hverdict">
           <span><b>${esc(pickName)}</b> ${pct(g.pickProb)}</span>
@@ -5079,7 +5148,7 @@ function bestBets(events) {
       ? `<div class="bb-ev">${esc(g.bp.text)} · +${(g.bp.ev * 100).toFixed(1)}% EV</div>` : '';
     return `<div class="bb-card" style="animation-delay:${i * 90}ms"><span class="bb-medal">${medals[i]}</span>${teamLogo(t)}
       <div><div class="bb-team">${esc(t.name)}</div>
-      <div class="bb-meta">${vs} ${esc(opp.name)} · ${esc(timeOf(g.start))}</div></div>
+      <div class="bb-meta">${vs} ${esc(opp.name)} · ${esc(g.state === 'pre' ? preStart(g, 'clock') : timeOf(g.start))}</div></div>
       <div class="bb-right"><div class="bb-prob">${pct(g.pickProb)}</div>${evLine}</div></div>`;
   }).join('')}</div></div>`;
 }
