@@ -443,6 +443,9 @@
   .projline b { color: var(--text); }
   .projline .fair { color: var(--accent); font-weight: 700; }
   .projline .rfisp { color: var(--muted); opacity: .8; }
+  .rfiform { letter-spacing: 2px; color: var(--accent); font-size: 10px; }
+  .projline .rfihit { color: var(--accent); font-weight: 700; }
+  .projline .rfimiss { color: var(--hot); font-weight: 700; }
   .steam {
     display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: .4px;
     color: #ffcf5c; background: rgba(255, 180, 40, .12); border: 1px solid rgba(255, 180, 40, .42);
@@ -946,7 +949,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.12'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.13'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1489,6 +1492,10 @@ const Brain = (() => {
   db.edge = db.edge || {};   // per-sport Brier of market prior (mkt) vs our posterior (mdl) — edge trust
   db.mmaMethod = db.mmaMethod || {};   // per-weight-class actual finish mix {ko, sub, dec, n}
   db.margins = db.margins || {};       // per-sport actual |margin| tally vs Normal expectation — learned key numbers
+  // ⚾ YRFI/NRFI scorecard: {n, hit, bs} — n graded, hit = lean was right, bs = summed Brier
+  // (a hit rate alone can't tell a sharp forecast from a lucky one; Brier keeps it honest).
+  // r = last 20 outcomes, newest first, as 1/0 — drives the tab's recent-form strip.
+  db.rfi = db.rfi || { n: 0, hit: 0, bs: 0, r: [] };
   // (v15.9) one-time reset: totalsBias was learned against projections carrying the
   // injury double-count (wnba had drifted to −11 pts). The model changed, so the bias
   // restarts clean and re-learns against the corrected totals.
@@ -1496,6 +1503,7 @@ const Brain = (() => {
   const cutoff = ymd(new Date(Date.now() - 60 * 864e5));
   for (const k in db.processed) if (db.processed[k] < cutoff) delete db.processed[k];
   for (const k in db.learned) if (db.learned[k] < cutoff) delete db.learned[k];
+  if (db.rfiGraded) for (const k in db.rfiGraded) if (db.rfiGraded[k] < cutoff) delete db.rfiGraded[k];
 
   const save = () => { try { localStorage.setItem(KEY, JSON.stringify(db)); } catch {} };
   const getElo = (sport, key) => {
@@ -1728,6 +1736,23 @@ const Brain = (() => {
       const key = sport.id + '|' + g.id;
       const gday = ymd(g.start);
       const scoreH = g.home.winner ? 1 : g.away.winner ? 0 : 0.5;
+      // ⚾ YRFI/NRFI settle: grade the pregame first-inning read against the actual box
+      // score. Kept OUT of the stage-1/stage-2 guards on purpose — it has its own
+      // `rfiGraded` key so it still records if the ledger already processed this game
+      // (e.g. from an earlier version that had no RFI). Immediate, so today's finals count.
+      if (sport.id === 'mlb' && !db.rfiGraded?.[key]) {
+        const act = rfiActual(g);
+        const pre = Open.get(sport, g)?.rf;   // ESPN strips probables from finals → use the snapshot
+        if (act && pre != null) {
+          const predYes = pre >= 0.5;
+          const hit = predYes === act.yrfi;
+          db.rfi.n++; if (hit) db.rfi.hit++;
+          db.rfi.bs += Math.pow(pre - (act.yrfi ? 1 : 0), 2);   // Brier vs the actual 0/1
+          db.rfi.r.unshift(hit ? 1 : 0); if (db.rfi.r.length > 20) db.rfi.r.length = 20;
+          (db.rfiGraded = db.rfiGraded || {})[key] = today;
+          changed = true;
+        }
+      }
       // stage 1 — ledger settle + history record (once, immediately)
       if (!db.processed[key]) {
         settle(key, g, scoreH);
@@ -1914,6 +1939,7 @@ const Brain = (() => {
     },
     postmortems: () => db.postmortems,
     totalsBias: sportId => db.totalsBias[sportId] || null,
+    rfiRec: () => db.rfi,
     pendingFor: (sportId, gid) => db.pending[sportId + '|' + gid] || null,
     settledFor: (sportId, gid) => db.stats.betlog.find(x => x.gid === String(gid) && x.k === sportId) || null,
     // units below the ⭐ ledger's peak (0 = at a new peak) — fuels the tilt guard
@@ -1975,11 +2001,14 @@ const Open = (() => {
         if (!db[k]) {
           db[k] = { p: g.model.home, d: g.vegas?.detail || '', t: Date.now(), te: g.total?.exp ?? null,
                     mp: g.vegas?.homeProb ?? null,     // open de-vigged MARKET prob → line-move steam
+                    rf: g.rfi ? +g.rfi.yrfi.toFixed(4) : null,   // pregame YRFI read → settles at final
                     h: g.vegas?.homeProb != null ? [[Date.now(), g.vegas.homeProb]] : [] };
           changed = true;
         } else {
           const rec = db[k];
           if (rec.te == null && g.total?.exp != null) { rec.te = g.total.exp; changed = true; }
+          // the RFI read sharpens once probables post — keep refreshing it while pregame
+          if (g.rfi) { const v = +g.rfi.yrfi.toFixed(4); if (rec.rf !== v) { rec.rf = v; changed = true; } }
           // line-velocity tape (v15.2): append a [timestamp, de-vigged home prob] sample
           // whenever the market's number actually moves — powers steam vectors + slippage
           const mp = g.vegas?.homeProb;
@@ -3125,20 +3154,47 @@ const MonteCarlo = (() => {
 // matchup: an ace vs a cold offense leans hard NRFI, a bandbox slugfest with two back-end
 // starters leans YRFI. Calibrated so league offense vs a league starter in a neutral park
 // reproduces the real ~27% first-inning score rate (geometric mean 0.37).
-const RFI_LG_RUNS = 4.4;    // league-average team runs per game (2023-25 MLB ≈ 4.3-4.5)
+// (v16.13) Constants MEASURED from 1,536 completed games (Apr 1 – Jul 29 2026) by reading
+// each game's per-inning `linescores[period 1]` off the scoreboard feed. Two independent
+// windows agreed (Apr–Jun 52.0% YRFI on n=984, Jun–Jul 50.2% on n=552), so these are the
+// real base rates, not textbook guesses:
+//   • a run scores in the 1st  51.4% of games  → the true market is a COIN FLIP, not NRFI-ish
+//   • a given team scores in the 1st  30.0% of the time
+//   • but split by side: HOME 32.8% vs AWAY 27.1% — a stable 5.7-point gap in BOTH windows.
+// The old single 0.37 base targeted 27%/47% YRFI, i.e. it was calibrated ~4 points too far
+// toward NRFI on every single game — the deeper half of the bias the user reported. Fixing
+// the base is what actually re-centres the read; v16.12 only removed the proj-driven part.
+const RFI_LG_RUNS = 4.44;   // measured league runs/game over the same 1,536 games
 const RFI_LG_ERA  = 4.2;    // league-average starter ERA (matches the totals block's baseline)
-const RFI_BASE_LAM = 0.37;  // first-inning geometric mean at league conditions → P(score)≈0.27
+// geometric means reproducing the measured per-side rates: 0.372/(1.372)=27.1%, 0.488/(1.488)=32.8%
+const RFI_BASE_AWAY = 0.372;
+const RFI_BASE_HOME = 0.488;
+// VALIDATED FUNCTIONAL FORM: bucketing 3,040 real matchups by the opposing starter's ERA gave
+// a clean monotonic ladder — ERA<3.0 → 21.0% score rate, 3.0-3.5 → 23.9%, 3.5-4.0 → 26.7%,
+// 4.0-4.5 → 30.6%, 4.5-5.0 → 32.3%, 5.0+ → 39.0%. Regressing the implied λ on (ERA/4.2)
+// returns a slope of ~1.0, so the linear multiplier below is empirically correct, not assumed.
+// The batting team's season runs/game is also monotonic but MUCH weaker (26.0% → 31.4% across
+// the full range vs the starter's 21% → 39%); its regression slope is 0.96, so it too stays
+// linear. The starter is the dominant term, which is why this model is built on the arms.
 function firstInningRun(home, away, park) {
   if (!(home.pfg > 0) || !(away.pfg > 0)) return null;
   const off = t => clamp(t.pfg / RFI_LG_RUNS, 0.7, 1.45);
   const arm = p => { const e = p ? (p.xera ?? p.era) : null; return e > 0 ? clamp(e / RFI_LG_ERA, 0.55, 1.6) : 1; };
   const pk = park > 0 ? clamp(Math.sqrt(park), 0.9, 1.12) : 1;
   // away bats the top of the 1st vs the HOME starter; home bats the bottom vs the AWAY starter
-  const lamA = RFI_BASE_LAM * off(away) * arm(home.probable) * pk;
-  const lamH = RFI_BASE_LAM * off(home) * arm(away.probable) * pk;
+  const lamA = RFI_BASE_AWAY * off(away) * arm(home.probable) * pk;
+  const lamH = RFI_BASE_HOME * off(home) * arm(away.probable) * pk;
   const pA = lamA / (1 + lamA), pH = lamH / (1 + lamH);
   const yrfi = 1 - (1 - pH) * (1 - pA);
   return { yrfi, nrfi: 1 - yrfi, pH, pA, starters: !!(home.probable && away.probable) };
+}
+// actual first-inning outcome, straight off the box score's per-inning linescores.
+// Returns null until both sides have batted the 1st (so live games settle mid-game correctly).
+function rfiActual(g) {
+  const r1 = t => { const v = t.line1; return typeof v === 'number' ? v : null; };
+  const h = r1(g.home), a = r1(g.away);
+  if (h == null || a == null) return null;
+  return { runs: h + a, yrfi: h + a > 0, h, a };
 }
 // prob → fair American odds (no vig). Feed through fmtML for the leading + sign.
 const fairAm = p => { const c = clamp(p, 0.02, 0.98); return c >= 0.5 ? Math.round(-100 * c / (1 - c)) : Math.round(100 * (1 - c) / c); };
@@ -3455,6 +3511,9 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         rec: parseRecord(recSummary, sport.soccer),
         score: c.score,
         winner: c.winner === true,
+        // runs in the 1st inning, straight off the box score's per-inning linescores
+        // (period 1). Present once the side has batted — powers YRFI/NRFI settlement.
+        line1: (() => { const l = (c.linescores || []).find(x => x.period === 1); return l && typeof l.value === 'number' ? l.value : null; })(),
         loc: c.team?.location || '',   // city — Kalshi names markets by city, ESPN by nickname
         probable, leaders, pen,
         pyth: q?.pyth ?? null, pythG: q?.g || 0,
@@ -4943,6 +5002,22 @@ function projLineHtml(g) {
 // it), so this is a model read, not a graded +EV bet — it prints fair no-vig odds for BOTH
 // sides so the user can shop them against Kalshi or a book's 1st-inning market themselves.
 function rfiStrip(g) {
+  // finished (or already-batted) MLB game: grade the pregame read against the real box score
+  if (g.sportId === 'mlb' && g.state !== 'pre') {
+    const act = rfiActual(g);
+    if (!act) return '';
+    const sport = SPORTS.find(s => s.id === 'mlb');
+    const pre = sport ? Open.get(sport, g)?.rf : null;
+    const outcome = act.yrfi
+      ? `YRFI — ${act.runs} run${act.runs === 1 ? '' : 's'} in the 1st (${esc(g.away.abbr)} ${act.a}, ${esc(g.home.abbr)} ${act.h})`
+      : 'NRFI — scoreless 1st';
+    if (pre == null)
+      return `<div class="projline">🥎 1st inning · <b>${outcome}</b> <span class="rfisp">· no pregame read logged</span></div>`;
+    const called = pre >= 0.5 ? 'YRFI' : 'NRFI';
+    const hit = (pre >= 0.5) === act.yrfi;
+    const conf = Math.round((pre >= 0.5 ? pre : 1 - pre) * 100);
+    return `<div class="projline" title="${esc(`Pregame the model read ${called} at ${conf}%. Actual: ${outcome}.`)}">🥎 1st inning · <b>${outcome}</b> · <span class="${hit ? 'rfihit' : 'rfimiss'}">${hit ? '✓' : '✗'} called ${called} ${conf}%</span></div>`;
+  }
   const r = g.rfi;
   if (!r) return '';
   const lean = r.nrfi >= r.yrfi ? 'NRFI' : 'YRFI';
@@ -5194,6 +5269,25 @@ function summaryBar(events, sport) {
   // when it binds, the pick strips already show the scaled stake with the ⚖️ mark
   const ps = portfolioScale();
   if (ps.n && ps.s < 0.999) html += stat(`×${ps.s.toFixed(2)}`, `⚖️ portfolio Kelly · ${ps.eff.toFixed(1)}u corr. exposure vs ${PORTFOLIO_CAP}u cap`, 'gold');
+  // ⚾ YRFI/NRFI scorecard — the first-inning read graded against real box scores.
+  // Shown with the coin-flip baseline (the market is genuinely ~51/49) because a hit rate
+  // means nothing without knowing what a coin would have scored. Brier is the honest
+  // companion metric: it punishes confident misses, which a raw hit rate can't see.
+  if (sport?.id === 'mlb') {
+    const rf = Brain.rfiRec();
+    if (rf && rf.n >= 3) {
+      const pctHit = rf.hit / rf.n * 100;
+      const brier = rf.bs / rf.n;
+      const edge = pctHit - 51.4;          // vs the measured league YRFI base rate
+      const form = rf.r.slice(0, 10).map(x => x ? '●' : '○').join('');
+      const tip = `The model's pregame YRFI/NRFI lean vs what actually happened in the 1st inning, from ${rf.n} graded game${rf.n === 1 ? '' : 's'}. `
+        + `Baseline: a run scores in the 1st 51.4% of the time (measured over 1,536 games), so always guessing the same side scores ~51%. `
+        + `Brier score ${brier.toFixed(3)} — lower is better; 0.25 = a coin flip, and beating it means the probabilities carry real information. `
+        + `Recent form (newest first): ● hit, ○ miss.`;
+      html += `<div class="stat" title="${esc(tip)}"><span class="v ${edge >= 0 ? 'good' : 'bad'}">${rf.hit}–${rf.n - rf.hit}</span>`
+        + `<span class="k">🥎 YRFI/NRFI ${Math.round(pctHit)}% · Brier ${brier.toFixed(3)}${form ? `<br><span class="rfiform">${form}</span>` : ''}</span></div>`;
+    }
+  }
   // this sport's all-time ⭐ suggested-pick record (every pick tailed, bet or not)
   if (sport) {
     const r = Brain.sportRecord(sport.id);
