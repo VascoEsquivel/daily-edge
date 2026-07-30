@@ -442,6 +442,7 @@
   }
   .projline b { color: var(--text); }
   .projline .fair { color: var(--accent); font-weight: 700; }
+  .projline .rfisp { color: var(--muted); opacity: .8; }
   .steam {
     display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: .4px;
     color: #ffcf5c; background: rgba(255, 180, 40, .12); border: 1px solid rgba(255, 180, 40, .42);
@@ -945,7 +946,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.11'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.12'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -3109,24 +3110,35 @@ const MonteCarlo = (() => {
 })();
 
 // ⚾ YRFI / NRFI — will a run score in the FIRST inning (Yes/No Run First Inning)? A popular
-// standalone MLB market. Reuses the sim's own geometric per-inning run model so it stays
-// consistent with the rest of the MLB engine: a team's runs in an inning are geometric with
-// P(0 runs)=1/(1+λ), so P(they score at least once) = λ/(1+λ). The league-average first
-// inning is CALIBRATED to the real base rate — an average team scores in the 1st ~27% of the
-// time, and the geometric mean that reproduces that is 0.37, well below a naive runs/9,
-// because a single inning is far more zero-heavy than the full-game rate implies. Each team's
-// first-inning λ scales that base by its model-projected runs relative to league average, so
-// an ace-vs-ace duel leans NRFI and a bandbox slugfest leans YRFI. proj.h/proj.a already fold
-// in the probable starters' xERA, the park factor and the weather — exactly what drives
-// first-inning scoring — and the starter always throws the 1st, so no bullpen dilution here.
+// standalone MLB market. Reuses the sim's geometric per-inning run model — a team's runs in
+// an inning are geometric with P(0)=1/(1+λ), so P(they score) = λ/(1+λ) — but crucially builds
+// each team's first-inning λ from FIRST-INNING-SPECIFIC observed stats, NOT the full-game
+// total. (The old version scaled off proj.h/proj.a, which run ~1.4 runs UNDER the market total
+// on a typical slate — that systematic under-projection leaked straight into the read and
+// printed an NRFI lean on nearly every game.) The 1st inning is one specific offense vs one
+// specific STARTER (who always throws the 1st) in one park, so we use exactly those three:
+//   • the batting team's season runs/game (pfg) vs league 4.4  — its real offensive level
+//   • the OPPOSING STARTER's xERA (or ERA) vs league 4.2       — the arm actually on the mound
+//   • the park run factor                                       — venue scoring environment
+// pfg and starter ERA both centre on league average by construction, so the slate NRFI average
+// lands back near the true ~53% instead of drifting high, and each game spreads on the real
+// matchup: an ace vs a cold offense leans hard NRFI, a bandbox slugfest with two back-end
+// starters leans YRFI. Calibrated so league offense vs a league starter in a neutral park
+// reproduces the real ~27% first-inning score rate (geometric mean 0.37).
 const RFI_LG_RUNS = 4.4;    // league-average team runs per game (2023-25 MLB ≈ 4.3-4.5)
-const RFI_BASE_LAM = 0.37;  // first-inning geometric mean for a league-average team → P(score)≈0.27
-function firstInningRun(projH, projA) {
-  if (!(projH > 0) || !(projA > 0)) return null;
-  const pScore = runs => { const lam = RFI_BASE_LAM * runs / RFI_LG_RUNS; return lam / (1 + lam); };
-  const pH = pScore(projH), pA = pScore(projA);
+const RFI_LG_ERA  = 4.2;    // league-average starter ERA (matches the totals block's baseline)
+const RFI_BASE_LAM = 0.37;  // first-inning geometric mean at league conditions → P(score)≈0.27
+function firstInningRun(home, away, park) {
+  if (!(home.pfg > 0) || !(away.pfg > 0)) return null;
+  const off = t => clamp(t.pfg / RFI_LG_RUNS, 0.7, 1.45);
+  const arm = p => { const e = p ? (p.xera ?? p.era) : null; return e > 0 ? clamp(e / RFI_LG_ERA, 0.55, 1.6) : 1; };
+  const pk = park > 0 ? clamp(Math.sqrt(park), 0.9, 1.12) : 1;
+  // away bats the top of the 1st vs the HOME starter; home bats the bottom vs the AWAY starter
+  const lamA = RFI_BASE_LAM * off(away) * arm(home.probable) * pk;
+  const lamH = RFI_BASE_LAM * off(home) * arm(away.probable) * pk;
+  const pA = lamA / (1 + lamA), pH = lamH / (1 + lamH);
   const yrfi = 1 - (1 - pH) * (1 - pA);
-  return { yrfi, nrfi: 1 - yrfi, pH, pA };
+  return { yrfi, nrfi: 1 - yrfi, pH, pA, starters: !!(home.probable && away.probable) };
 }
 // prob → fair American odds (no vig). Feed through fmtML for the leading + sign.
 const fairAm = p => { const c = clamp(p, 0.02, 0.98); return c >= 0.5 ? Math.round(-100 * c / (1 - c)) : Math.round(100 * (1 - c) / c); };
@@ -3726,7 +3738,8 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
     return {
       id: ev.id, home, away, model, pick, pickProb, vegas, edge, marketPrior, noLearn,
       alphaInfo: typeof alphaInfo !== 'undefined' ? alphaInfo : null,
-      rfi: (sport.id === 'mlb' && (st.state || 'pre') === 'pre' && proj) ? firstInningRun(proj.h, proj.a) : null,
+      rfi: (sport.id === 'mlb' && (st.state || 'pre') === 'pre' && home.pfg != null && away.pfg != null)
+        ? firstInningRun(home, away, PARK_RUN_FACTOR[home.abbr]) : null,
       total, sim, proj, wx, why: typeof whyDrivers !== 'undefined' ? whyDrivers : [],
       pRaw: typeof pRawHome !== 'undefined' ? pRawHome : null,
       state: st.state || 'pre',                       // pre | in | post
@@ -4935,8 +4948,20 @@ function rfiStrip(g) {
   const lean = r.nrfi >= r.yrfi ? 'NRFI' : 'YRFI';
   const lp = Math.max(r.nrfi, r.yrfi);
   const strength = lp >= 0.58 ? 'strong' : lp >= 0.53 ? 'lean' : 'coin-flip';
-  const tip = `Model probability a run scores in the 1st inning — NRFI = neither team scores, YRFI = at least one does. Built from each team's model-projected runs (probable starter's xERA, park factor and weather already folded in) through the sim's geometric per-inning run model, calibrated to the league ~53% NRFI base rate. ${g.away.abbr} score-in-1st ${pct(r.pA)} · ${g.home.abbr} score-in-1st ${pct(r.pH)}. No book price in our feed — compare these fair odds to your NRFI/YRFI market to spot value.`;
-  return `<div class="projline" title="${esc(tip)}">🥎 1st inning · NRFI <b>${pct(r.nrfi)}</b> <span class="fair">${fmtML(fairAm(r.nrfi))}</span> · YRFI <b>${pct(r.yrfi)}</b> <span class="fair">${fmtML(fairAm(r.yrfi))}</span> — ${strength === 'coin-flip' ? 'coin-flip' : `<b>${strength} ${lean}</b>`}</div>`;
+  // surface the actual basis: the two starting pitchers (the arms that throw the 1st) with
+  // their ERA/xERA, so the read is transparent rather than a black-box number
+  const arm = p => {
+    if (!p) return null;
+    const x = p.xera, e = x ?? p.era;
+    if (e == null) return null;
+    return `${esc((p.name || 'SP').split(' ').pop())} ${e.toFixed(2)}${x != null ? 'x' : ''}`;  // x = xERA (expected)
+  };
+  const ah = arm(g.home.probable), aa = arm(g.away.probable);
+  const spLine = (ah && aa)
+    ? ` · <span class="rfisp">SP ${esc(g.away.abbr)} ${aa} vs ${esc(g.home.abbr)} ${ah}</span>`
+    : ' · <span class="rfisp">SP TBD · offense+park only</span>';
+  const tip = `Model probability a run scores in the 1st inning — NRFI = neither team scores, YRFI = at least one does. Built from each team's SEASON runs/game, the OPPOSING STARTER's xERA (the arm that throws the 1st), and the park factor — through the sim's geometric per-inning model, calibrated to the league ~53% NRFI base rate. ${g.away.abbr} score-in-1st ${pct(r.pA)} · ${g.home.abbr} score-in-1st ${pct(r.pH)}.${r.starters ? '' : ' Probable starters not posted yet — offense + park only, less certain.'} (An "x" after an ERA means xERA — expected ERA from Statcast, more predictive than raw ERA and why it can differ from the ERA on the card.) No book price in our feed — compare these fair odds to your NRFI/YRFI market to spot value.`;
+  return `<div class="projline" title="${esc(tip)}">🥎 1st inning · NRFI <b>${pct(r.nrfi)}</b> <span class="fair">${fmtML(fairAm(r.nrfi))}</span> · YRFI <b>${pct(r.yrfi)}</b> <span class="fair">${fmtML(fairAm(r.yrfi))}</span> — ${strength === 'coin-flip' ? 'coin-flip' : `<b>${strength} ${lean}</b>`}${spLine}</div>`;
 }
 
 // 📈 inline price sparkline (v16.1): the Open price tape drawn as a tiny time-scaled
