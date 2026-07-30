@@ -949,7 +949,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.13'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.14'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1742,12 +1742,12 @@ const Brain = (() => {
       // (e.g. from an earlier version that had no RFI). Immediate, so today's finals count.
       if (sport.id === 'mlb' && !db.rfiGraded?.[key]) {
         const act = rfiActual(g);
-        const pre = Open.get(sport, g)?.rf;   // ESPN strips probables from finals → use the snapshot
-        if (act && pre != null) {
-          const predYes = pre >= 0.5;
-          const hit = predYes === act.yrfi;
+        const read = act ? rfiRead(g) : null;   // pregame snapshot, else reconstructed from the box
+        if (act && read) {
+          const hit = (read.p >= 0.5) === act.yrfi;
           db.rfi.n++; if (hit) db.rfi.hit++;
-          db.rfi.bs += Math.pow(pre - (act.yrfi ? 1 : 0), 2);   // Brier vs the actual 0/1
+          if (read.recon) db.rfi.rc = (db.rfi.rc || 0) + 1;
+          db.rfi.bs += Math.pow(read.p - (act.yrfi ? 1 : 0), 2);   // Brier vs the actual 0/1
           db.rfi.r.unshift(hit ? 1 : 0); if (db.rfi.r.length > 20) db.rfi.r.length = 20;
           (db.rfiGraded = db.rfiGraded || {})[key] = today;
           changed = true;
@@ -3187,6 +3187,20 @@ function firstInningRun(home, away, park) {
   const pA = lamA / (1 + lamA), pH = lamH / (1 + lamH);
   const yrfi = 1 - (1 - pH) * (1 - pA);
   return { yrfi, nrfi: 1 - yrfi, pH, pA, starters: !!(home.probable && away.probable) };
+}
+// The pregame read to GRADE a finished game against. Prefers the true pregame snapshot
+// (the authentic real-time call). If the app never saw this game pregame — installed later,
+// or an older date the user scrolled back to — reconstruct it from the SAME inputs the
+// pregame model uses: ESPN retains `probables` on finals (it strips ODDS, not starters).
+// HONESTY: a reconstructed read uses CURRENT season stats rather than as-of-game-date, a
+// mild look-ahead, so it's flagged and counted separately instead of being passed off as a
+// live call. Without this the scorecard would sit empty for days after install.
+function rfiRead(g) {
+  const sport = SPORTS.find(s => s.id === 'mlb');
+  const snap = (typeof Open !== 'undefined' && sport) ? Open.get(sport, g)?.rf : null;
+  if (snap != null) return { p: snap, recon: false };
+  const r = firstInningRun(g.home, g.away, PARK_RUN_FACTOR[g.home.abbr]);
+  return r ? { p: r.yrfi, recon: true } : null;
 }
 // actual first-inning outcome, straight off the box score's per-inning linescores.
 // Returns null until both sides have batted the 1st (so live games settle mid-game correctly).
@@ -5006,17 +5020,19 @@ function rfiStrip(g) {
   if (g.sportId === 'mlb' && g.state !== 'pre') {
     const act = rfiActual(g);
     if (!act) return '';
-    const sport = SPORTS.find(s => s.id === 'mlb');
-    const pre = sport ? Open.get(sport, g)?.rf : null;
+    const read = rfiRead(g);
     const outcome = act.yrfi
       ? `YRFI — ${act.runs} run${act.runs === 1 ? '' : 's'} in the 1st (${esc(g.away.abbr)} ${act.a}, ${esc(g.home.abbr)} ${act.h})`
       : 'NRFI — scoreless 1st';
-    if (pre == null)
-      return `<div class="projline">🥎 1st inning · <b>${outcome}</b> <span class="rfisp">· no pregame read logged</span></div>`;
-    const called = pre >= 0.5 ? 'YRFI' : 'NRFI';
-    const hit = (pre >= 0.5) === act.yrfi;
-    const conf = Math.round((pre >= 0.5 ? pre : 1 - pre) * 100);
-    return `<div class="projline" title="${esc(`Pregame the model read ${called} at ${conf}%. Actual: ${outcome}.`)}">🥎 1st inning · <b>${outcome}</b> · <span class="${hit ? 'rfihit' : 'rfimiss'}">${hit ? '✓' : '✗'} called ${called} ${conf}%</span></div>`;
+    if (!read)
+      return `<div class="projline">🥎 1st inning · <b>${outcome}</b> <span class="rfisp">· no model read available</span></div>`;
+    const called = read.p >= 0.5 ? 'YRFI' : 'NRFI';
+    const hit = (read.p >= 0.5) === act.yrfi;
+    const conf = Math.round((read.p >= 0.5 ? read.p : 1 - read.p) * 100);
+    const tip = read.recon
+      ? `Reconstructed read: the app didn't see this game pregame, so the ${called} ${conf}% call was rebuilt from the same starters/offense/park inputs the live model uses. It uses current season stats rather than as-of-game-date, so treat it as a backtest, not a live call. Actual: ${outcome}.`
+      : `Pregame the model read ${called} at ${conf}%. Actual: ${outcome}.`;
+    return `<div class="projline" title="${esc(tip)}">🥎 1st inning · <b>${outcome}</b> · <span class="${hit ? 'rfihit' : 'rfimiss'}">${hit ? '✓' : '✗'} called ${called} ${conf}%</span>${read.recon ? ' <span class="rfisp">· backtest</span>' : ''}</div>`;
   }
   const r = g.rfi;
   if (!r) return '';
@@ -5275,17 +5291,23 @@ function summaryBar(events, sport) {
   // companion metric: it punishes confident misses, which a raw hit rate can't see.
   if (sport?.id === 'mlb') {
     const rf = Brain.rfiRec();
-    if (rf && rf.n >= 3) {
+    if (!rf || !rf.n) {
+      // always render the tile so the scorecard is discoverable rather than silently absent
+      html += `<div class="stat" title="${esc('No first-inning results graded yet. Every MLB game that finishes gets its YRFI/NRFI call scored against the real box score, and the running record shows up here.')}">`
+        + `<span class="v">–</span><span class="k">🥎 YRFI/NRFI · awaiting first graded game</span></div>`;
+    } else {
       const pctHit = rf.hit / rf.n * 100;
       const brier = rf.bs / rf.n;
       const edge = pctHit - 51.4;          // vs the measured league YRFI base rate
       const form = rf.r.slice(0, 10).map(x => x ? '●' : '○').join('');
-      const tip = `The model's pregame YRFI/NRFI lean vs what actually happened in the 1st inning, from ${rf.n} graded game${rf.n === 1 ? '' : 's'}. `
-        + `Baseline: a run scores in the 1st 51.4% of the time (measured over 1,536 games), so always guessing the same side scores ~51%. `
-        + `Brier score ${brier.toFixed(3)} — lower is better; 0.25 = a coin flip, and beating it means the probabilities carry real information. `
+      const rc = rf.rc || 0;
+      const tip = `The model's YRFI/NRFI lean vs what actually happened in the 1st inning, from ${rf.n} graded game${rf.n === 1 ? '' : 's'}. `
+        + `Baseline: a run scores in the 1st 51.4% of the time (measured over 1,536 games), so always guessing the same side scores ~51% — beat that and the read is doing work. `
+        + `Brier score ${brier.toFixed(3)} — lower is better; 0.25 = a coin flip, and beating it means the probabilities themselves carry information, not just the lean. `
+        + (rc ? `${rc} of ${rf.n} are BACKTESTS — games the app didn't see pregame, rebuilt from the same inputs but using current season stats, so they flatter slightly. ${rf.n - rc} are true live calls. ` : `All ${rf.n} are true live pregame calls. `)
         + `Recent form (newest first): ● hit, ○ miss.`;
       html += `<div class="stat" title="${esc(tip)}"><span class="v ${edge >= 0 ? 'good' : 'bad'}">${rf.hit}–${rf.n - rf.hit}</span>`
-        + `<span class="k">🥎 YRFI/NRFI ${Math.round(pctHit)}% · Brier ${brier.toFixed(3)}${form ? `<br><span class="rfiform">${form}</span>` : ''}</span></div>`;
+        + `<span class="k">🥎 YRFI/NRFI ${Math.round(pctHit)}% · Brier ${brier.toFixed(3)}${rc ? ` · ${rc} backtest` : ''}${form ? `<br><span class="rfiform">${form}</span>` : ''}</span></div>`;
     }
   }
   // this sport's all-time ⭐ suggested-pick record (every pick tailed, bet or not)
