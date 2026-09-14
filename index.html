@@ -295,6 +295,7 @@
   .chip.lean { background: rgba(0,200,255,.12); color: var(--accent2); }
   .chip.coin { background: rgba(132,148,184,.14); color: var(--muted); }
   .chip.mkt { background: rgba(167,139,250,.14); color: #a78bfa; }
+  .chip.locktag { background: rgba(132,148,184,.12); color: var(--muted); font-weight: 600; margin-left: 6px; }
   .chip.value {
     background: linear-gradient(90deg, rgba(255,209,102,.2), rgba(244,169,66,.12));
     color: var(--gold); border: 1px solid rgba(255,209,102,.35);
@@ -949,7 +950,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.14'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.15'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -965,7 +966,18 @@ const SPORTS = [
     extraPaths: ['basketball/nba-summer-las-vegas'],   // Summer League rides in the NBA tab (never trains the real Elo)
     offMsg: 'No NBA or Summer League games on this date.' },
   { id: 'nhl',  label: '🏒 NHL',  path: 'hockey/nhl',      hfaWin: 0.550, spreadSigma: 2.7,  offMsg: 'Off-season — puck drops again in October.' },
-  { id: 'nfl',  label: '🏈 NFL',  path: 'football/nfl',    hfaWin: 0.565, spreadSigma: 13.5, offMsg: 'Off-season — kickoff returns in September.' },
+  // (v16.15) NFL constants re-measured on 2,227 games (2018-25): non-neutral home win
+  // 0.544 and a closing-line HFA of ~1.7 pts → 0.555 (0.565 was the high end); the
+  // closing-spread residual SD is 12.2-12.7 every season, so 13.5 was ~6% too wide.
+  { id: 'nfl',  label: '🏈 NFL',  path: 'football/nfl',    hfaWin: 0.555, spreadSigma: 12.75, offMsg: 'Off-season — kickoff returns in September.' },
+  // 🎓 (v16.15) College football, FBS slate (ESPN's default with a dates param). Every
+  // constant below was MEASURED on 1,853 FBS games (2024-25) against closing lines, not
+  // copied from the NFL: home win 0.594 raw but only 0.558 in conference play (the raw
+  // rate counts P4-hosts-G5 scheduling) and a closing-line HFA of 2.5-2.7 pts → 0.57;
+  // closing-spread residual SD 15.09 (the raw margin SD of 22 includes predictable talent
+  // gaps and must NOT be used). ~6% of games are neutral-site → hfa 0.5 (see g.neutral).
+  { id: 'cfb',  label: '🎓 CFB',  path: 'football/college-football', hfaWin: 0.57, spreadSigma: 15, cfb: true,
+    offMsg: 'No college football on this date — the FBS slate lands on Saturdays.' },
 ];
 const API = 'https://site.api.espn.com/apis/site/v2/sports';
 
@@ -1059,9 +1071,17 @@ function predictUS(pH, pA, hfaWin) {
 // scored vs allowed — leads the record, so it gets the majority weight)
 function teamStrength(t) {
   const pct = regressedWinPct(t.rec.w, t.rec.l);
-  if (t.pyth == null) return pct;
-  const pythReg = (t.pyth * t.pythG + 0.5 * REGRESS_GAMES) / (t.pythG + REGRESS_GAMES);
-  return 0.45 * pct + 0.55 * pythReg;
+  let s = pct;
+  if (t.pyth != null) {
+    const pythReg = (t.pyth * t.pythG + 0.5 * REGRESS_GAMES) / (t.pythG + REGRESS_GAMES);
+    s = 0.45 * pct + 0.55 * pythReg;
+  }
+  // 🎓 college football: an AP Top-25 rank is a POINT-IN-TIME strength read (the scoreboard
+  // carries the poll in force on that date, verified — unlike records and standings, it
+  // never leaks the result). With 12-game seasons and 2-0 records built on FCS cupcakes,
+  // a 2-0 unranked team and #3 are otherwise indistinguishable to the record prior.
+  if (t.rank && t.rank <= 25) s = 0.5 * s + 0.5 * (0.52 + 0.40 * (26 - t.rank) / 25);
+  return s;
 }
 
 // Soccer: strength from regressed points-per-game, draw share shrinks as gap grows
@@ -1256,6 +1276,13 @@ const KEY_MARGIN_W = {
   nba:  { 0: 0, 1: 0.55, 2: 0.68, 3: 0.85, 4: 0.92, 5: 1.05, 6: 1.08, 7: 1.10, 8: 1.08,
           9: 1.05, 10: 1.05, 11: 1.03, 12: 1.02 },             // fouling stretches close finishes
   wnba: { 0: 0, 1: 0.58, 2: 0.70, 3: 0.86, 4: 0.93, 5: 1.05, 6: 1.07, 7: 1.08, 8: 1.06, 10: 1.04 },
+  // 🎓 FBS 2024-25, n=1,799 finals scored each against its own Normal(−closing spread, 15.09)
+  // — the same construction marginPMF applies these weights to. An integer was kept only if
+  // it sat on the same side of 1 in BOTH seasons with |r−1| ≥ 1.5 SE, then shrunk toward 1
+  // by its sampling error. 3 (field goal) and 7 (touchdown) dominate; 0 is impossible (OT).
+  cfb:  { 0: 0, 2: 0.80, 3: 2.55, 5: 0.80, 7: 2.15, 9: 0.25, 10: 1.30, 11: 0.75, 12: 0.60,
+          13: 0.50, 14: 1.10, 15: 0.60, 16: 0.60, 17: 1.50, 20: 0.70, 21: 1.55, 23: 0.55, 24: 1.30,
+          26: 0.65, 28: 1.60 },
 };
 function marginPMF(sportId, mu, sigma) {
   const W = KEY_MARGIN_W[sportId];
@@ -1371,8 +1398,13 @@ const fmtML = n => (n > 0 ? '+' : '') + n;
 // ── Live in-game win probability (Stern model) ────────────────────────
 // P(win | lead, time left) = Φ((margin + μ·rem) / (σ·√rem)) where μ is the
 // pregame expected margin and rem is the fraction of the game remaining.
-const LIVE_SIGMA = { mlb: 4.3, wnba: 13, nba: 13.5, nfl: 13.8, nhl: 2.9, mls: 1.9, wc: 1.9 };
-const PERIOD_CFG = { wnba: { n: 4, len: 10 }, nba: { n: 4, len: 12 }, nfl: { n: 4, len: 15 }, nhl: { n: 3, len: 20 } };
+// (v16.15) football live sigmas measured at quarter-end checkpoints (NFL 2018-25, FBS
+// 2024-25): remaining-margin variance is Brownian-like at ~13-15, but LEADS MEAN-REVERT
+// (slope −0.13 to −0.16 in the NFL) and sternLive doesn't model that, so the sigma that
+// minimizes log loss is wider — 16 for the NFL (13.8 was overconfident in leaders: the
+// Q3 0-10% bucket won 6.7%), 17 for college.
+const LIVE_SIGMA = { mlb: 4.3, wnba: 13, nba: 13.5, nfl: 16, cfb: 17, nhl: 2.9, mls: 1.9, wc: 1.9 };
+const PERIOD_CFG = { wnba: { n: 4, len: 10 }, nba: { n: 4, len: 12 }, nfl: { n: 4, len: 15 }, cfb: { n: 4, len: 15 }, nhl: { n: 3, len: 20 } };
 
 function gameFraction(g, sport) {
   const cap = x => Math.max(0.02, Math.min(0.98, x));
@@ -1436,7 +1468,10 @@ function liveProbs(g, sport) {
   const sigma = LIVE_SIGMA[sport.id] || 10;
   const pace = livePaceMult(g, sport, f);
   if (!g.model.draw) {
-    const p = sternLive(margin, f, Open.get(sport, g)?.p ?? g.model.home, sigma, pace);
+    // pregame anchor: the LOCKED kickoff read when we have one (g.model is already the
+    // locked value then), else the first-sight Open snapshot, else whatever the model says
+    const pre = g.lock ? g.model.home : (Open.get(sport, g)?.p ?? g.model.home);
+    const p = sternLive(margin, f, pre, sigma, pace);
     return { home: p, away: 1 - p, draw: 0 };
   }
   // soccer: shrink the draw share as the clock runs (slower when level), split the rest
@@ -1456,10 +1491,14 @@ const ymd = d => d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate(
 // weight grows with how many games the brain has seen for those teams.
 const Brain = (() => {
   const KEY = 'de-brain-v4';   // v4: self-calibrating totals bias (relearns the season with it)
-  const ELO_K = { mlb: 6, wnba: 24, nba: 20, nfl: 24, nhl: 10, mls: 24, wc: 28, tennis: 32 };
+  // 🎓 cfb K: replaying the app's own learn() over 2024 → scored on 2025, the NFL K (24)
+  // gives log loss 0.583 while K≈110-130 gives 0.493 (market 0.471) — 12-game seasons, a
+  // huge talent spread and 136 teams need ratings to move fast. 80 here because the
+  // Glicko sampleF already boosts early-season updates on top of K.
+  const ELO_K = { mlb: 6, wnba: 24, nba: 20, nfl: 24, cfb: 80, nhl: 10, mls: 24, wc: 28, tennis: 32 };
   // typical decisive margin per sport — the MOV multiplier is scaled to this so a
   // 3-run baseball win and a 12-point NBA win teach comparable amounts
-  const MOV_REF = { mlb: 3, wnba: 10, nba: 12, nfl: 10, nhl: 2, mls: 1.5, wc: 1.5, tennis: 1.5 };
+  const MOV_REF = { mlb: 3, wnba: 10, nba: 12, nfl: 10, cfb: 14, nhl: 2, mls: 1.5, wc: 1.5, tennis: 1.5 };
   const LR = 0.04;                 // calibration learning rate
   let db;
   try { db = JSON.parse(localStorage.getItem(KEY)); } catch { db = null; }
@@ -1496,6 +1535,44 @@ const Brain = (() => {
   // (a hit rate alone can't tell a sharp forecast from a lucky one; Brier keeps it honest).
   // r = last 20 outcomes, newest first, as 1/0 — drives the tab's recent-form strip.
   db.rfi = db.rfi || { n: 0, hit: 0, bs: 0, r: [] };
+  // ══ LOCK ERA (v16.15) — one-time, deterministic migration ══════════════════════════
+  // Until now every finished game was RE-PREDICTED from data that already contained the
+  // result (post-final records, season standings, an Elo that had learned the game, and a
+  // market clamp that vanished because ESPN strips odds from finals). Measured on NFL
+  // week 1: the recomputed model "picked" 13 of 13 winners with a Brier of 0.185; the
+  // genuine pregame read picked 8 of 14 at 0.245. Every stat below that graded the
+  // recomputation was therefore scored with the answer key, and cannot be repaired:
+  //  • straight-up hits/misses (incl. the canonical 4100-2437 built with July standings
+  //    on games back to March) → moved to db.legacy.su, headline restarts at 0-0
+  //  • ⭐ ledger reconstructions (rec:true — a would-be pick priced off the post-final
+  //    model, then settled) were winner-biased → dropped from the headline, kept in
+  //    db.legacy; genuine pregame tickets are re-summed as the honest record
+  //  • calib / perf (the Elo-vs-prior blend weight) / edge trust / totalsBias / margins
+  //    were FIT on hindsight inputs and price every future game → reset, relearn from
+  //    locked reads only. Elo, learned HFA, MMA finish mix, CLV and RFI are outcome-only
+  //    learners and are untouched.
+  const PRAW_SPORTS = ['mlb', 'nba', 'wnba', 'nhl', 'nfl', 'cfb', 'mma'];
+  const scrubLearners = () => {
+    PRAW_SPORTS.forEach(s => { if (db.calib[s]) db.calib[s] = { a: 0, b: 1, n: 0 }; delete db.perf[s]; });
+    db.edge = {}; db.totalsBias = {}; db.margins = {};
+  };
+  if (!db.lockEraV1) {
+    db.legacy = db.legacy || {};
+    db.legacy.su = { h: db.stats.hits || 0, m: db.stats.misses || 0, asOf: ymd(new Date()) };
+    db.stats.hits = 0; db.stats.misses = 0;
+    scrubLearners();
+    const keep = db.stats.betlog.filter(x => !x.rec), recN = db.stats.betlog.length - keep.length;
+    db.legacy.bets = { bets: db.stats.bets, betsWon: db.stats.betsWon, pnl: +(db.stats.pnl || 0).toFixed(2),
+                       staked: db.stats.betsStaked, recon: recN };
+    let c = 0;
+    keep.forEach(x => { c = +(c + (x.pnl || 0)).toFixed(2); x.c = c; });
+    db.stats.bets = keep.length; db.stats.betsWon = keep.filter(x => x.w).length; db.stats.pnl = c;
+    db.stats.betsStaked = +keep.reduce((s, x) => s + (x.u || 0), 0).toFixed(2);
+    db.stats.betsExpWon = +keep.reduce((s, x) => s + (x.p || 0), 0).toFixed(3);
+    db.stats.betlog = keep;
+    for (const k in db.pending) if (db.pending[k].rec) delete db.pending[k];   // unsettled hindsight tickets
+    db.lockEraV1 = 1;
+  }
   // (v15.9) one-time reset: totalsBias was learned against projections carrying the
   // injury double-count (wnba had drifted to −11 pts). The model changed, so the bias
   // restarts clean and re-learns against the corrected totals.
@@ -1577,7 +1654,10 @@ const Brain = (() => {
     return Math.max(0.45, Math.min(0.68, (1 - mix) * base + mix * h.w));
   };
 
-  function learn(sport, kH, kA, hfaLogit, scoreH, mov = 1, day = null, surf = null, pRaw = null, wt = 1) {
+  // opts.fitCalib=false: the game had no LOCKED pregame read, so the calibration map and the
+  // Elo-vs-prior Brier must not train on it (the Elo update itself needs only the outcome).
+  // opts.neutral: neutral site → the home-advantage EMA learns nothing from it.
+  function learn(sport, kH, kA, hfaLogit, scoreH, mov = 1, day = null, surf = null, pRaw = null, wt = 1, opts = {}) {
     const { p: pElo, eH, eA } = eloProb(sport, kH, kA, hfaLogit, surf, day);
     const nMinPre = Math.min(eH.n, eA.n);   // pre-update sample size — the calibration fit
                                             // must see the same weight the forecast used
@@ -1607,9 +1687,11 @@ const Brain = (() => {
     eA.d = Math.max(RD_MIN, Math.sqrt(1 / (1 / (dA * dA) + 1 / info)));
     // home-advantage tracker: slow EMA (~last 100 games) of the home result share.
     // Updated AFTER this game's Elo math so it never self-influences.
-    const hf = db.hfa[sport] = db.hfa[sport] || { w: 0.55, n: 0 };
-    hf.w += 0.01 * (scoreH - hf.w);
-    hf.n++;
+    if (!opts.neutral) {
+      const hf = db.hfa[sport] = db.hfa[sport] || { w: 0.55, n: 0 };
+      hf.w += 0.01 * (scoreH - hf.w);
+      hf.n++;
+    }
     // rolling last-10 signed margins, fuel for the form sparklines
     const hMargin = scoreH === 1 ? mov : scoreH === 0 ? -mov : 0;
     (eH.hist = eH.hist || []).push(hMargin); if (eH.hist.length > 10) eH.hist.shift();
@@ -1626,7 +1708,7 @@ const Brain = (() => {
       eH.s[surf] = capped((eH.s[surf] || 0) + 0.5 * delta);
       eA.s[surf] = capped((eA.s[surf] || 0) - 0.5 * delta);
     }
-    if (scoreH !== 0.5) {
+    if (scoreH !== 0.5 && opts.fitCalib !== false) {
       const c = getCalib(sport);
       // (v16.6) FIT ON WHAT WE APPLY IT TO. This used to fit the recalibration map on the
       // raw Elo logit while adjust() applied it to the Elo/prior BLEND — a train/apply
@@ -1732,10 +1814,16 @@ const Brain = (() => {
     const today = ymd(new Date());
     let changed = false;
     events.forEach(g => {
-      if (g.state !== 'post') return;
+      // postponed / canceled games sit in ESPN as 'post' with completed=false — they were
+      // being logged as misses and learned into Elo as ties. Nothing to grade: skip.
+      if (g.state !== 'post' || g.completed === false) return;
       const key = sport.id + '|' + g.id;
       const gday = ymd(g.start);
       const scoreH = g.home.winner ? 1 : g.away.winner ? 0 : 0.5;
+      const winAbbr = g.home.winner ? g.home.abbr : g.away.winner ? g.away.abbr : null;
+      // graded = this game carries a LOCKED pregame read (Lock.sync restored it onto g).
+      // Only graded games may score the model or train the forecast learners.
+      const graded = !!g.graded;
       // ⚾ YRFI/NRFI settle: grade the pregame first-inning read against the actual box
       // score. Kept OUT of the stage-1/stage-2 guards on purpose — it has its own
       // `rfiGraded` key so it still records if the ledger already processed this game
@@ -1756,10 +1844,13 @@ const Brain = (() => {
       // stage 1 — ledger settle + history record (once, immediately)
       if (!db.processed[key]) {
         settle(key, g, scoreH);
+        // pk/p/ok come from the LOCKED read; a game never seen pregame keeps its score and
+        // winner (wn — history/H2H still work) but carries no pick and no ✓/✗
         db.log.unshift({ d: gday, s: sport.id,
-          a: g.away.abbr, h: g.home.abbr, sa: g.away.score ?? '', sh: g.home.score ?? '',
-          pk: g.pick === 'draw' ? 'Draw' : g[g.pick].abbr, p: Math.round(g.pickProb * 100), ok: !!g.correct });
-        if (db.log.length > 600) { db.log.sort((x, y) => y.d - x.d); db.log.length = 600; }
+          a: g.away.abbr, h: g.home.abbr, sa: g.away.score ?? '', sh: g.home.score ?? '', wn: winAbbr,
+          pk: graded ? (g.pick === 'draw' ? 'Draw' : g[g.pick].abbr) : null,
+          p: graded ? Math.round(g.pickProb * 100) : null, ok: graded ? !!g.correct : null, lk: graded ? 1 : 0 });
+        if (db.log.length > 1200) { db.log.sort((x, y) => y.d - x.d); db.log.length = 1200; }
         db.processed[key] = today;
         changed = true;
       }
@@ -1767,20 +1858,27 @@ const Brain = (() => {
       // The anchor guard skips anything the adopted canonical brain already learned.
       // noLearn events (Summer League) settle picks above but never touch the Elo.
       if (!g.noLearn && gday < today && gday > (db.anchor || 0) && !db.learned[key]) {
-        const hfaLogit = g.tennis || sport.hfaWin == null ? 0 : logit(effHfa(sport.id, sport.hfaWin));
+        const hfaLogit = g.tennis || g.neutral || sport.hfaWin == null ? 0 : logit(effHfa(sport.id, sport.hfaWin));
         let mov;
         if (g.tennis) { const [th, ta] = setsTally(g.home.sets, g.away.sets); mov = Math.abs(th - ta); }
         else mov = Math.abs((Number(g.home.score) || 0) - (Number(g.away.score) || 0));
         // tier weighting: Grand Slam results are tennis Elo's strongest signal
-        // (best-of-5 for the men + peak fields) — standard in tennis rating systems
-        const wt = g.tennis && /wimbledon|us open|french open|roland garros|australian open/i.test(g.venue || '') ? 1.3 : 1;
+        // (best-of-5 for the men + peak fields) — standard in tennis rating systems.
+        // 🎓 FBS-vs-FCS blowouts (avg +32, 96% FBS wins) teach half as much — the margin
+        // says more about the tier gap than either team.
+        const wt = g.tennis && /wimbledon|us open|french open|roland garros|australian open/i.test(g.venue || '') ? 1.3
+          : g.fcs ? 0.5 : 1;
+        // the record/Pythagorean prior and the calibration fit may only use a LOCKED pregame
+        // read; sports that never carry pRaw (tennis, soccer) keep their Elo-only calib path
         learn(sport.id, teamKey(g.home), teamKey(g.away), hfaLogit, scoreH, mov,
-          Math.floor(g.start.getTime() / 864e5), g.surface || null, g.pRaw ?? null, wt);
-        g.correct ? db.stats.hits++ : db.stats.misses++;
+          Math.floor(g.start.getTime() / 864e5), g.surface || null, graded ? (g.pRaw ?? null) : null, wt,
+          { fitCalib: g.pRaw == null || graded, neutral: !!g.neutral });
+        if (graded) { g.correct ? db.stats.hits++ : db.stats.misses++; }
         db.stats.absorbed++;
-        // totals self-calibration: ESPN strips odds from finals, so the pregame
-        // prediction comes from the Open snapshot taken while the game was upcoming
-        const preTotal = g.total?.exp ?? (typeof Open !== 'undefined' ? Open.get(sport, g)?.te : null);
+        // totals self-calibration, LOCKED reads only. expRaw is the projection BEFORE the
+        // learned bias was applied — learning the residual against the biased number
+        // converged to half the true bias (a feedback loop).
+        const preTotal = graded ? (g.total?.expRaw ?? g.total?.exp ?? null) : null;
         if (preTotal != null) {
           const actual = (Number(g.home.score) || 0) + (Number(g.away.score) || 0);
           const tb = db.totalsBias[sport.id] = db.totalsBias[sport.id] || { b: 0, n: 0 };
@@ -1792,7 +1890,7 @@ const Brain = (() => {
         // (trust=1, so the measure is stable) by Brier per sport. edgeTrust() reads this
         // to decide how hard to apply the alpha. Priced two-way games only (soccer keeps
         // its own 3-way blend and carries no alphaInfo).
-        if (g.alphaInfo && !sport.soccer) {
+        if (graded && g.alphaInfo && !sport.soccer) {
           const prior = g.alphaInfo.prior, raw = clamp(g.alphaInfo.raw);
           const fullAlpha = Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, raw - prior));
           const post = clamp(prior + fullAlpha);
@@ -1816,7 +1914,7 @@ const Brain = (() => {
         // accounted for). marginPMF blends the observed/expected ratio over the hardcoded
         // KEY_MARGIN_W once enough finals bank — the key-number table tunes itself to the
         // league as it actually plays. Canonical (rides export/adopt).
-        if (KEY_MARGIN_W[sport.id] && sport.spreadSigma && g.model?.home != null) {
+        if (graded && KEY_MARGIN_W[sport.id] && sport.spreadSigma && g.model?.home != null) {
           const md = db.margins[sport.id] = db.margins[sport.id] || { obs: {}, exp: {}, n: 0 };
           const sig = sport.spreadSigma;
           const muM = invNorm(clamp(g.model.home)) * sig;
@@ -1924,19 +2022,24 @@ const Brain = (() => {
         db.mmaMethod = r.mmaMethod || {}; db.margins = r.margins || {};
         db.through = r.through; db.anchor = r.through; db.learned = {};
         db.canonId = r.id;
-        // brain-level counters ride along so a fresh device shows the brain's real experience
-        ['absorbed', 'hits', 'misses'].forEach(k => db.stats[k] = Math.max(db.stats[k] || 0, r.stats?.[k] || 0));
+        // a canonical published before the lock era carries learners fit on hindsight
+        // inputs — adopt its Elo/HFA, scrub the rest (same reset every device applies)
+        if (!r.lockEra) scrubLearners();
+        // only the experience counter rides along: hit/miss counts from a pre-lock canonical
+        // were graded after the final and would re-import the contamination
+        db.stats.absorbed = Math.max(db.stats.absorbed || 0, r.stats?.absorbed || 0);
         save();
         return true;
       } catch { return false; }
     },
     // canonical export: everything that PRICES games (none of the personal state)
     exportCanonical() {
-      return JSON.stringify({ id: syncFingerprint().id, through: db.through || 0,
+      return JSON.stringify({ id: syncFingerprint().id, through: db.through || 0, lockEra: 1,
         elo: db.elo, calib: db.calib, perf: db.perf, totalsBias: db.totalsBias, hfa: db.hfa, edge: db.edge,
         mmaMethod: db.mmaMethod, margins: db.margins,
-        stats: { absorbed: db.stats.absorbed, hits: db.stats.hits, misses: db.stats.misses } });
+        stats: { absorbed: db.stats.absorbed } });
     },
+    legacy: () => db.legacy || null,
     postmortems: () => db.postmortems,
     totalsBias: sportId => db.totalsBias[sportId] || null,
     rfiRec: () => db.rfi,
@@ -2045,13 +2148,169 @@ const Open = (() => {
   };
 })();
 
+// ── 🔒 Prediction Lock (v16.15) ─────────────────────────────────────────────
+// THE FIX for "the pick changed after the game ended". Every poll re-runs the parsers from
+// scratch, and for an in-progress or finished game the inputs already contain the result:
+// ESPN's W-L records and season standings include the game, the Elo brain has learned it
+// when a past date is viewed, and ESPN strips odds from finals so the ±5% market clamp
+// vanishes and the leaky bottom-up model stands alone. Measured on NFL week 1: the
+// recomputed "prediction" hit 13 of 13 finals; the genuine pregame read hit 8 of 14.
+//
+// The lock is the pregame read, frozen the moment a game leaves 'pre'. While a game is
+// pregame it refreshes on every poll (lines and injuries legitimately move before kickoff);
+// the first sighting as live or final freezes it, and it is never written again. On every
+// later parse the locked fields are restored onto the game object BEFORE anything grades,
+// learns from, logs, or renders it — so the card, the history, the calibration chart and
+// every learner see exactly what the model said at kickoff.
+//
+// Sharded per sport per date (one small localStorage write per poll, whole-shard expiry),
+// kept 45 days for team sports (past every learning/settlement window) and 14 for tennis.
+// A game never seen pregame has no lock: it shows its score, ungraded, and stays out of
+// every model stat. A first sighting while LIVE freezes as s:'l' — stable on screen, but
+// in-play odds and mid-game standings make it an unverified read, so it is never graded.
+const Lock = (() => {
+  const PFX = 'de-lock-v1:';
+  const KEEP = { tennis: 14 * 864e5 };
+  const KEEP_DEFAULT = 45 * 864e5;
+  const shards = new Map();   // key → { d: dirty, g: {gid: rec} }
+  const r4 = x => x == null ? null : +Number(x).toFixed(4);
+  const r2 = x => x == null ? null : +Number(x).toFixed(2);
+  try {   // boot: expire old shards
+    const now = Date.now();
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith(PFX)) continue;
+      const [, sid, ys] = k.split(':');
+      const y = Number(ys), t = new Date(Math.floor(y / 10000), Math.floor(y / 100) % 100 - 1, y % 100).getTime();
+      if (!(y > 0) || now - t > (KEEP[sid] || KEEP_DEFAULT)) localStorage.removeItem(k);
+    }
+  } catch {}
+  const shardKey = (sport, date) => PFX + sport.id + ':' + ymd(date);
+  const load = key => {
+    if (shards.has(key)) return shards.get(key);
+    let g = {};
+    try { g = JSON.parse(localStorage.getItem(key)) || {}; } catch { g = {}; }
+    const sh = { d: false, g };
+    shards.set(key, sh);
+    return sh;
+  };
+  const flush = key => {
+    const sh = shards.get(key);
+    if (!sh || !sh.d) return;
+    try { localStorage.setItem(key, JSON.stringify(sh.g)); sh.d = false; }
+    catch (e) { console.warn('🔒 lock: localStorage write failed', e); }
+  };
+  // the prediction-relevant subset of a game, rounded — everything a card, a stat or a
+  // learner reads for a finished game comes back out of this
+  function pack(g) {
+    const m = g.model || {};
+    const v = g.vegas, t = g.total, a = g.alphaInfo, p = g.proj, r = g.rfi;
+    return {
+      s: 'p', fz: 0, u: Date.now(), ko: +g.start || 0, pc: 0,
+      m: [r4(m.home), r4(m.away), r4(m.draw || 0)],
+      pk: g.pick, pp: r4(g.pickProb),
+      pr: g.pRaw != null ? r4(g.pRaw) : null,
+      ai: a ? [r4(a.prior), r4(a.alpha), r4(a.raw), r4(a.trust ?? 1)] : null,
+      mp: !!g.marketPrior, ed: g.edge != null ? r4(g.edge) : null,
+      v: v ? { d: v.detail || '', hp: r4(v.homeProb), ou: v.ou ?? null, mh: v.mlHome ?? null, ma: v.mlAway ?? null,
+               md: v.mlDraw ?? null, hs: v.homeSpread ?? null, sph: v.spHome ?? null, spa: v.spAway ?? null,
+               oo: v.ouOver ?? null, uu: v.ouUnder ?? null,
+               f3: v.fair3 ? [r4(v.fair3.home), r4(v.fair3.draw), r4(v.fair3.away)] : null } : null,
+      tt: t ? { e: r2(t.exp), er: r2(t.expRaw ?? t.exp), l: t.line ?? null, po: r4(t.pOver), por: r4(t.pOverRaw),
+                pr: r4(t.priorO), sd: t.slateDebias ?? null, nt: (t.notes || []).slice(0, 6) } : null,
+      pj: p ? (p.tennis ? { tn: 1, f: p.fav, s: p.sets } : p.soccer ? { sc: 1, h: r2(p.h), a: r2(p.a) }
+             : { h: r2(p.h), a: r2(p.a), t: r2(p.total) }) : null,
+      rf: r ? { y: r4(r.yrfi), h: r4(r.pH), a: r4(r.pA), st: !!r.starters } : null,
+      w: (g.why || []).slice(0, 4),
+    };
+  }
+  const sig = rec => JSON.stringify({ ...rec, u: 0, fz: 0, fs: 0, pc: 0 });
+  // restore the locked read onto g; everything downstream just reads g as usual
+  function apply(rec, g) {
+    g.model = { home: rec.m[0], away: rec.m[1], draw: rec.m[2] || 0 };
+    g.pick = rec.pk; g.pickProb = rec.pp;
+    g.pRaw = rec.pr; g.marketPrior = rec.mp; g.edge = rec.ed;
+    g.alphaInfo = rec.ai ? { prior: rec.ai[0], alpha: rec.ai[1], raw: rec.ai[2], trust: rec.ai[3] } : null;
+    g.total = rec.tt ? { exp: rec.tt.e, expRaw: rec.tt.er, line: rec.tt.l, pOver: rec.tt.po, pOverRaw: rec.tt.por,
+                         priorO: rec.tt.pr, slateDebias: rec.tt.sd, notes: rec.tt.nt || [] } : null;
+    g.proj = rec.pj ? (rec.pj.tn ? { tennis: true, fav: rec.pj.f, sets: rec.pj.s }
+                     : rec.pj.sc ? { h: rec.pj.h, a: rec.pj.a, soccer: true }
+                     : { h: rec.pj.h, a: rec.pj.a, total: rec.pj.t }) : null;
+    g.rfi = rec.rf ? { yrfi: rec.rf.y, nrfi: 1 - rec.rf.y, pH: rec.rf.h, pA: rec.rf.a, starters: rec.rf.st } : null;
+    g.why = rec.w || [];
+    g.sim = null;
+    // the current vegas (closing line re-injected from the core API) stays for display; if
+    // ESPN stripped it and nothing was re-injected, fall back to the PREGAME line we saved
+    if (!g.vegas && rec.v) {
+      const v = rec.v;
+      g.vegas = { detail: v.d, homeProb: v.hp, ou: v.ou, mlHome: v.mh, mlAway: v.ma, mlDraw: v.md, homeSpread: v.hs,
+                  spHome: v.sph, spAway: v.spa, ouOver: v.oo, ouUnder: v.uu, mlFav: null, spread: null, favIsHome: null,
+                  fair3: v.f3 ? { home: v.f3[0], draw: v.f3[1], away: v.f3[2] } : undefined, locked: true };
+    }
+    g.lock = rec;
+    g.graded = rec.s === 'p';
+    if (g.state === 'post') {
+      const winnerSide = g.home.winner ? 'home' : g.away.winner ? 'away' : 'draw';
+      g.correct = g.completed === false ? null : g.pick === winnerSide;
+    }
+  }
+  return {
+    // call right after parsing, before anything reconstructs / settles / learns / renders
+    sync(sport, date, events) {
+      const key = shardKey(sport, date);
+      const sh = load(key);
+      const now = Date.now();
+      events.forEach(g => {
+        if (g.kalshiOnly) return;   // Kalshi-only tennis: a date, no tip-off, never settles here
+        const gid = String(g.id);
+        let rec = sh.g[gid];
+        if (g.state === 'post' && g.completed === false) {   // postponed / canceled: nothing to grade
+          g.lock = rec || null; g.graded = false; g.correct = null; return;
+        }
+        if (g.state === 'pre') {
+          if (rec && rec.fz) {
+            // frozen but ESPN says pregame again: a status flicker (keep the freeze) unless the
+            // kickoff genuinely moved (a postponement rescheduled) and nothing has been scored
+            const moved = Math.abs((+g.start || 0) - (rec.ko || 0)) > 3 * 3600e3;
+            const scored = (Number(g.home.score) || 0) + (Number(g.away.score) || 0) > 0;
+            if (moved && !scored) { rec.fz = 0; rec.fs = undefined; rec.s = 'p'; sh.d = true; }
+            else { apply(rec, g); g.bp = null; return; }   // a started game never earns a fresh ⭐
+          }
+          const fresh = pack(g);
+          if (!rec) { sh.g[gid] = fresh; sh.d = true; }
+          else if (rec.v && !fresh.v) { rec.u = now; sh.d = true; }   // market dropout guard: ESPN
+            // pulls odds around kickoff — an unpriced last look must never replace the priced,
+            // clamped posterior with the raw bottom-up model
+          else if (sig(fresh) !== sig(rec)) {
+            fresh.pc = (rec.pc || 0) + (rec.pk !== fresh.pk ? 1 : 0);   // pregame pick flips, for transparency
+            sh.g[gid] = fresh; sh.d = true;
+          } else rec.u = now;
+          g.lock = sh.g[gid]; g.graded = false;
+          return;
+        }
+        if (rec) {                       // in / post with a record: freeze once, then always apply
+          if (!rec.fz) { rec.fz = now; rec.fs = g.state; sh.d = true; }
+          apply(rec, g);
+        } else if (g.state === 'in') {   // first seen live: freeze so the card stops moving — ungraded
+          rec = pack(g); rec.s = 'l'; rec.fz = now; rec.fs = 'in';
+          sh.g[gid] = rec; sh.d = true;
+          apply(rec, g);
+        } else {                         // a final never seen before it started: score only, grade nothing
+          g.lock = null; g.graded = false; g.correct = null;
+        }
+      });
+      flush(key);
+    },
+  };
+})();
+
 // ── Session live tape (v15.5): score snapshot per poll for every LIVE game ──
 // In-memory only — a scoring run is a NOW signal, there's nothing to persist.
 // Feeds the 🔥 momentum read on live cards and the ⚡ LIVE EDGE console.
 const LiveTape = (() => {
   const tape = new Map();   // sport|gid → [{t, hs, as}]
   // net run (points/goals) over the window that reads as real momentum per sport
-  const RUN_MIN = { nba: 8, wnba: 7, nfl: 8, mlb: 3, nhl: 2, mls: 1, wc: 1 };
+  const RUN_MIN = { nba: 8, wnba: 7, nfl: 8, cfb: 12, mlb: 3, nhl: 2, mls: 1, wc: 1 };
   return {
     record(sport, events) {
       events.forEach(g => {
@@ -2090,8 +2349,9 @@ const LiveTape = (() => {
 // chips and the hedge assistant. READ-ONLY by design: no keys, no orders, ever.
 const Kalshi = (() => {
   const KEY = 'de-kalshi-proxy';
+  // 🎓 KXNCAAFGAME covers FBS and FCS; markets are titled by SCHOOL ("Ohio St.", "Miami (FL)")
   const SERIES = { mlb: 'KXMLBGAME', wnba: 'KXWNBAGAME', nba: 'KXNBAGAME', nhl: 'KXNHLGAME',
-                   nfl: 'KXNFLGAME', mma: 'KXUFCFIGHT', mls: 'KXMLSGAME' };
+                   nfl: 'KXNFLGAME', cfb: 'KXNCAAFGAME', mma: 'KXUFCFIGHT', mls: 'KXMLSGAME' };
   // 🎾 tennis is the one sport ESPN prices NOWHERE, so Kalshi IS its market — and it also
   // covers FAR more of the sport than ESPN's atp/wta scoreboards (ITF alone runs ~250
   // matches a day). Six singles series, each mapping to a tour tier.
@@ -2118,8 +2378,17 @@ const Kalshi = (() => {
     const c = cache.get(series);
     if (c && Date.now() - c.t < 45000) return c.events;
     try {
-      const r = await fetch(`${base()}/trade-api/v2/events?limit=200&status=open&series_ticker=${series}&with_nested_markets=true`);
-      const events = (await r.json())?.events || [];
+      // (v16.15) follow the cursor: a busy college Saturday is 239 open events, and page 1
+      // (200) silently truncated everything a week out
+      const events = [];
+      let cursor = '';
+      for (let page = 0; page < 6; page++) {
+        const r = await fetch(`${base()}/trade-api/v2/events?limit=200&status=open&series_ticker=${series}&with_nested_markets=true${cursor ? '&cursor=' + encodeURIComponent(cursor) : ''}`);
+        const j = await r.json();
+        events.push(...(j?.events || []));
+        cursor = j?.cursor || '';
+        if (!cursor || !(j?.events || []).length) break;
+      }
       cache.set(series, { t: Date.now(), events });
       return events;
     } catch { cache.set(series, { t: Date.now(), events: null }); return null; }
@@ -2153,7 +2422,10 @@ const Kalshi = (() => {
     }
     return best;
   }
-  const px = m => ({ bid: m.yes_bid || null, ask: m.yes_ask || null, last: m.last_price || null });
+  // (v16.15) Kalshi moved prices to *_dollars STRINGS ("0.7800") and dropped the integer-cent
+  // fields — every quote in the app had silently become null. Accept either shape, in cents.
+  const cents = (c, d) => { const n = c != null && c !== 0 ? Number(c) : (d != null ? Math.round(parseFloat(d) * 100) : NaN); return n > 0 ? n : null; };
+  const px = m => ({ bid: cents(m.yes_bid, m.yes_bid_dollars), ask: cents(m.yes_ask, m.yes_ask_dollars), last: cents(m.last_price, m.last_price_dollars) });
   return {
     enabled: () => !!base() ,
     setProxy(u) { if (u) localStorage.setItem(KEY, u.trim()); else localStorage.removeItem(KEY); cache.clear(); },
@@ -2173,7 +2445,7 @@ const Kalshi = (() => {
         for (const m of e.markets || []) {
           const mm = String(m.yes_sub_title || m.title || '').match(/^(.+?):\s*(\d+(?:\.\d+)?)\+/);
           if (mm && samePlayer(mm[1], playerName))
-            out.push({ thr: +mm[2], bid: m.yes_bid || null, ask: m.yes_ask || null, last: m.last_price || null });
+            out.push({ thr: +mm[2], ...px(m) });
         }
       }
       return out.sort((a, b) => a.thr - b.thr);
@@ -2443,7 +2715,7 @@ function getInjuries(sport) {
 // ── Team quality feeds ──────────────────────────────────────────────────
 // Pythagorean expectation from league standings (points for/against), the
 // classic "record leads, run differential predicts" upgrade — every team sport
-const PYTH_EXP = { mlb: 1.83, wnba: 13.9, nba: 13.9, nfl: 2.37, nhl: 2.15, mls: 1.35, wc: 1.35 };
+const PYTH_EXP = { mlb: 1.83, wnba: 13.9, nba: 13.9, nfl: 2.37, cfb: 2.37, nhl: 2.15, mls: 1.35, wc: 1.35 };
 const qualCache = new Map();
 function getQuality(sport) {
   if (!PYTH_EXP[sport.id]) return Promise.resolve(null);
@@ -2451,12 +2723,34 @@ function getQuality(sport) {
     qualCache.set(sport.id, fetch(`https://site.api.espn.com/apis/v2/sports/${sport.path}/standings`)
       .then(r => r.json()).then(json => {
         const map = new Map();
-        const groups = json.children?.length ? json.children.map(c => c.standings) : [json.standings];
+        // (v16.15) walk children RECURSIVELY: college standings nest divisions inside
+        // conferences (Sun Belt → East/West), which a one-level read silently skipped
+        const groups = [];
+        const walk = node => {
+          if (!node) return;
+          if (node.standings?.entries) groups.push(node.standings);
+          (node.children || []).forEach(walk);
+        };
+        walk(json);
         groups.forEach(st => (st?.entries || []).forEach(e => {
-          const s = {};
-          (e.stats || []).forEach(x => { s[x.name] = x.value; });
-          const pf = s.pointsFor, pa = s.pointsAgainst;
+          // stat NAMES repeat across splits in the college feed (pointsFor for overall, home,
+          // away, vs-conference, vs-ranked…) and the last one used to win — usually a 0 from
+          // the "vs ranked" split. First occurrence is the overall split, so first wins; the
+          // stable `type` key is preferred where present.
+          const s = {}, byType = {}, summ = {};
+          (e.stats || []).forEach(x => {
+            if (x.name && s[x.name] == null) s[x.name] = x.value;
+            if (x.type && byType[x.type] == null) byType[x.type] = x.value;
+            if (x.type && x.summary && summ[x.type] == null) summ[x.type] = x.summary;
+          });
+          const pf = byType.pointsfor ?? s.pointsFor, pa = byType.pointsagainst ?? s.pointsAgainst;
           if (pf == null || pa == null || !(pf + pa)) return;
+          // college has no losses/gamesPlayed stat — the W-L lives in the 'total' summary "3-1"
+          const rec = /^(\d+)-(\d+)(?:-(\d+))?/.exec(summ.total || '');
+          if (rec) { if (s.wins == null) s.wins = +rec[1]; if (s.losses == null) s.losses = +rec[2]; if (s.ties == null && rec[3]) s.ties = +rec[3]; }
+          const hr = /^(\d+)-(\d+)/.exec(summ.homerecord || ''), ar = /^(\d+)-(\d+)/.exec(summ.awayrecord || summ.roadrecord || '');
+          if (hr) { s.homeWins ??= +hr[1]; s.homeLosses ??= +hr[2]; }
+          if (ar) { s.roadWins ??= +ar[1]; s.roadLosses ??= +ar[2]; }
           const g = s.gamesPlayed || (s.wins || 0) + (s.losses || 0) + (s.ties || 0) || 1;
           // Pythagenpat (MLB): the right exponent tracks the scoring environment —
           // ((RS+RA)/G)^0.287 — so a team living in extreme run contexts (Coors, dead
@@ -2820,6 +3114,13 @@ function getCoreOdds(sport, id) {
 function reconstructPicks(sport, events) {
   events.forEach(g => {
     if (g.state === 'pre' || !g.vegas) return;
+    // (v16.15) only a game with a LOCKED pregame read may be reconstructed — its model,
+    // total and drivers are then the honest kickoff values, priced at the retained closing
+    // line. A game never seen pregame used to get a would-be pick built from post-final
+    // data (records, standings and Elo that already knew the result) and then settled as
+    // if it had been called — winner-biased by construction. And the line must be a real
+    // closing line, not the locked pregame line standing in for a stripped one.
+    if (g.lock?.s !== 'p' || g.vegas.locked) return;
     if (Brain.pendingFor(sport.id, g.id) || Brain.settledFor(sport.id, g.id)) return;
     const bp = computeBestPick({ ...g, state: 'pre' }, sport);   // what the pick would have been
     if (bp?.kind !== 'ev' || !bp.side) return;
@@ -2832,7 +3133,8 @@ function reconstructPicks(sport, events) {
 }
 
 // totals: stdev of combined final score, for Over/Under probability
-const TOTAL_SIGMA = { mlb: 4.6, wnba: 17, nba: 19, nfl: 13.5, nhl: 2.2, mls: 1.8 };
+// (v16.15) nfl re-measured 13.2 vs closing O/U (2018-25); cfb 15.8 (16.9 in bowls) on 2024-25
+const TOTAL_SIGMA = { mlb: 4.6, wnba: 17, nba: 19, nfl: 13.2, cfb: 16, nhl: 2.2, mls: 1.8 };
 const SOCCER_TOTAL = { mls: 2.9, wc: 2.5 };   // league-typical goal totals for the scoreline fallback
 // MLB park run factors (multi-year approximations, keyed by home-team abbr).
 // Applied at half strength (sqrt) because team scoring rates already carry
@@ -2845,6 +3147,10 @@ const PARK_RUN_FACTOR = {
 };
 // back-to-back fatigue (logit penalty) — biggest in basketball, real in hockey
 const B2B_PEN = { wnba: 0.10, nba: 0.10, nhl: 0.08 };
+// 🎓 ESPN conference ids that are FBS (ACC, Big 12, Big Ten, SEC, Pac-12, C-USA, MAC, MWC,
+// FBS Independents, Sun Belt, American). Anything else on a college scoreboard is FCS or
+// lower — a tier gap no record can express (an 8-3 FCS team is not an 8-3 FBS team).
+const FBS_CONF = new Set([1, 4, 5, 8, 9, 12, 15, 17, 18, 37, 151]);
 
 // Star detection: match an injured player against the team's stat leaders.
 // Scoring leader out hurts ~3x a rotation player; other category leaders ~2x.
@@ -2888,9 +3194,11 @@ async function fetchSport(sport, date, force = false) {
       if (rows.length) events = events.concat(kalshiTennisGames(rows, events, date));
     } catch {}
     events.sort((a, b) => (STATE_ORDER[a.state] - STATE_ORDER[b.state]) || (a.start - b.start));
+    Lock.sync(sport, date, events);        // 🔒 restore kickoff reads onto live/final matches
   } else if (sport.mma) {
     const res = await fetchRetry(`${API}/${sport.path}/scoreboard?dates=${ymd(date)}`);
     events = parseMMA(await res.json(), sport);
+    Lock.sync(sport, date, events);        // 🔒
   } else {
     const [res, injuries, quality, savant, bullpen, pitcherX] = await Promise.all([
       fetchRetry(`${API}/${sport.path}/scoreboard?dates=${ymd(date)}`),
@@ -2928,6 +3236,9 @@ async function fetchSport(sport, date, force = false) {
     }
     const winds = sport.id === 'mlb' ? await getWinds(json) : null;
     events = parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pitcherX);
+    // 🔒 BEFORE reconstruction, settlement, learning or rendering: every in/post game now
+    // carries the read the model gave at kickoff, not a recomputation that knows the score
+    Lock.sync(sport, date, events);
     if (recent && !sport.soccer) reconstructPicks(sport, events);
   }
   events.forEach(g => { g.sportId = sport.id; });
@@ -3020,7 +3331,10 @@ function parseVegas(comp, sport, home) {
   const m = v.detail.match(/([A-Z]{2,4})\s+(-?\d+(?:\.\d+)?)/);
   if (!m) return v;
   const line = Number(m[2]);
-  v.favIsHome = m[1] === home.abbr;
+  // (v16.15) the abbreviation regex fails on college names like TA&M, W&M and M-OH (it
+  // matches "OH", assigning a Miami (OH) home favorite to the away side). The signed home
+  // spread already parsed above is authoritative whenever it exists.
+  v.favIsHome = v.homeSpread != null && Math.abs(line) < 100 ? v.homeSpread < 0 : m[1] === home.abbr;
   if (Math.abs(line) >= 100) {
     v.mlFav = line;
     const favProb = Math.min(0.97, mlToProb(line) / OVERROUND);   // strip the assumed margin — prior must be FAIR
@@ -3196,6 +3510,8 @@ function firstInningRun(home, away, park) {
 // mild look-ahead, so it's flagged and counted separately instead of being passed off as a
 // live call. Without this the scorecard would sit empty for days after install.
 function rfiRead(g) {
+  // 🔒 the locked kickoff read is the authoritative pregame call
+  if (g.lock?.s === 'p' && g.rfi?.yrfi != null) return { p: g.rfi.yrfi, recon: false };
   const sport = SPORTS.find(s => s.id === 'mlb');
   const snap = (typeof Open !== 'undefined' && sport) ? Open.get(sport, g)?.rf : null;
   if (snap != null) return { p: snap, recon: false };
@@ -3312,6 +3628,15 @@ function computeBestPick(g, sport) {
   if (g.state !== 'pre') return null;
   const pickName = g.pick === 'draw' ? 'Draw' : g[g.pick].name;
   const v = g.vegas;
+  // 🎓 FBS-vs-FCS: 96% FBS wins by +32 on average, moneylines of −2000 or "OFF", the FCS
+  // side has no standings row and no Elo history. There is no honest edge to price here.
+  if (g.fcs) return { kind: 'model', text: `${pickName} to win`,
+    sub: 'FBS vs FCS — tier mismatch, no ⭐ (no reliable line or model read)' };
+  // 🎓 cold start: with alpha forced to 0 the model IS the market, so any "+EV" left over
+  // is an artifact of the spread/totals transformations (measured: 43 picks on a 71-game
+  // slate with zero independent information). No ⭐ until the Elo has real history.
+  if (sport.cfb && g.marketPrior) return { kind: 'model', text: `${pickName} to win`,
+    sub: 'tracks the market — college Elo still warming up (needs 4+ rated games per team before it may disagree)' };
   // 🎾 tennis prices come from Kalshi (ESPN carries none)
   if (g.tennis) {
     // no Elo history on one or both players → we have no independent read, so the only
@@ -3529,6 +3854,10 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         // (period 1). Present once the side has batted — powers YRFI/NRFI settlement.
         line1: (() => { const l = (c.linescores || []).find(x => x.period === 1); return l && typeof l.value === 'number' ? l.value : null; })(),
         loc: c.team?.location || '',   // city — Kalshi names markets by city, ESPN by nickname
+        // 🎓 AP rank (99 = unranked → null; POINT-IN-TIME on the scoreboard, never leaks) and the
+        // conference id, which tells FBS from FCS without trusting a record
+        rank: (() => { if (!sport.cfb) return null; const r = Number(c.curatedRank?.current); return r >= 1 && r <= 25 ? r : null; })(),
+        conf: c.team?.conferenceId != null ? Number(c.team.conferenceId) : null,
         probable, leaders, pen,
         pyth: q?.pyth ?? null, pythG: q?.g || 0,
         pfg: q?.pfg ?? null, pag: q?.pag ?? null,
@@ -3555,9 +3884,15 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
 
     // model — soccer without season records (World Cup knockouts) leans on the market
     const played = r => r.w + r.d + r.l;
-    // effective HFA = static prior blended with the learned per-sport home EMA
-    const hfaWinEff = Brain.effHfa(sport.id, sport.hfaWin);
+    // effective HFA = static prior blended with the learned per-sport home EMA.
+    // (v16.15) NEUTRAL SITES get none of it — bowls, the CFP, kickoff classics, NFL games
+    // abroad. This was never read before: every neutral game was priced AND learned with a
+    // phantom home edge.
+    const neutral = !!comp.neutralSite;
+    const hfaWinEff = neutral ? 0.5 : Brain.effHfa(sport.id, sport.hfaWin);
     const hfaL = logit(hfaWinEff);
+    // 🎓 FBS vs FCS: a conference id outside the FBS set on either side
+    const fcs = !!sport.cfb && (!FBS_CONF.has(home.conf) || !FBS_CONF.has(away.conf));
     let model, marketPrior = false, soccerLambda = null;
     if (sport.soccer && (!played(home.rec) || !played(away.rec))) {
       if (vegas?.homeProb != null) { model = predictFromMarket(vegas.homeProb); marketPrior = true; }
@@ -3692,7 +4027,18 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         // scale the raw disagreement by the sport's learned edge trust before clamping —
         // lean harder on the market where our alpha has been noise, push where it's paid
         const trust = Brain.edgeTrust(sport.id);
-        const alpha = Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, (model.home - prior) * trust));
+        // 🎓 college earns the SOFT cap, and NO alpha at all until the Elo brain has real
+        // history on both teams. Simulated on a live Saturday slate with the NFL stack as-is:
+        // the raw record model sat a median 19 points from the market, 45 of 49 priced games
+        // pinned the clamp and 47 flagged +EV — that is noise dressed as edge. Cold start →
+        // the market prior stands alone (the same honesty guard Kalshi-only tennis uses).
+        let cap = ALPHA_CAP;
+        if (sport.cfb) {
+          const eH = Brain.rating(sport.id, home), eA = Brain.rating(sport.id, away);
+          cap = (!eH || !eA || Math.min(eH.n, eA.n) < 4 || fcs) ? 0 : SOFT_ALPHA_CAP;
+          if (!cap) marketPrior = true;
+        }
+        const alpha = Math.max(-cap, Math.min(cap, (model.home - prior) * trust));
         var alphaInfo = { prior, alpha, raw: model.home, trust };   // hoisted to the game object
         const p2 = clamp(prior + alpha);
         model = { home: p2, away: 1 - p2, draw: 0 };
@@ -3760,7 +4106,10 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         const tired = ((home.fatigue || 0) + (away.fatigue || 0)) * FATIGUE_TOTAL_PTS[sport.id];
         if (tired) { exp -= tired; if (tired >= TOTAL_SIGMA[sport.id] * 0.08) notes.push(`fatigue → under (−${tired.toFixed(1)})`); }
       }
-      // self-calibration: apply the brain's learned totals bias once it has a real sample
+      // self-calibration: apply the brain's learned totals bias once it has a real sample.
+      // expRaw = the projection BEFORE the bias, so the learner scores itself against an
+      // unbiased number (scoring against the corrected one converges to half the bias)
+      const expRaw = exp;
       const tb = Brain.totalsBias(sport.id);
       if (tb && tb.n >= 20) {
         const cap = TOTAL_SIGMA[sport.id] * 0.4;
@@ -3788,8 +4137,10 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
           const io = mlToProb(vegas.ouOver), iu = mlToProb(vegas.ouUnder), t = io + iu;
           if (t > 0) priorO = io / t;
         }
-        const pOver = clamp(priorO + Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, pOverRaw - priorO)));
-        total = { exp, line: vegas.ou, pOver, pOverRaw, priorO, notes };
+        // 🎓 college totals run on 2-4 games of season scoring (often vs FCS cupcakes) — soft cap
+        const tcap = sport.cfb ? SOFT_ALPHA_CAP : ALPHA_CAP;
+        const pOver = clamp(priorO + Math.max(-tcap, Math.min(tcap, pOverRaw - priorO)));
+        total = { exp, expRaw, line: vegas.ou, pOver, pOverRaw, priorO, notes };
       }
     }
     // soccer without season rates (World Cup knockouts) still gets a scoreline, derived
@@ -3816,6 +4167,8 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
       total, sim, proj, wx, why: typeof whyDrivers !== 'undefined' ? whyDrivers : [],
       pRaw: typeof pRawHome !== 'undefined' ? pRawHome : null,
       state: st.state || 'pre',                       // pre | in | post
+      completed: st.completed !== false,              // false = postponed / canceled (state still 'post')
+      neutral, fcs,
       statusText: st.shortDetail || st.detail || '',
       period: ev.status?.period, clock: ev.status?.displayClock || '',
       start: new Date(ev.date),
@@ -3846,7 +4199,10 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
   // P(over) directly to the market's implied is only meaningful after both sides speak the
   // same language, so we simply centre the model's DISAGREEMENT with the market across the
   // slate and keep each game's residual — no assumption about skew or pushes required.
-  const priced = games.filter(g => g.total && g.total.line != null && g.total.pOverRaw != null);
+  // (v16.15) PREGAME games only. In/post games carry locked totals that must not move, and
+  // pooling them (with post-final standings in their pOverRaw) let the early finals drag
+  // the still-pregame evening slate's picks around.
+  const priced = games.filter(g => g.state === 'pre' && g.total && g.total.line != null && g.total.pOverRaw != null);
   if (priced.length >= 4) {
     const devs = priced.map(g => g.total.pOverRaw - (g.total.priorO ?? 0.5));
     const mean = devs.reduce((a, b) => a + b, 0) / devs.length;
@@ -3857,7 +4213,8 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         t.slateDebias = +(-shift * 100).toFixed(1);   // in points of over-probability
         t.pOverRaw = clamp(t.pOverRaw - shift, 0.01, 0.99);
         const pr = t.priorO != null ? t.priorO : 0.5;
-        t.pOver = clamp(pr + Math.max(-ALPHA_CAP, Math.min(ALPHA_CAP, t.pOverRaw - pr)));
+        const tcap = sport.cfb ? SOFT_ALPHA_CAP : ALPHA_CAP;
+        t.pOver = clamp(pr + Math.max(-tcap, Math.min(tcap, t.pOverRaw - pr)));
         t.notes = [...(t.notes || []), `slate de-bias ${shift > 0 ? '−' : '+'}${Math.abs(shift * 100).toFixed(0)}pts`];
         if (g.state === 'pre') g.bp = computeBestPick(g, sport);
       });
@@ -3952,6 +4309,7 @@ function parseMMA(json, sport) {
         start: new Date(comp.date || ev.date),
         venue: [ev.shortName || ev.name, wclass].filter(Boolean).join(' · '),
         tv: '', mma: true, wclass, rounds: sched, result, correct: null,
+        completed: st.completed !== false,
       };
       if (g.state === 'post') g.correct = g.pick === (home.winner ? 'home' : 'away');
       g.bp = computeBestPick(g, sport);
@@ -4041,6 +4399,7 @@ function parseTennis(jsons, ranks, date) {
           tennis: true, tier,
           surface: surf,
           correct: null,
+          completed: st.completed !== false || state === 'post',   // the 8h stuck-live finalize counts
         };
         if (g.state === 'post') g.correct = g.pick === (home.winner ? 'home' : 'away');
         g.bp = computeBestPick(g, SPORTS.find(s => s.tennis));
@@ -4427,7 +4786,7 @@ function fxOverProb(stat, proj, thr) {
 function fxMatchup(g, side) {
   const me = g[side], opp = g[side === 'home' ? 'away' : 'home'];
   if (!me || !opp) return null;
-  const BASE = { wnba: 81, nba: 114, nfl: 22.5, nhl: 3.0, mlb: 4.6 };
+  const BASE = { wnba: 81, nba: 114, nfl: 22.5, cfb: 26.2, nhl: 3.0, mlb: 4.6 };
   // league baseline = mean points-allowed across every team on this sport's loaded slate
   const pags = (state.lastEntries.get(g.sportId)?.events || [])
     .flatMap(x => [x.home?.pag, x.away?.pag]).filter(v => v != null);
@@ -4542,7 +4901,9 @@ function h2hSection(g) {
   const rows = meet.map(r => {
     const sa = Number(r.sa), sh = Number(r.sh);
     let win;
-    if (r.sa !== '' && r.sh !== '' && Number.isFinite(sa) && Number.isFinite(sh)) {
+    if (r.wn !== undefined) {
+      win = r.wn;                                          // (v16.15) rows carry the winner outright
+    } else if (r.sa !== '' && r.sh !== '' && Number.isFinite(sa) && Number.isFinite(sh)) {
       win = sa > sh ? r.a : sh > sa ? r.h : null;          // team sports: by score (null = draw)
     } else {
       // tennis scores are set strings — derive the winner from the logged pick + result
@@ -5092,15 +5453,25 @@ function gameCard(g, i, sport, bare = false) {   // bare = focus-sheet header (n
     : g.state === 'post' ? '<span class="badge post">FINAL</span>'
     : preBadge;
 
-  const pickName = g.pick === 'draw' ? 'Draw' : g[g.pick].name;
+  const pickName = g.pick === 'draw' ? 'Draw' : (g[g.pick]?.name ?? '—');
+  // 🔒 lock tag: a live/final card is graded ONLY against the read frozen at kickoff
+  const lockTag = g.lock?.fz && g.state !== 'pre'
+    ? `<span class="chip locktag" title="${esc(g.graded
+        ? `Frozen at kickoff — this is exactly what the model said before the game started (last pregame refresh ${new Date(g.lock.u).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}${g.lock.pc ? `, pick changed ${g.lock.pc}× pregame as lines moved` : ''}). It is never recomputed after a game starts, so the score can't leak into it.`
+        : 'First seen while already in progress — frozen so it stops moving, but in-play odds and mid-game standings make it an unverified read, so it is not graded and does not count toward any model stat.')}">🔒 ${g.graded ? 'locked at kickoff' : 'seen live · ungraded'}</span>` : '';
   let verdict;
   if (g.state === 'post') {
-    verdict = g.correct
-      ? `<span class="chip hit">✓ MODEL HIT — ${esc(pickName)} ${pct(g.pickProb)}</span>`
-      : `<span class="chip miss">✗ MODEL MISS — had ${esc(pickName)} ${pct(g.pickProb)}</span>`;
+    if (g.completed === false)
+      verdict = '<span class="chip mkt">⏸ POSTPONED</span>';
+    else if (!g.graded)
+      verdict = `<span class="chip mkt" title="This game was never seen by the app before it started, so there is no pregame read to grade. Recomputing one now would use records and standings that already contain this result — the old behavior, which is exactly how finals used to 'predict' every winner.">📭 NOT TRACKED PREGAME — no pick to grade</span>`;
+    else
+      verdict = (g.correct
+        ? `<span class="chip hit">✓ MODEL HIT — ${esc(pickName)} ${pct(g.pickProb)}</span>`
+        : `<span class="chip miss">✗ MODEL MISS — had ${esc(pickName)} ${pct(g.pickProb)}</span>`) + lockTag;
   } else {
     const mkt = g.marketPrior ? '<span class="chip mkt">MARKET PRIOR</span>' : '';
-    verdict = `<b>${esc(pickName)}</b>&nbsp;${pct(g.pickProb)} ${tierChip(g.pickProb)} ${valueChip(g)} ${mkt}`;
+    verdict = `<b>${esc(pickName)}</b>&nbsp;${pct(g.pickProb)} ${tierChip(g.pickProb)} ${valueChip(g)} ${mkt}${lockTag}`;
   }
   const opened = g.state === 'pre' ? Open.get(sport, g) : null;
   const moved = opened?.d && g.vegas?.detail && opened.d !== g.vegas.detail
@@ -5198,8 +5569,7 @@ function gameCard(g, i, sport, bare = false) {   // bare = focus-sheet header (n
     </div>
     ${teamRow(g.away, g, 'away')}
     ${teamRow(g.home, g, 'home')}
-    ${probBar(lp || g.model)}
-    ${probLabels(g, lp)}
+    ${g.state === 'post' && !g.graded ? '' : probBar(lp || g.model) + probLabels(g, lp)}
     ${liveLine}
     <div class="g-verdict">${verdict}${vegasStr}${priceSpark(opened, g)}${steamBadge}${kalshiChip}</div>
     ${steamAct}
@@ -5270,16 +5640,21 @@ function bestBets(events) {
 }
 
 function summaryBar(events, sport) {
-  const finals = events.filter(g => g.state === 'post');
+  // 🔒 only finals with a locked kickoff read are graded; the rest are shown as untracked
+  const finalsAll = events.filter(g => g.state === 'post' && g.completed !== false);
+  const finals = finalsAll.filter(g => g.graded);
+  const untracked = finalsAll.length - finals.length;
   const hits = finals.filter(g => g.correct).length;
   const live = events.filter(g => g.state === 'in').length;
   const upcoming = events.filter(g => g.state === 'pre').length;
   const evPicks = events.filter(g => g.bp?.kind === 'ev');
   const evPlays = evPicks.length;
-  const stat = (v, k, cls = '') => `<div class="stat"><span class="v ${cls}">${v}</span><span class="k">${k}</span></div>`;
+  const stat = (v, k, cls = '', tip = '') => `<div class="stat"${tip ? ` title="${esc(tip)}"` : ''}><span class="v ${cls}">${v}</span><span class="k">${k}</span></div>`;
   let html = stat(events.length, 'games') + stat(upcoming, 'upcoming');
   if (live) html += stat(live, 'live now', 'bad');
-  if (finals.length) html += stat(`${hits}–${finals.length - hits}`, 'model on finals', hits >= finals.length - hits ? 'good' : 'bad');
+  if (finals.length) html += stat(`${hits}–${finals.length - hits}`, `model on finals${untracked ? ` · ${untracked} untracked` : ''}`, hits >= finals.length - hits ? 'good' : 'bad',
+    `Graded against the read the model gave at kickoff (locked, never recomputed).${untracked ? ` ${untracked} final${untracked === 1 ? '' : 's'} were never seen pregame on this device and are not counted.` : ''}`);
+  else if (untracked) html += stat('–', `${untracked} final${untracked === 1 ? '' : 's'} · not tracked pregame`, '', 'These games were never seen before they started, so there is no honest pregame pick to grade.');
   if (evPlays) html += stat(evPlays, '+EV plays', 'gold');
   // portfolio Kelly (v14): correlated exposure across ALL sports' picks vs the cap —
   // when it binds, the pick strips already show the scaled stake with the ⚖️ mark
@@ -5359,9 +5734,13 @@ function renderBrain() {
     const clvAvg = st.clvN ? st.clvSum / st.clvN * 100 : 0;
     const clvBeat = st.clvN ? Math.round(st.clvBeat / st.clvN * 100) : 0;
     const itemT = (label, val, cls, tip) => `<span class="b-item" title="${esc(tip)}">${label} <b class="${cls}">${val}</b></span>`;
+    const lg = Brain.legacy();
     items = item('results absorbed', st.absorbed)
-      + itemT('model picks · straight-up', `${st.hits}–${st.misses} (${acc}%)`, st.hits >= st.misses ? 'good' : 'bad',
-          'How often the model\'s who-wins pick is right. Different from the ⭐ suggested-bet hit rate — those are value plays.')
+      + (st.hits + st.misses
+        ? itemT('model picks · straight-up', `${st.hits}–${st.misses} (${acc}%)`, st.hits >= st.misses ? 'good' : 'bad',
+            'How often the model\'s who-wins pick is right, graded ONLY against the read locked at kickoff. Different from the ⭐ suggested-bet hit rate — those are value plays.')
+        : itemT('model picks · straight-up', '🔒 grading from kickoff reads', 'gold',
+            'The straight-up record restarted at 0-0: every previous count was graded against a prediction recomputed AFTER the final (with records and standings that already contained the result). From now on a final is only graded against the read the model locked at kickoff. The old number is under more ▾.'))
       + (st.bets ? itemT('⭐ suggested-bet hit', `${st.betsWon}–${st.bets - st.betsWon} (${betHit}% · exp ${expHit}%)`,
           betHit >= expHit ? 'good' : 'bad',
           '⭐ +EV plays are often plus-money underdogs, so a hit% below the straight-up rate is normal and still profitable. "exp" is the rate the model expected — beating it means the edge is real.') : '')
@@ -5392,6 +5771,8 @@ function renderBrain() {
         })() : '')
       + item('teams & players rated', st.tracked, 'gold')
       + (st.pendingN ? item('open tickets', st.pendingN) : '')
+      + (lg?.su && (lg.su.h + lg.su.m) ? itemT('legacy straight-up (pre-lock)', `${lg.su.h}–${lg.su.m} · retired`, 'bad',
+          `Kept for the record, not for trust: these ${lg.su.h + lg.su.m} picks were graded after each final against a model recomputed with the result already in its inputs, which is how it read ${Math.round(lg.su.h / (lg.su.h + lg.su.m) * 100)}%. Measured on NFL week 1 that recomputation hit 13 of 13; the honest pregame read hit 8 of 14.${lg.bets?.recon ? ` ${lg.bets.recon} hindsight ⭐ reconstructions were also dropped from the ledger headline.` : ''}`) : '')
       + `<span class="b-item" title="A fingerprint of the pricing brain (Elo + calibration). Open the site on another device and check this matches — if the id and 'studied through' date are the same, both devices are working from the identical history and will suggest the same picks. It only changes when a new day of results is studied, not per-device.">🧬 sync <b class="gold">#${sync.id}</b> · studied through ${thruStr}</span>`;
   }
   // tilt guard: a real drawdown is ADVICE now (stakes are no longer silently changed,
@@ -5620,10 +6001,11 @@ function renderHistory() {
       const ds = String(r.d);
       html += `<div class="h-date">${ds.slice(0, 4)}-${ds.slice(4, 6)}-${ds.slice(6)}</div>`;
     }
+    const graded = r.ok === true || r.ok === false;
     html += `<div class="h-row"><span>${SPORT_ICON[r.s] || '🎯'}</span>
       <span class="h-match">${esc(r.a)} ${esc(r.sa)}–${esc(r.sh)} ${esc(r.h)}</span>
-      <span class="h-pick">pick ${esc(r.pk)} ${r.p}%</span>
-      <span class="${r.ok ? 'ok' : 'bad'}">${r.ok ? '✓' : '✗'}</span></div>`;
+      <span class="h-pick">${graded ? `pick ${esc(r.pk)} ${r.p}%${r.lk ? '' : ' · pre-lock'}` : `<span style="opacity:.6">no pregame read</span>`}</span>
+      <span class="${graded ? (r.ok ? 'ok' : 'bad') : ''}" ${graded ? '' : 'style="opacity:.5"'}>${graded ? (r.ok ? '✓' : '✗') : '·'}</span></div>`;
   });
   el.innerHTML = `<div class="hist">${html}</div>`;
 }
@@ -5634,10 +6016,12 @@ function renderHistory() {
 function renderCalibration() {
   const el = $('#calibpanel');
   if (!state.showCalib) { el.innerHTML = ''; return; }
-  const log = (Brain.history() || []).filter(r => typeof r.p === 'number' && (r.ok === true || r.ok === false));
+  // 🔒 locked kickoff reads only — rows graded before the lock era were scored against a
+  // recomputation that already knew the result, which inflates every point on this chart
+  const log = (Brain.history() || []).filter(r => r.lk && typeof r.p === 'number' && (r.ok === true || r.ok === false));
   if (log.length < 30) {
     el.innerHTML = `<div class="hist"><div class="h-date">📊 CALIBRATION — is the model honest about its confidence?</div>
-      <div class="h-empty">Need ~30 finished picks to chart this reliably (have ${log.length}). It fills in as finals land.</div></div>`;
+      <div class="h-empty">Need ~30 finished picks graded against locked kickoff reads to chart this reliably (have ${log.length}). It fills in as finals land — only reads frozen at kickoff count, never a recomputation.</div></div>`;
     return;
   }
   const edges = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 1.01];
