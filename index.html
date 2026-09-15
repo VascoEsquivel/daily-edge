@@ -712,6 +712,8 @@
     color: #8affc0; background: rgba(0,255,136,.10); border: 1px solid rgba(0,255,136,.4); line-height: 1.5; }
   .sgpval b { color: #d5ffe6; }
   .tierbar { margin-top: -6px; }
+  .rankchip { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; font-weight: 700; color: var(--gold);
+    margin-right: 5px; letter-spacing: .2px; vertical-align: 1px; }
   .tierbtn b { color: var(--accent); font-weight: 700; margin-left: 2px; }
   .tierbtn.on b { color: var(--bg); }
   .tierhint { font-size: 10.5px; color: #ffd75e; background: rgba(255,190,40,.08);
@@ -950,7 +952,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.15'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.16'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1045,6 +1047,7 @@ const state = {
   propLegs: [],
   mbLegs: [],                  // manual parlay builder: staged legs before logging
   tennisTier: 'all',           // 🎾 tour-tier filter: all | ATP | WTA | ATP Ch | WTA Ch | ITF
+  cfbFilter: (() => { try { return localStorage.getItem('de-cfbf') || 'all'; } catch { return 'all'; } })(),   // 🎓 all | top25 | rvr | fbs
 };
 try { state.slip = JSON.parse(localStorage.getItem('de-slip-v1')) || []; } catch {}
 try { Object.assign(state.esports, JSON.parse(localStorage.getItem('de-elab-v1')) || {}); } catch {}
@@ -5191,9 +5194,10 @@ function teamRow(t, g, side) {
   const vel = g.state === 'pre' && typeof Open !== 'undefined' ? Open.velocity(g.sportId, g) : null;
   const steamVec = vel && vel.side === side
     ? `<span class="steamvec" title="SHARP STEAM: the de-vigged market moved ${(Math.abs(vel.dp) * 100).toFixed(1)} pts toward ${esc(t.abbr)} in the last ${vel.mins} min (${(Math.abs(vel.vpm) * 100).toFixed(2)}%/min). Velocity like this usually means sharp money or breaking news — the reaction window on a lagging price is closing.">▲▲</span>` : '';
+  const rankChip = t.rank ? `<span class="rankchip" title="AP Top 25 rank on this date">#${t.rank}</span>` : '';
   return `<div class="teamrow ${isWinner ? 'winner' : ''} ${isPicked ? 'picked' : ''}">
     ${teamLogo(t)}
-    <div><div class="tname">${esc(t.name)}${injChip}${b2bChip}${streakChip}${steamVec}</div><div class="trec">${esc(t.recSummary)}${eloStr}${esc(pit)}</div></div>
+    <div><div class="tname">${rankChip}${esc(t.name)}${injChip}${b2bChip}${streakChip}${steamVec}</div><div class="trec">${esc(t.recSummary)}${eloStr}${esc(pit)}</div></div>
     ${score}
   </div>`;
 }
@@ -6101,12 +6105,16 @@ function renderContent(sport, entry) {
   let grid = entry.events;
   // 🎾 tour-tier filter (ATP / WTA / Challengers / ITF) — the tennis calendar is huge
   if (sport.tennis && state.tennisTier !== 'all') grid = grid.filter(g => g.tier === state.tennisTier);
+  // 🎓 college slate filter — 70-80 games on a Saturday, most people want the ranked ones
+  const cfbF = sport.cfb ? CFB_FILTERS[state.cfbFilter] || CFB_FILTERS.all : null;
+  if (cfbF) grid = grid.filter(cfbF.test);
   if (state.filter === 'ev') grid = grid.filter(g => g.bp?.kind === 'ev');
   else if (state.filter !== 'all') grid = grid.filter(g => g.state === state.filter);
   if (state.sort === 'ev') grid = [...grid].sort((a, b) => (b.bp?.ev ?? -9) - (a.bp?.ev ?? -9));
   else if (state.sort === 'conf') grid = [...grid].sort((a, b) => b.pickProb - a.pickProb);
+  else if (cfbF?.byRank) grid = [...grid].sort((a, b) => (STATE_ORDER[a.state] - STATE_ORDER[b.state]) || (bestRank(a) - bestRank(b)) || (a.start - b.start));
   c.innerHTML = summaryBar(entry.events, sport) + heroCard(entry.events) + bestBets(entry.events)
-    + filterBar() + tierBar(sport, entry.events)
+    + filterBar() + tierBar(sport, entry.events) + cfbBar(sport, entry.events)
     + (grid.length
         ? `<div class="games">${grid.map((g, i) => gameCard(g, i, sport)).join('')}</div>`
         : '<div class="empty">no games match this filter</div>');
@@ -6131,6 +6139,32 @@ function tierBar(sport, events) {
     ${chip('all', 'All', events.length)}${pills}
     ${kOnly ? `<span class="f-sep" title="Matches ESPN doesn't list — pulled from Kalshi's ATP/WTA/Challenger/ITF markets. Cards without ranking history show the market price only, never a model edge.">💹 ${kOnly} via Kalshi</span>` : ''}
     ${missing ? `<span class="tierhint" title="ESPN's tennis feed only publishes the ATP and WTA main tours. Challenger and ITF draws — usually 250+ matches a day — are only available through Kalshi, so they appear here once the 💹 relay URL is set in the top bar.">💤 no Challenger/ITF — those come from Kalshi · add your 💹 relay URL up top to pull them in</span>` : ''}
+  </div>`;
+}
+
+// 🎓 college slate filters. Ranks are the AP poll IN FORCE ON THAT DATE (the scoreboard's
+// curatedRank — point-in-time, so a past Saturday shows who was ranked then, not now).
+const bestRank = g => Math.min(g.home.rank || 99, g.away.rank || 99);
+const CFB_FILTERS = {
+  all:   { label: 'All', test: () => true },
+  top25: { label: '🏆 Top 25', byRank: true, test: g => !!(g.home.rank || g.away.rank),
+           tip: 'Games with at least one AP Top-25 team, ordered by the best rank on the field.' },
+  rvr:   { label: '⚔️ Ranked vs Ranked', byRank: true, test: g => !!(g.home.rank && g.away.rank),
+           tip: 'Both teams in the AP Top 25 — the marquee games.' },
+  fbs:   { label: 'FBS only', test: g => !g.fcs,
+           tip: 'Hides FBS-vs-FCS tier mismatches (the FBS side wins ~96% by ~32 points; no picks are made on them).' },
+};
+function cfbBar(sport, events) {
+  if (!sport.cfb) return '';
+  const chip = key => {
+    const f = CFB_FILTERS[key], n = events.filter(f.test).length;
+    return `<button class="f-btn tierbtn ${state.cfbFilter === key ? 'on' : ''}" data-cfbf="${key}"${f.tip ? ` title="${esc(f.tip)}"` : ''}>${f.label} <b>${n}</b></button>`;
+  };
+  const byRank = CFB_FILTERS[state.cfbFilter]?.byRank && state.sort === 'time';
+  return `<div class="fbar tierbar">
+    <span class="f-sep">SLATE</span>
+    ${Object.keys(CFB_FILTERS).map(chip).join('')}
+    ${byRank ? '<span class="f-sep" title="Within live / upcoming / final, ordered by the best AP rank in the game. Pick a different sort to override.">↕ by AP rank</span>' : ''}
   </div>`;
 }
 
@@ -7108,6 +7142,7 @@ function contentClick(e) {
   const fb = e.target.closest('.f-btn');
   if (fb) {
     if (fb.dataset.tier) state.tennisTier = fb.dataset.tier;
+    if (fb.dataset.cfbf) { state.cfbFilter = fb.dataset.cfbf; try { localStorage.setItem('de-cfbf', fb.dataset.cfbf); } catch {} }
     if (fb.dataset.f) state.filter = fb.dataset.f;
     if (fb.dataset.s) state.sort = fb.dataset.s;
     renderActive(); return;
