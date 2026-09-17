@@ -952,7 +952,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.19'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.20'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -4090,6 +4090,16 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         // pinned the clamp and 47 flagged +EV — that is noise dressed as edge. Cold start →
         // the market prior stands alone (the same honesty guard Kalshi-only tennis uses).
         let cap = ALPHA_CAP;
+        // 🏈 (v16.20) NFL moneylines earn NO alpha. Replayed causally over 2,117 NFL regular-
+        // season games (2018-25) — record/Pythag prior + learned HFA + Elo blend, exactly this
+        // pipeline minus the injury/form shifts — against the closing moneyline: the model sat
+        // a mean 7.9 pts off the market and pinned the ±5 cap on 61% of games; at the cap it
+        // flagged 77% of games (mostly dogs) hitting 34.6%, ROI −9.0%, log loss 3.8 SE WORSE
+        // than the market alone. Every cap tested (1-5 pts) was worse. NFL closing lines are
+        // simply sharper than a records-and-Elo model. This does NOT set marketPrior: the
+        // spread read (key-number PMF vs the spread juice) still prices — it was validated with
+        // the model pinned to the market (leave-one-season-out 55.6%, ROI +6.1%).
+        if (sport.id === 'nfl') cap = 0;
         if (sport.cfb) {
           const eH = Brain.rating(sport.id, home), eA = Brain.rating(sport.id, away);
           cap = (!eH || !eA || Math.min(eH.n, eA.n) < 4 || fcs) ? 0 : SOFT_ALPHA_CAP;
