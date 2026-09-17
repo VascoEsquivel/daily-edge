@@ -952,7 +952,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.24'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.25'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -964,7 +964,7 @@ const SPORTS = [
   { id: 'tennis', label: '🎾 Tennis', paths: ['tennis/atp', 'tennis/wta'], tennis: true, offMsg: 'No tour-level tennis on this date.' },
   { id: 'mma',  label: '🥊 MMA',  path: 'mma/ufc', mma: true, offMsg: 'No fight card on this date.' },
   { id: 'mls',  label: '⚽ MLS',  path: 'soccer/usa.1',    hfaWin: 0.600, offMsg: 'No MLS matches on this date.', soccer: true },
-  { id: 'nba',  label: '🏀 NBA',  path: 'basketball/nba',  hfaWin: 0.600, spreadSigma: 12,
+  { id: 'nba',  label: '🏀 NBA',  path: 'basketball/nba',  hfaWin: 0.550, spreadSigma: 12,   // measured: home won 55.0% of 2,469 games 2024-26
     extraPaths: ['basketball/nba-summer-las-vegas'],   // Summer League rides in the NBA tab (never trains the real Elo)
     offMsg: 'No NBA or Summer League games on this date.' },
   { id: 'nhl',  label: '🏒 NHL',  path: 'hockey/nhl',      hfaWin: 0.550, spreadSigma: 2.7,  offMsg: 'Off-season — puck drops again in October.' },
@@ -3616,7 +3616,10 @@ const SOFT_ALPHA_CAP = 0.03;
 // log loss 3 SE worse than the market). Every positive cap tested (1-5 pts) scored worse
 // than the market alone. College keeps the soft cap: shrunk FBS totals beat the market in
 // both held-out seasons (log loss −0.0034, se .0015).
-const totalsCap = sport => sport.id === 'nfl' ? 0 : sport.cfb ? SOFT_ALPHA_CAP : ALPHA_CAP;
+// 🏀 (v16.25) NBA totals likewise: season points-for/against − schedule fatigue through the BB sim,
+// replayed over 2,429 NBA games vs closing totals — at the 5-pt cap 79% of games flagged hitting
+// 47.2% (ROI −9.8%), log loss 4.8 SE worse than the market; 3 pts still 2.5 SE worse.
+const totalsCap = sport => (sport.id === 'nfl' || sport.id === 'nba') ? 0 : sport.cfb ? SOFT_ALPHA_CAP : ALPHA_CAP;
 // k phantom league-average games blended into each football team's season points-for /
 // against before projecting a total (NFL MAE vs the final 11.06 → 10.86; CFB log loss above)
 const FB_RATE_K = { nfl: 8, cfb: 8 };
@@ -4131,7 +4134,11 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         // simply sharper than a records-and-Elo model. This does NOT set marketPrior: the
         // spread read (key-number PMF vs the spread juice) still prices — it was validated with
         // the model pinned to the market (leave-one-season-out 55.6%, ROI +6.1%).
-        if (sport.id === 'nfl') cap = 0;
+        // 🏀 (v16.25) NBA too: same replay over 2,429 NBA regular-season games (2024-25, 2025-26)
+        // vs the closing moneyline — 74% of games flagged (mostly dogs) hitting 38.8%, ROI −7.2%,
+        // log loss 3.1 SE worse than the market; fixing the home-court base (.600 → measured .550)
+        // didn't rescue it (−7.7%). Injuries aren't replayable, but they're priced by the close.
+        if (sport.id === 'nfl' || sport.id === 'nba') cap = 0;
         if (sport.cfb) {
           const eH = Brain.rating(sport.id, home), eA = Brain.rating(sport.id, away);
           // (v16.21) warm-up 4 → 10 rated games per team. Causal replay vs closing FBS
