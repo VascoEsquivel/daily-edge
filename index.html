@@ -952,7 +952,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.23'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.24'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -3567,8 +3567,9 @@ function firstInningRun(home, away, park) {
 // (the authentic real-time call). If the app never saw this game pregame — installed later,
 // or an older date the user scrolled back to — reconstruct it from the SAME inputs the
 // pregame model uses: ESPN retains `probables` on finals (it strips ODDS, not starters).
-// HONESTY: a reconstructed read uses CURRENT season stats rather than as-of-game-date, a
-// mild look-ahead, so it's flagged and counted separately instead of being passed off as a
+// HONESTY: a reconstructed read uses CURRENT season stats rather than as-of-game-date — and
+// (verified v16.24) ESPN's past-game probables carry the starter's FULL-SEASON ERA, identical on
+// every start, so it is real look-ahead, not mild — flagged and counted separately instead of being passed off as a
 // live call. Without this the scorecard would sit empty for days after install.
 function rfiRead(g) {
   // 🔒 the locked kickoff read is the authoritative pregame call
@@ -5555,7 +5556,7 @@ function rfiStrip(g) {
     const hit = (read.p >= 0.5) === act.yrfi;
     const conf = Math.round((read.p >= 0.5 ? read.p : 1 - read.p) * 100);
     const tip = read.recon
-      ? `Reconstructed read: the app didn't see this game pregame, so the ${called} ${conf}% call was rebuilt from the same starters/offense/park inputs the live model uses. It uses current season stats rather than as-of-game-date, so treat it as a backtest, not a live call. Actual: ${outcome}.`
+      ? `Reconstructed read: the app didn't see this game pregame, so the ${called} ${conf}% call was rebuilt from the same starters/offense/park inputs the live model uses. ESPN shows each starter's full-season ERA on past games, so this read knows how their season turned out — a look-ahead backtest, not a live call. Actual: ${outcome}.`
       : `Pregame the model read ${called} at ${conf}%. Actual: ${outcome}.`;
     return `<div class="projline" title="${esc(tip)}">🥎 1st inning · <b>${outcome}</b> · <span class="${hit ? 'rfihit' : 'rfimiss'}">${hit ? '✓' : '✗'} called ${called} ${conf}%</span>${read.recon ? ' <span class="rfisp">· backtest</span>' : ''}</div>`;
   }
@@ -5843,7 +5844,7 @@ function summaryBar(events, sport) {
       const tip = `The model's YRFI/NRFI lean vs what actually happened in the 1st inning, from ${rf.n} graded game${rf.n === 1 ? '' : 's'}. `
         + `Baseline: a run scores in the 1st 51.4% of the time (measured over 1,536 games), so always guessing the same side scores ~51% — beat that and the read is doing work. `
         + `Brier score ${brier.toFixed(3)} — lower is better; 0.25 = a coin flip, and beating it means the probabilities themselves carry information, not just the lean. `
-        + (rc ? `${rc} of ${rf.n} are BACKTESTS — games the app didn't see pregame, rebuilt from the same inputs but using current season stats, so they flatter slightly. ${rf.n - rc} are true live calls. ` : `All ${rf.n} are true live pregame calls. `)
+        + (rc ? `${rc} of ${rf.n} are BACKTESTS — games the app didn't see pregame, rebuilt from the same inputs. ESPN shows each starter's FULL-SEASON ERA on past games (it's identical on every start), so a backtest already knows how that pitcher's whole season went — real look-ahead that flatters the read. Judge the model on the ${rf.n - rc} true live call${rf.n - rc === 1 ? '' : 's'}. ` : `All ${rf.n} are true live pregame calls. `)
         + `Recent form (newest first): ● hit, ○ miss.`;
       html += `<div class="stat" title="${esc(tip)}"><span class="v ${edge >= 0 ? 'good' : 'bad'}">${rf.hit}–${rf.n - rf.hit}</span>`
         + `<span class="k">🥎 YRFI/NRFI ${Math.round(pctHit)}% · Brier ${brier.toFixed(3)}${rc ? ` · ${rc} backtest` : ''}${form ? `<br><span class="rfiform">${form}</span>` : ''}</span></div>`;
