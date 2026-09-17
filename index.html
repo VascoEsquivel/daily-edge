@@ -952,7 +952,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.22'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.23'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -2312,9 +2312,12 @@ const Lock = (() => {
           }
           const fresh = pack(g);
           if (!rec) { sh.g[gid] = fresh; sh.d = true; }
-          else if (rec.v && !fresh.v) { rec.u = now; sh.d = true; }   // market dropout guard: ESPN
-            // pulls odds around kickoff — an unpriced last look must never replace the priced,
-            // clamped posterior with the raw bottom-up model
+          else if ((rec.v && !fresh.v) || (rec.v?.hp != null && fresh.v?.hp == null)) {
+            rec.u = now; sh.d = true;   // market dropout guard: ESPN pulls odds around kickoff —
+            // an unpriced last look must never replace the priced, clamped posterior with the raw
+            // bottom-up model. (v16.23) also when the odds block survives but the moneyline /
+            // spread went dark (an O/U-only board): no win price → no market prior → raw model.
+          }
           else if (sig(fresh) !== sig(rec)) {
             fresh.pc = (rec.pc || 0) + (rec.pk !== fresh.pk ? 1 : 0);   // pregame pick flips, for transparency
             sh.g[gid] = fresh; sh.d = true;
@@ -3403,7 +3406,9 @@ const MonteCarlo = (() => {
   // widen with the run environment, so its win-prob→gap scale is sd(exp)=1.50+0.35·exp: the
   // fixed 4.2 missed the model's win prob by up to 5 pts at high totals (now <0.7).
   const P = {
-    mlb:  { marginSD: 4.2, sdA: 1.50, sdB: 0.35, envSD: 0.46, drift: [0.2253, -0.00343] },
+    // (v16.23) MLB drift gains a win-prob term: with real 9th-inning rules the home side skips
+    // its last at-bat more often the more it's favored, so the mean falls with pHome
+    mlb:  { marginSD: 4.2, sdA: 1.50, sdB: 0.35, envSD: 0.46, drift: [0.2916, -0.04364, -0.9844] },
     nba:  { marginSD: 13.2, ppp: 1.14, r3: 0.30, envSD: 0.05, drift: [0.9556, -0.00188] },
     wnba: { marginSD: 11.2, ppp: 1.02, r3: 0.25, envSD: 0.05, drift: [0.6965, -0.00083] },
   };
@@ -3418,9 +3423,24 @@ const MonteCarlo = (() => {
     for (let i = 0; i < N; i++) {
       const sH = 1 / (1 + lamH * env(p.envSD)), sA = 1 / (1 + lamA * env(p.envSD));
       let rH = 0, rA = 0;
-      for (let inn = 0; inn < 9; inn++) { rA += geo(sA); rH += geo(sH); }
-      let guard = 0;                                   // extra innings break the tie
-      while (rH === rA && guard++ < 20) { rA += geo(sA); rH += geo(sH); }
+      for (let inn = 0; inn < 8; inn++) { rA += geo(sA); rH += geo(sH); }
+      // (v16.23) REAL 9th-inning rules. The home team doesn't bat in the bottom of the 9th
+      // when it already leads, and a walk-off ends the game the moment the winning run scores
+      // (by 1 run 75% of the time, 2 15%, 3 7%, 4 3% — the home-run tail). The old sim played a
+      // full symmetric 9 + extras, so home favorites "won big" too often: on 1,126 MLB games
+      // (2025-26 closing lines) it read home −1.5 at .455 vs .419 market / .421 actual, home
+      // +1.5 at .596 vs .581 / .576, and flagged run-line value on 36% of games. With the rules:
+      // run-line log loss ≈ the market (+0.0002, se .0011) and phantom flags 36% → 1%.
+      rA += geo(sA);                                   // top of the 9th
+      let guard = 0;
+      do {                                             // bottom 9th, then each extra inning
+        if (guard > 0) rA += geo(sA);                  // extras: top half first
+        if (rH <= rA) {                                // home bats only if it isn't already ahead
+          const b = geo(sH), d = rA - rH;
+          if (b > d) { const u = Math.random(); rH = rA + Math.min(b - d, u < 0.75 ? 1 : u < 0.90 ? 2 : u < 0.97 ? 3 : 4); }
+          else rH += b;
+        }
+      } while (rH === rA && guard++ < 20);
       if (rH === rA) { Math.random() < 0.5 ? rH++ : rA++; }
       totals[i] = rH + rA; margins[i] = rH - rA;
     }
@@ -3480,7 +3500,8 @@ const MonteCarlo = (() => {
       if (cache.has(key)) return cache.get(key);
       const sdM = p.sdA != null ? p.sdA + p.sdB * expTotal : p.marginSD;
       const gap = sdM * invNorm(clamp(pHome, 0.02, 0.98));   // model win% → mean score gap
-      const c = Math.max(0.5, (expTotal - (p.drift[0] + p.drift[1] * expTotal)) / expTotal);
+      const drift = p.drift[0] + p.drift[1] * expTotal + (p.drift[2] || 0) * (clamp(pHome, 0.02, 0.98) - 0.5);
+      const c = Math.max(0.5, (expTotal - drift) / expTotal);
       const muH = Math.max(0.5, (expTotal + gap) / 2) * c, muA = Math.max(0.5, (expTotal - gap) / 2) * c;
       const totals = new Float64Array(N), margins = new Float64Array(N);
       (sportId === 'mlb' ? simMLB : simBB)(muH, muA, p, totals, margins);
