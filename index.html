@@ -952,7 +952,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.16'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.17'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1272,8 +1272,18 @@ function biNormCdf(h, k, rho) {
 // (empirical frequency ÷ Normal frequency, league history), zero out impossible ties,
 // and renormalize. Spread cover probs — and alt-spread fair prices — read off this PMF.
 const KEY_MARGIN_W = {
-  nfl:  { 0: 0.07, 1: 0.42, 2: 0.60, 3: 1.90, 4: 0.80, 5: 0.55, 6: 1.05, 7: 1.45, 8: 0.90,
-          9: 0.55, 10: 1.20, 11: 0.62, 12: 0.68, 13: 0.80, 14: 1.20, 16: 0.85, 17: 1.10, 21: 1.10 },
+  // 🏈 (v16.17) MEASURED on NFL 2018-25 (n=2,200 finals with a closing spread + moneyline),
+  // each game scored against its own Normal(−closing spread, 12.75), per-|margin| obs/exp
+  // ratio shrunk toward 1 by its sampling error (empirical-Bayes τ≈0.56), |k|≤21.
+  // The old hand-set table was far too FLAT on 3/7 and too heavy on the small margins, and
+  // the chain spread → win% → mu → PMF → cover over-stated the favorite at every line
+  // (−7: app 57.5% vs 52.4% realized). Leave-one-season-out, shipped chain incl. the soft
+  // cap: old table log loss +0.0040 WORSE than the market prior alone (se .0011) and flagged
+  // 1,352 spread bets hitting 50.2% (ROI −4.1%); this table +0.0001 (se .0008), 639 bets,
+  // 55.6% (ROI +6.1%, se 3.8%). Re-fitting per held-out season reproduced it every year.
+  nfl:  { 0: 0.135, 1: 0.85, 2: 0.89, 3: 2.60, 4: 0.89, 5: 0.80, 6: 1.26, 7: 1.67, 8: 0.93,
+          9: 0.34, 10: 1.10, 11: 0.47, 12: 0.51, 13: 0.51, 14: 1.48, 15: 0.54, 16: 0.76,
+          17: 1.30, 19: 0.56, 20: 0.89 },
   mlb:  { 0: 0, 1: 1.18, 2: 1.02, 3: 0.96, 4: 0.94 },          // one-run games ≈ 28% of all MLB
   nhl:  { 0: 0, 1: 1.12, 2: 1.06, 3: 0.92, 4: 0.90 },          // OT forces 1; empty-netters feed 2
   nba:  { 0: 0, 1: 0.55, 2: 0.68, 3: 0.85, 4: 0.92, 5: 1.05, 6: 1.08, 7: 1.10, 8: 1.08,
@@ -1436,6 +1446,12 @@ function sternLive(margin, f, pPre, sigma, paceMult = 1) {
 // more decisive and the leader is safer. A track-meet overpace stretches it the other way.
 // Needs a projected total and enough elapsed game for the pace read to be stable; bounded.
 function livePaceMult(g, sport, f) {
+  // 🏈 (v16.17) OFF for football: scoring pace does NOT persist within a game. At quarter
+  // checkpoints the slope of remaining-points-vs-pace-so-far is ≈0 (NFL −0.14…+0.05, CFB
+  // −0.03…+0.08) where this model assumes 1.0, and out of sample the multiplier made live
+  // win probs worse (NFL 2024-25 log loss +0.0036, P(worse)=.96; CFB +0.0006 and +0.0062
+  // across both season splits) while lighting the ⏱ chip on ~85% of live cards.
+  if (sport.id === 'nfl' || sport.cfb) return 1;
   const exp = g.total?.exp;
   if (!exp || f < 0.18 || f > 0.92) return 1;
   const cur = (Number(g.home.score) || 0) + (Number(g.away.score) || 0);
@@ -1588,16 +1604,18 @@ const Brain = (() => {
   const save = () => { try { localStorage.setItem(KEY, JSON.stringify(db)); } catch {} };
   const getElo = (sport, key) => {
     db.elo[sport] = db.elo[sport] || {};
-    const e = db.elo[sport][key] = db.elo[sport][key] || { r: 1500, n: 0 };
-    // a 90+ day layoff (offseason) decays the rating 30% toward the mean — rosters
-    // turn over between seasons; regAt guards so each gap only regresses once
-    const today = Math.floor(Date.now() / 864e5);
-    if (e.last && today - e.last > 90 && e.regAt !== e.last) {
-      e.r = 1500 + (e.r - 1500) * 0.7;
-      e.regAt = e.last;
-    }
-    return e;
+    return db.elo[sport][key] = db.elo[sport][key] || { r: 1500, n: 0 };
   };
+  // A 90+ day layoff (offseason) decays the rating 30% toward the mean — rosters turn over.
+  // (v16.17) COMPUTED from the day being priced, never stored on a read and never from the
+  // wall clock. The old version mutated e.r inside getElo() using Date.now(), so merely
+  // RENDERING an old slate regressed ratings, and studying old dates in order re-fired it
+  // after every learned game (the regAt guard reset whenever e.last moved): a 120-day NFL
+  // backfill fired ~4.7 spurious 30% regressions per team, MLB-style daily play ~30, and
+  // two devices learning the same games on different days disagreed. learn() applies it
+  // for real exactly once — the first game after the gap — and then e.last moves past it.
+  const REG_GAP = 90, REG_KEEP = 0.7;
+  const regR = (e, day) => (e.last && day && day - e.last > REG_GAP) ? 1500 + (e.r - 1500) * REG_KEEP : e.r;
   const getCalib = sport => db.calib[sport] = db.calib[sport] || { a: 0, b: 1, n: 0 };
   // ── Glicko-lite rating deviation ──
   // Plain Elo's known weakness: it treats every rating as equally trustworthy. Glicko
@@ -1620,7 +1638,7 @@ const Brain = (() => {
     const sd = surf ? ((eH.s?.[surf] || 0) - (eA.s?.[surf] || 0)) : 0;
     const d = day || Math.floor(Date.now() / 864e5);
     const g = gFactor(effD(eH, d) ** 2 + effD(eA, d) ** 2);
-    return { p: invlogit(g * (eH.r - eA.r + sd) * RD_Q + hfaLogit), eH, eA };
+    return { p: invlogit(g * (regR(eH, d) - regR(eA, d) + sd) * RD_Q + hfaLogit), eH, eA };
   };
   const teamKey = t => t.flagLogo ? t.name : t.abbr;
 
@@ -1638,8 +1656,8 @@ const Brain = (() => {
       ? clamp(perf.bb / (perf.bb + perf.be), 0.2, 0.85) : (maxW ?? LEARN_MAXW[sport] ?? 0.65);
     return Math.min(topW, nMin / (nMin + 12));
   };
-  function adjust(sport, home, away, pRaw, hfaLogit, maxW = 0.65, calibrate = true, surf = null) {
-    const { p: pElo, eH, eA } = eloProb(sport, teamKey(home), teamKey(away), hfaLogit, surf);
+  function adjust(sport, home, away, pRaw, hfaLogit, maxW = 0.65, calibrate = true, surf = null, day = null) {
+    const { p: pElo, eH, eA } = eloProb(sport, teamKey(home), teamKey(away), hfaLogit, surf, day);
     const w = blendW(sport, Math.min(eH.n, eA.n), maxW);
     let x = (1 - w) * logit(clamp(pRaw)) + w * logit(clamp(pElo));
     if (calibrate) { const c = getCalib(sport); x = c.a + c.b * x; }
@@ -1681,7 +1699,8 @@ const Brain = (() => {
     const sampleF = Math.min(2.4, Math.max(0.9, (dH + dA) / 110));
     const kMult = Math.min(4, movM * sampleF);
     const delta = (ELO_K[sport] || 20) * kMult * wt * (scoreH - pElo);
-    eH.r += delta; eA.r -= delta;
+    // bank the offseason regression pElo was priced with, then apply the update on top
+    eH.r = regR(eH, day) + delta; eA.r = regR(eA, day) - delta;
     eH.n++; eA.n++;
     // every played game is evidence: fold it into the deviation (Glicko variance update),
     // floored so a rating never claims perfect certainty
@@ -1860,7 +1879,10 @@ const Brain = (() => {
       // stage 2 — deterministic learning, only for games before today, exactly once.
       // The anchor guard skips anything the adopted canonical brain already learned.
       // noLearn events (Summer League) settle picks above but never touch the Elo.
-      if (!g.noLearn && gday < today && gday > (db.anchor || 0) && !db.learned[key]) {
+      // (v16.17) exhibition games (NFL preseason, MLB spring training, NBA/NHL preseason) are
+      // played by backups and prospects — learning them moved real teams' ratings on games
+      // that say nothing about the regular season (NFL: +0.003 log loss when included)
+      if (!g.noLearn && !g.exhib && gday < today && gday > (db.anchor || 0) && !db.learned[key]) {
         const hfaLogit = g.tennis || g.neutral || sport.hfaWin == null ? 0 : logit(effHfa(sport.id, sport.hfaWin));
         let mov;
         if (g.tennis) { const [th, ta] = setsTally(g.home.sets, g.away.sets); mov = Math.abs(th - ta); }
@@ -3366,10 +3388,15 @@ const MonteCarlo = (() => {
   // marginSD = the sim's own margin spread (used to convert the model win% into a
   // team-scoring gap so P(sim home win) ≈ model win%); envSD = per-game scoring-
   // environment noise (lognormal) that fattens the tails to match real dispersion.
+  // (v16.17) drift = the mean inflation the tie-break loop (extra innings / overtime) adds,
+  // as a+b·exp fitted on 400k-run sims — team rates are pre-scaled by (exp−drift)/exp so the
+  // sim lands on the model's total WITHOUT shifting the integer score lattice. MLB margins
+  // widen with the run environment, so its win-prob→gap scale is sd(exp)=1.50+0.35·exp: the
+  // fixed 4.2 missed the model's win prob by up to 5 pts at high totals (now <0.7).
   const P = {
-    mlb:  { marginSD: 4.2, envSD: 0.46 },
-    nba:  { marginSD: 13.2, ppp: 1.14, r3: 0.30, envSD: 0.05 },
-    wnba: { marginSD: 11.2, ppp: 1.02, r3: 0.25, envSD: 0.05 },
+    mlb:  { marginSD: 4.2, sdA: 1.50, sdB: 0.35, envSD: 0.46, drift: [0.2253, -0.00343] },
+    nba:  { marginSD: 13.2, ppp: 1.14, r3: 0.30, envSD: 0.05, drift: [0.9556, -0.00188] },
+    wnba: { marginSD: 11.2, ppp: 1.02, r3: 0.25, envSD: 0.05, drift: [0.6965, -0.00083] },
   };
   const cache = new Map();
 
@@ -3413,22 +3440,21 @@ const MonteCarlo = (() => {
     }
   }
 
-  function finalize(totals, margins, targetTotal) {
+  function finalize(totals, margins) {
     const n = totals.length;
-    // mean-correct the total to the model's expected total (removes the small drift
-    // from extra-inning / overtime tie-breaks) while preserving the empirical shape
-    if (targetTotal != null) {
-      let s = 0; for (let i = 0; i < n; i++) s += totals[i];
-      const shift = targetTotal - s / n;
-      if (Math.abs(shift) > 1e-9) for (let i = 0; i < n; i++) totals[i] += shift;
-    }
+    // (v16.17) NO post-hoc mean shift. This used to add a fractional correction (~−0.2 runs,
+    // ~−0.55 pts) to every sample, which slid the integer lattice off the integers: an 8.0
+    // total stopped pushing and an 8.5 swallowed a run of mass. MLB pOver came out −2 to −4
+    // pts on integer lines and +1.4 to +2.1 on half lines vs an exact mean-matched sim; NBA
+    // and WNBA half lines −1. simGame now pre-scales the team rates instead.
     totals.sort(); margins.sort();
     const mean = a => { let s = 0; for (let i = 0; i < n; i++) s += a[i]; return s / n; };
     const sd = (a, mu) => { let s = 0; for (let i = 0; i < n; i++) { const d = a[i] - mu; s += d * d; } return Math.sqrt(s / n); };
     const lb = (a, x) => { let lo = 0, hi = n; while (lo < hi) { const m = (lo + hi) >> 1; a[m] < x ? lo = m + 1 : hi = m; } return lo; };
     const ub = (a, x) => { let lo = 0, hi = n; while (lo < hi) { const m = (lo + hi) >> 1; a[m] <= x ? lo = m + 1 : hi = m; } return lo; };
-    // fraction strictly greater than x, giving pushes (exact ties) half credit
-    const pGt = (a, x) => { const l = lb(a, x), u = ub(a, x); return (n - u + 0.5 * (u - l)) / n; };
+    // P(strictly greater than x) with pushes REFUNDED — win/(win+lose), the −110 both-ways
+    // convention pmfHomeCover already uses. Half credit mis-priced integer totals/run lines.
+    const pGt = (a, x) => { const l = lb(a, x), u = ub(a, x), win = n - u; return win + l ? win / (win + l) : 0.5; };
     const mt = mean(totals), mm = mean(margins);
     return { n, meanTotal: mt, sdTotal: sd(totals, mt), meanMargin: mm, sdMargin: sd(margins, mm),
       pOver: line => pGt(totals, line),
@@ -3443,11 +3469,13 @@ const MonteCarlo = (() => {
       if (!p || !(expTotal > 0)) return null;
       const key = `${gid}|${expTotal.toFixed(1)}|${pHome.toFixed(3)}`;
       if (cache.has(key)) return cache.get(key);
-      const gap = p.marginSD * invNorm(clamp(pHome, 0.02, 0.98));   // model win% → mean score gap
-      const muH = Math.max(0.5, (expTotal + gap) / 2), muA = Math.max(0.5, (expTotal - gap) / 2);
+      const sdM = p.sdA != null ? p.sdA + p.sdB * expTotal : p.marginSD;
+      const gap = sdM * invNorm(clamp(pHome, 0.02, 0.98));   // model win% → mean score gap
+      const c = Math.max(0.5, (expTotal - (p.drift[0] + p.drift[1] * expTotal)) / expTotal);
+      const muH = Math.max(0.5, (expTotal + gap) / 2) * c, muA = Math.max(0.5, (expTotal - gap) / 2) * c;
       const totals = new Float64Array(N), margins = new Float64Array(N);
       (sportId === 'mlb' ? simMLB : simBB)(muH, muA, p, totals, margins);
-      const res = finalize(totals, margins, expTotal);
+      const res = finalize(totals, margins);
       if (cache.size > 200) cache.delete(cache.keys().next().value);
       cache.set(key, res);
       return res;
@@ -3938,7 +3966,8 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
     } else {
       var pRawHome = model.home;   // baseline (record/Pythagorean) prior, kept for Brier tracking
       const p = noLearn ? clamp(model.home)   // summer squads: real-team Elo means nothing
-        : Brain.adjust(sport.id, home, away, model.home, hfaL, 0.65, true);
+        : Brain.adjust(sport.id, home, away, model.home, hfaL, 0.65, true, null,
+            Math.floor(new Date(ev.date).getTime() / 864e5));   // price at the game's own day
       model = { home: p, away: 1 - p, draw: 0 };
       // pregame intel the record can't see: starting pitchers (MLB) + injury report
       let shift = 0;
@@ -4164,6 +4193,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
     const st = ev.status?.type || {};
     return {
       id: ev.id, home, away, model, pick, pickProb, vegas, edge, marketPrior, noLearn,
+      exhib: ev.season?.type === 1,   // preseason / spring training (ESPN season type 1)
       alphaInfo: typeof alphaInfo !== 'undefined' ? alphaInfo : null,
       rfi: (sport.id === 'mlb' && (st.state || 'pre') === 'pre' && home.pfg != null && away.pfg != null)
         ? firstInningRun(home, away, PARK_RUN_FACTOR[home.abbr]) : null,
