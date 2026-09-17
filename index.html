@@ -952,14 +952,14 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.25'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.26'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
 // spreadSigma = stdev of final margin, used to convert a point spread to win probability
 const SPORTS = [
   { id: 'mlb',  label: '⚾ MLB',  path: 'baseball/mlb',    hfaWin: 0.540, spreadSigma: 3.5,  offMsg: 'Off-season — first pitch returns in spring.' },
-  { id: 'wnba', label: '🏀 WNBA', path: 'basketball/wnba', hfaWin: 0.590, spreadSigma: 12,   offMsg: 'No WNBA games on this date.' },
+  { id: 'wnba', label: '🏀 WNBA', path: 'basketball/wnba', hfaWin: 0.546, spreadSigma: 12,   offMsg: 'No WNBA games on this date.' },   // measured: 590 games 2025-26
   { id: 'wc',   label: '🏆 World Cup', path: 'soccer/fifa.world', hfaWin: 0.500, offMsg: 'No World Cup matches on this date.', soccer: true },
   { id: 'tennis', label: '🎾 Tennis', paths: ['tennis/atp', 'tennis/wta'], tennis: true, offMsg: 'No tour-level tennis on this date.' },
   { id: 'mma',  label: '🥊 MMA',  path: 'mma/ufc', mma: true, offMsg: 'No fight card on this date.' },
@@ -3619,7 +3619,13 @@ const SOFT_ALPHA_CAP = 0.03;
 // 🏀 (v16.25) NBA totals likewise: season points-for/against − schedule fatigue through the BB sim,
 // replayed over 2,429 NBA games vs closing totals — at the 5-pt cap 79% of games flagged hitting
 // 47.2% (ROI −9.8%), log loss 4.8 SE worse than the market; 3 pts still 2.5 SE worse.
-const totalsCap = sport => (sport.id === 'nfl' || sport.id === 'nba') ? 0 : sport.cfb ? SOFT_ALPHA_CAP : ALPHA_CAP;
+// (v16.26) NHL + WNBA totals join them — NHL 2,587 games: 67% flagged, ROI −4.3%, log loss 1.9 SE
+// worse; WNBA 573 games: 76% flagged, ROI −9.9%, 2.3 SE worse.
+// NO_ALPHA_SPORTS: the records + Pythagorean + Elo pipeline, replayed causally against closing lines,
+// scored worse than the market in every league with enough games to tell. Their moneylines and
+// totals price at the de-vigged market; spreads still read (and rarely clear MIN_EV).
+const NO_ALPHA_SPORTS = new Set(['nfl', 'nba', 'nhl', 'wnba']);
+const totalsCap = sport => NO_ALPHA_SPORTS.has(sport.id) ? 0 : sport.cfb ? SOFT_ALPHA_CAP : ALPHA_CAP;
 // k phantom league-average games blended into each football team's season points-for /
 // against before projecting a total (NFL MAE vs the final 11.06 → 10.86; CFB log loss above)
 const FB_RATE_K = { nfl: 8, cfb: 8 };
@@ -4138,7 +4144,10 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         // vs the closing moneyline — 74% of games flagged (mostly dogs) hitting 38.8%, ROI −7.2%,
         // log loss 3.1 SE worse than the market; fixing the home-court base (.600 → measured .550)
         // didn't rescue it (−7.7%). Injuries aren't replayable, but they're priced by the close.
-        if (sport.id === 'nfl' || sport.id === 'nba') cap = 0;
+        // (v16.26) NHL: 2,587 games, 71% flagged, ROI −3.2%, log loss 2.1 SE worse. WNBA: 573 games is
+        // too few to tell alone (+0.0008, se .0040) — zeroed on the pooled evidence of the identical
+        // pipeline failing in all three leagues that had the power to show it.
+        if (NO_ALPHA_SPORTS.has(sport.id)) cap = 0;
         if (sport.cfb) {
           const eH = Brain.rating(sport.id, home), eA = Brain.rating(sport.id, away);
           // (v16.21) warm-up 4 → 10 rated games per team. Causal replay vs closing FBS
