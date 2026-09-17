@@ -952,7 +952,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.26'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.27'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -3624,7 +3624,11 @@ const SOFT_ALPHA_CAP = 0.03;
 // NO_ALPHA_SPORTS: the records + Pythagorean + Elo pipeline, replayed causally against closing lines,
 // scored worse than the market in every league with enough games to tell. Their moneylines and
 // totals price at the de-vigged market; spreads still read (and rarely clear MIN_EV).
-const NO_ALPHA_SPORTS = new Set(['nfl', 'nba', 'nhl', 'wnba']);
+// (v16.27) MLS: 852 matches 2025-26 vs closing 3-way prices — at the soft cap 48% of matches
+// flagged hitting 24.7% (home −27%, draw −19%, away −2%; ROI −11.2%), log loss 1.8 SE worse.
+// World Cup runs the identical soccer model (points-per-game + Dixon-Coles + Elo) — untested on
+// its own, included on the pooled evidence.
+const NO_ALPHA_SPORTS = new Set(['nfl', 'nba', 'nhl', 'wnba', 'mls', 'wc']);
 const totalsCap = sport => NO_ALPHA_SPORTS.has(sport.id) ? 0 : sport.cfb ? SOFT_ALPHA_CAP : ALPHA_CAP;
 // k phantom league-average games blended into each football team's season points-for /
 // against before projecting a total (NFL MAE vs the final 11.06 → 10.86; CFB log loss above)
@@ -3650,15 +3654,18 @@ const PORTFOLIO_CAP = 12;      // max correlated units at risk simultaneously (1
 // Same Bayesian discipline as the ball sports: the de-vigged 3-way market is the prior,
 // the Dixon-Coles model earns a bounded alpha per outcome, then we renormalize so the
 // three posteriors still sum to 1. Totals come off the Poisson goal sum at the real price.
-function soccerCands(g, v) {
+function soccerCands(g, v, sport) {
   const cands = [];
   if (!v) return cands;
+  // (v16.27) MLS / World Cup price at the de-vigged market (see NO_ALPHA_SPORTS). Keyed off the
+  // sport passed in — computeBestPick runs inside parseEvents, before g.sportId is assigned.
+  const soccerCap = NO_ALPHA_SPORTS.has(sport?.id ?? g.sportId) ? 0 : SOFT_ALPHA_CAP;
   if (v.fair3) {
     const prior = v.fair3, mdl = g.model || {};
     const post = {};
     ['home', 'draw', 'away'].forEach(k => {
       const pr = prior[k], m = mdl[k];
-      post[k] = m == null ? pr : Math.max(0.005, pr + Math.max(-SOFT_ALPHA_CAP, Math.min(SOFT_ALPHA_CAP, m - pr)));
+      post[k] = m == null ? pr : Math.max(0.005, pr + Math.max(-soccerCap, Math.min(soccerCap, m - pr)));
     });
     const s = post.home + post.draw + post.away;
     ['home', 'draw', 'away'].forEach(k => post[k] /= s);
@@ -3679,7 +3686,7 @@ function soccerCands(g, v) {
     const rawOver = poissonOver(v.ou, lam);
     const impO = mlToProb(v.ouOver), impU = mlToProb(v.ouUnder), tot = impO + impU;
     const priorO = tot > 0 ? impO / tot : 0.5;
-    const pOver = clamp(priorO + Math.max(-SOFT_ALPHA_CAP, Math.min(SOFT_ALPHA_CAP, rawOver - priorO)));
+    const pOver = clamp(priorO + Math.max(-soccerCap, Math.min(soccerCap, rawOver - priorO)));
     cands.push({ side: 'over', type: 'total', line: v.ou, p: pOver, imp: impO,
       b: v.ouOver > 0 ? v.ouOver / 100 : 100 / -v.ouOver, text: `Over ${v.ou} ${fmtML(v.ouOver)}`,
       subText: `mkt ${pct(priorO)} · model goals ${lam.toFixed(2)}` });
@@ -3747,7 +3754,7 @@ function computeBestPick(g, sport) {
   }
   // ⚽ soccer: real 3-way prices when the book posts them
   if (sport.soccer) {
-    const sc = soccerCands(g, v);
+    const sc = soccerCands(g, v, sport);
     if (!sc.length) {
       const sub = g.marketPrior ? 'tracks the market — no separate edge' : 'model lean · 3-way prices not listed';
       return { kind: 'model', text: g.pick === 'draw' ? 'Draw' : `${pickName} to win`, sub };
