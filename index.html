@@ -952,7 +952,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.21'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.22'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1834,6 +1834,13 @@ const Brain = (() => {
   //    learned tomorrow (via the once-a-session yesterday sweep / backfill).
   function processResults(sport, events) {
     const today = ymd(new Date());
+    // (v16.22) The rfiGraded / processed / learned guards are pruned 60 days after they're
+    // written, but the date picker reaches any day. Opening a date older than that re-counted
+    // every game on it: the RFI tile's n grew again, History/H2H got duplicate rows, and the
+    // Elo learned the whole day a second time, out of order. A game older than the prune
+    // horizon may now only be recorded while the backfill is still ADVANCING through it
+    // (gday > through) — i.e. the first time — never by browsing back to it.
+    const pruneFloor = ymd(new Date(Date.now() - 59 * 864e5));
     let changed = false;
     events.forEach(g => {
       // postponed / canceled games sit in ESPN as 'post' with completed=false — they were
@@ -1846,6 +1853,8 @@ const Brain = (() => {
       // graded = this game carries a LOCKED pregame read (Lock.sync restored it onto g).
       // Only graded games may score the model or train the forecast learners.
       const graded = !!g.graded;
+      const recordable = gday >= pruneFloor || gday > (db.through || 0);
+      if (!recordable) return;
       // ⚾ YRFI/NRFI settle: grade the pregame first-inning read against the actual box
       // score. Kept OUT of the stage-1/stage-2 guards on purpose — it has its own
       // `rfiGraded` key so it still records if the ledger already processed this game
