@@ -952,7 +952,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.20'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.21'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -3589,6 +3589,7 @@ const totalsCap = sport => sport.id === 'nfl' ? 0 : sport.cfb ? SOFT_ALPHA_CAP :
 // k phantom league-average games blended into each football team's season points-for /
 // against before projecting a total (NFL MAE vs the final 11.06 → 10.86; CFB log loss above)
 const FB_RATE_K = { nfl: 8, cfb: 8 };
+const CFB_WARM_GAMES = 10;     // rated games per team before college moneylines may disagree with the market
 // season-to-date league points FOR and AGAINST per team-game, from the same standings the
 // rates come from. Kept separate: the college standings list FBS teams only, whose points-for
 // include FCS blowouts (~31/g) while points-against run ~24 — one pooled mean put every
@@ -3692,7 +3693,7 @@ function computeBestPick(g, sport) {
   // is an artifact of the spread/totals transformations (measured: 43 picks on a 71-game
   // slate with zero independent information). No ⭐ until the Elo has real history.
   if (sport.cfb && g.marketPrior) return { kind: 'model', text: `${pickName} to win`,
-    sub: 'tracks the market — college Elo still warming up (needs 4+ rated games per team before it may disagree)' };
+    sub: `tracks the market — college Elo still warming up (needs ${CFB_WARM_GAMES}+ rated games per team before it may disagree)` };
   // 🎾 tennis prices come from Kalshi (ESPN carries none)
   if (g.tennis) {
     // no Elo history on one or both players → we have no independent read, so the only
@@ -4102,7 +4103,11 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         if (sport.id === 'nfl') cap = 0;
         if (sport.cfb) {
           const eH = Brain.rating(sport.id, home), eA = Brain.rating(sport.id, away);
-          cap = (!eH || !eA || Math.min(eH.n, eA.n) < 4 || fcs) ? 0 : SOFT_ALPHA_CAP;
+          // (v16.21) warm-up 4 → 10 rated games per team. Causal replay vs closing FBS
+          // moneylines (1,423 games 2024-25, fresh Elo like the live app): at 4 the alpha was
+          // WORSE than the market in 2024 (+0.0011) and flagged 660 bets at ROI −6.6%; at 10 it
+          // beats the market in both seasons (−0.0018 / −0.0023) with 414 flags at ROI −1.4%.
+          cap = (!eH || !eA || Math.min(eH.n, eA.n) < CFB_WARM_GAMES || fcs) ? 0 : SOFT_ALPHA_CAP;
           if (!cap) marketPrior = true;
         }
         const alpha = Math.max(-cap, Math.min(cap, (model.home - prior) * trust));
