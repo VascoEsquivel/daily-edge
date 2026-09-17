@@ -952,7 +952,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.18'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.19'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -3578,6 +3578,31 @@ const ALPHA_CAP = 0.05;
 // a live 15-game MLS slate: a 5% cap flagged 10 of 15 games (+EV in 67% of a liquid market
 // is not credible); 3% flags 4 with a 5.1% top edge, which is a defensible edge profile.
 const SOFT_ALPHA_CAP = 0.03;
+// 🏈 (v16.18) How far a TOTAL may stray from the de-vigged over/under price. NFL gets NONE:
+// replayed causally over 2,084 NFL games (2018-25) against closing totals, the points-for/
+// against projection carried no information the market total lacked at ANY shrinkage — and
+// at the old 5-pt cap it flagged 72% of games as totals value, hitting 48.5% (ROI −7.4%,
+// log loss 3 SE worse than the market). Every positive cap tested (1-5 pts) scored worse
+// than the market alone. College keeps the soft cap: shrunk FBS totals beat the market in
+// both held-out seasons (log loss −0.0034, se .0015).
+const totalsCap = sport => sport.id === 'nfl' ? 0 : sport.cfb ? SOFT_ALPHA_CAP : ALPHA_CAP;
+// k phantom league-average games blended into each football team's season points-for /
+// against before projecting a total (NFL MAE vs the final 11.06 → 10.86; CFB log loss above)
+const FB_RATE_K = { nfl: 8, cfb: 8 };
+// season-to-date league points FOR and AGAINST per team-game, from the same standings the
+// rates come from. Kept separate: the college standings list FBS teams only, whose points-for
+// include FCS blowouts (~31/g) while points-against run ~24 — one pooled mean put every
+// shrunk college total near 62 against lines in the low 50s.
+const _lgPts = new WeakMap();
+function leaguePtsPerTeam(quality) {
+  if (!quality || typeof quality.values !== 'function') return null;
+  if (_lgPts.has(quality)) return _lgPts.get(quality);
+  let pf = 0, pa = 0, gp = 0;
+  for (const q of quality.values()) if (q && q.g > 0 && q.pfg != null && q.pag != null) { pf += q.pfg * q.g; pa += q.pag * q.g; gp += q.g; }
+  const v = gp >= 20 ? { pf: pf / gp, pa: pa / gp } : null;   // too few games league-wide → no shrink
+  _lgPts.set(quality, v);
+  return v;
+}
 const PORTFOLIO_CAP = 12;      // max correlated units at risk simultaneously (12% bankroll)
 
 // ⚽ (v16.4) soccer candidates from the REAL 3-way prices in the nested odds block.
@@ -3891,7 +3916,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         conf: c.team?.conferenceId != null ? Number(c.team.conferenceId) : null,
         probable, leaders, pen,
         pyth: q?.pyth ?? null, pythG: q?.g || 0,
-        pfg: q?.pfg ?? null, pag: q?.pag ?? null,
+        pfg: q?.pfg ?? null, pag: q?.pag ?? null, gp: q?.g ?? null,
         hw: q?.hw ?? null, hl: q?.hl ?? null, rw: q?.rw ?? null, rl: q?.rl ?? null,
         xw: (xwBat != null && xwPit != null) ? { bat: xwBat, pit: xwPit } : null,
         inj: noLearn ? null : injuries?.get(String(c.team?.id)) || null,
@@ -4093,7 +4118,12 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
       ? { t: ev.weather.temperature ?? null, txt: ev.weather.displayValue || '', wind } : null;
     let total = null, sim = null, expTotal = null;
     if (TOTAL_SIGMA[sport.id] && home.pfg != null && away.pfg != null) {
-      let exp = (home.pfg + away.pag) / 2 + (away.pfg + home.pag) / 2;
+      // 🏈 football: 2-3 games of season scoring swing wildly (week 3 printed totals of 21
+      // and 72), so each rate is blended with FB_RATE_K league-average games first
+      const kS = FB_RATE_K[sport.id], lg = kS ? leaguePtsPerTeam(quality) : null;
+      const sh = (x, t, L) => lg && t.gp ? (x * t.gp + kS * L) / (t.gp + kS) : x;
+      let exp = (sh(home.pfg, home, lg?.pf) + sh(away.pag, away, lg?.pa)) / 2
+              + (sh(away.pfg, away, lg?.pf) + sh(home.pag, home, lg?.pa)) / 2;
       const notes = [];
       if (sport.id === 'mlb') {
         const pf = PARK_RUN_FACTOR[home.abbr];
@@ -4169,8 +4199,9 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
           const io = mlToProb(vegas.ouOver), iu = mlToProb(vegas.ouUnder), t = io + iu;
           if (t > 0) priorO = io / t;
         }
-        // 🎓 college totals run on 2-4 games of season scoring (often vs FCS cupcakes) — soft cap
-        const tcap = sport.cfb ? SOFT_ALPHA_CAP : ALPHA_CAP;
+        // 🎓 college totals run on 2-4 games of season scoring (often vs FCS cupcakes) — soft
+        // cap; 🏈 NFL totals earn no alpha at all (see totalsCap)
+        const tcap = totalsCap(sport);
         const pOver = clamp(priorO + Math.max(-tcap, Math.min(tcap, pOverRaw - priorO)));
         total = { exp, expRaw, line: vegas.ou, pOver, pOverRaw, priorO, notes };
       }
@@ -4246,7 +4277,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         t.slateDebias = +(-shift * 100).toFixed(1);   // in points of over-probability
         t.pOverRaw = clamp(t.pOverRaw - shift, 0.01, 0.99);
         const pr = t.priorO != null ? t.priorO : 0.5;
-        const tcap = sport.cfb ? SOFT_ALPHA_CAP : ALPHA_CAP;
+        const tcap = totalsCap(sport);
         t.pOver = clamp(pr + Math.max(-tcap, Math.min(tcap, t.pOverRaw - pr)));
         t.notes = [...(t.notes || []), `slate de-bias ${shift > 0 ? '−' : '+'}${Math.abs(shift * 100).toFixed(0)}pts`];
         if (g.state === 'pre') g.bp = computeBestPick(g, sport);
@@ -5446,11 +5477,17 @@ function projLineHtml(g) {
   const P = g.proj;
   if (P.tennis) return `<div class="projline">📊 proj <b>${esc(P.fav)}</b> in <b>${P.sets}</b></div>`;
   if (P.soccer) return `<div class="projline">📊 proj <b>${esc(g.away.abbr)} ${P.a.toFixed(1)}–${P.h.toFixed(1)} ${esc(g.home.abbr)}</b> goals</div>`;
-  // football: the most plausible REAL final near the projection (see footballScore)
-  const fs = FB_SCORE_W[g.sportId] ? footballScore(g.sportId, P.h + P.a, P.h - P.a) : null;
+  // football: the most plausible REAL final near the projection (see footballScore). With a
+  // posted O/U the total is the one the model actually SHIPS — the line moved by the model's
+  // capped over/under lean — so the score agrees with the card's own totals read (NFL totals
+  // earn no alpha, so that's the market number: the best total forecast available).
+  const t = g.total, sig = TOTAL_SIGMA[g.sportId];
+  const T = FB_SCORE_W[g.sportId] && t?.line != null && t.pOver != null && sig
+    ? t.line + invNorm(clamp(t.pOver)) * sig : P.h + P.a;
+  const fs = FB_SCORE_W[g.sportId] ? footballScore(g.sportId, T, P.h - P.a) : null;
   if (fs) {
-    const tip = `Most likely realistic final near the model's projection (${esc(g.away.abbr)} ${P.a.toFixed(1)} – ${P.h.toFixed(1)} ${esc(g.home.abbr)}). Football scores come in 3s and 7s, so the raw split is snapped to the nearest score line that actually happens — common team scores (17, 20, 24, 27…) and key margins (3, 7, 10, 14) — keeping the model's winner.`;
-    return `<div class="projline" title="${tip}">📊 proj <b>${esc(g.away.abbr)} ${fs.a}–${fs.h} ${esc(g.home.abbr)}</b>${P.total ? ` · total ${P.total.toFixed(1)}` : ''}</div>`;
+    const tip = `Most likely realistic final: total ${T.toFixed(1)}${t?.line != null ? ` (line ${t.line}, adjusted by the model's capped over/under lean)` : ''}, margin from the model's win probability. Football scores come in 3s and 7s, so the split is snapped to the nearest score that actually happens — common team scores (17, 20, 24, 27…) and key margins (3, 7, 10, 14) — keeping the model's winner.`;
+    return `<div class="projline" title="${tip}">📊 proj <b>${esc(g.away.abbr)} ${fs.a}–${fs.h} ${esc(g.home.abbr)}</b> · total ${T.toFixed(1)}</div>`;
   }
   return `<div class="projline">📊 proj <b>${esc(g.away.abbr)} ${Math.round(P.a)}–${Math.round(P.h)} ${esc(g.home.abbr)}</b>${P.total ? ` · total ${P.total.toFixed(1)}` : ''}</div>`;
 }
