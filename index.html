@@ -321,6 +321,12 @@
   .bestpick.pass .bp-tag { background: rgba(132,148,184,.25); color: var(--text); }
   .bestpick.lost { background: rgba(255,77,109,.06); border: 1px solid rgba(255,77,109,.4); }
   .bestpick.lost .bp-tag { background: var(--hot); color: #2b0a12; }
+  /* 📐 always-on spread pick (v16.28): its own cool-blue row, visibly not a ⭐ */
+  .bestpick.spread { margin-top: 6px; background: rgba(0,200,255,.05); border: 1px solid rgba(0,200,255,.28); }
+  .bestpick.spread .bp-tag { background: rgba(0,200,255,.22); color: var(--text); }
+  .bestpick.spread.won { border-color: rgba(0,255,136,.45); }
+  .bestpick.spread.won .bp-tag { background: var(--accent); color: #052013; }
+  .bestpick.spread.lost .bp-tag { background: var(--hot); color: #2b0a12; }
   .bestpick .bp-main { font-weight: 800; font-size: 13.5px; }
   .bestpick .bp-ev { font-family: 'JetBrains Mono', monospace; font-weight: 700; color: var(--accent); text-shadow: 0 0 12px rgba(0,255,136,.4); }
   .bestpick .bp-units {
@@ -952,7 +958,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.27'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.28'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1281,6 +1287,8 @@ const KEY_MARGIN_W = {
   // cap: old table log loss +0.0040 WORSE than the market prior alone (se .0011) and flagged
   // 1,352 spread bets hitting 50.2% (ROI −4.1%); this table +0.0001 (se .0008), 639 bets,
   // 55.6% (ROI +6.1%, se 3.8%). Re-fitting per held-out season reproduced it every year.
+  // (v16.28 correction: that ROI assumed −110 on every spread; at the real juice it is −4.7%,
+  // and only 3 bets in 8 seasons clear MIN_EV — the table is a CALIBRATION fix, not an edge.)
   nfl:  { 0: 0.135, 1: 0.85, 2: 0.89, 3: 2.60, 4: 0.89, 5: 0.80, 6: 1.26, 7: 1.67, 8: 0.93,
           9: 0.34, 10: 1.10, 11: 0.47, 12: 0.51, 13: 0.51, 14: 1.48, 15: 0.54, 16: 0.76,
           17: 1.30, 19: 0.56, 20: 0.89 },
@@ -1875,12 +1883,15 @@ const Brain = (() => {
       // stage 1 — ledger settle + history record (once, immediately)
       if (!db.processed[key]) {
         settle(key, g, scoreH);
+        // 📐 (v16.28) the kickoff spread pick, graded: sp = "NYG +6.5", sr = 1 / 0.5 push / 0
+        const slr = graded && g.sl ? spreadLeanResult(g, g.sl) : null;
         // pk/p/ok come from the LOCKED read; a game never seen pregame keeps its score and
         // winner (wn — history/H2H still work) but carries no pick and no ✓/✗
         db.log.unshift({ d: gday, s: sport.id,
           a: g.away.abbr, h: g.home.abbr, sa: g.away.score ?? '', sh: g.home.score ?? '', wn: winAbbr,
           pk: graded ? (g.pick === 'draw' ? 'Draw' : g[g.pick].abbr) : null,
-          p: graded ? Math.round(g.pickProb * 100) : null, ok: graded ? !!g.correct : null, lk: graded ? 1 : 0 });
+          p: graded ? Math.round(g.pickProb * 100) : null, ok: graded ? !!g.correct : null, lk: graded ? 1 : 0,
+          ...(slr != null ? { sp: spreadLeanText(g, g.sl), sr: slr } : {}) });
         if (db.log.length > 1200) { db.log.sort((x, y) => y.d - x.d); db.log.length = 1200; }
         db.processed[key] = today;
         changed = true;
@@ -2077,6 +2088,12 @@ const Brain = (() => {
     postmortems: () => db.postmortems,
     totalsBias: sportId => db.totalsBias[sportId] || null,
     rfiRec: () => db.rfi,
+    // 📐 graded spread picks for one sport off the permanent log: {w, l, p, r: last 10 newest-first}
+    spreadRecord(sportId) {
+      const rows = db.log.filter(x => x.s === sportId && x.sr != null);
+      return { w: rows.filter(x => x.sr === 1).length, l: rows.filter(x => x.sr === 0).length,
+               p: rows.filter(x => x.sr === 0.5).length, r: rows.slice(0, 10).map(x => x.sr) };
+    },
     pendingFor: (sportId, gid) => db.pending[sportId + '|' + gid] || null,
     settledFor: (sportId, gid) => db.stats.betlog.find(x => x.gid === String(gid) && x.k === sportId) || null,
     // units below the ⭐ ledger's peak (0 = at a new peak) — fuels the tilt guard
@@ -2256,6 +2273,7 @@ const Lock = (() => {
              : { h: r2(p.h), a: r2(p.a), t: r2(p.total) }) : null,
       rf: r ? { y: r4(r.yrfi), h: r4(r.pH), a: r4(r.pA), st: !!r.starters } : null,
       w: (g.why || []).slice(0, 4),
+      sl: g.sl ? { ...g.sl } : null,   // 📐 spread pick (v16.28) — graded against this kickoff side
     };
   }
   const sig = rec => JSON.stringify({ ...rec, u: 0, fz: 0, fs: 0, pc: 0 });
@@ -2272,6 +2290,7 @@ const Lock = (() => {
                      : { h: rec.pj.h, a: rec.pj.a, total: rec.pj.t }) : null;
     g.rfi = rec.rf ? { yrfi: rec.rf.y, nrfi: 1 - rec.rf.y, pH: rec.rf.h, pA: rec.rf.a, starters: rec.rf.st } : null;
     g.why = rec.w || [];
+    g.sl = rec.sl || null;
     g.sim = null;
     // the current vegas (closing line re-injected from the core API) stays for display; if
     // ESPN stripped it and nothing was re-injected, fall back to the PREGAME line we saved
@@ -3809,7 +3828,13 @@ function computeBestPick(g, sport) {
     }
     // The spread read is a TRANSFORMATION of the same win-probability the moneyline
     // already prices — not independent information — so it earns the softer alpha.
-    const pHome = clamp(prior + Math.max(-SOFT_ALPHA_CAP, Math.min(SOFT_ALPHA_CAP, raw - prior)));
+    // 🏈 (v16.28) NFL: none. With the moneyline pinned to the market (v16.20) this read is
+    // only "does the book's moneyline disagree with its own spread" — replayed over 2,076 NFL
+    // games (2018-25) at the real spread juice it scored WORSE than the spread price alone
+    // (log loss +0.0008, se .0007), its side covered 49.0%, and at MIN_EV it flagged 3 bets in
+    // 8 seasons (1 won). College keeps it: −0.0028 (se .0013), better in BOTH seasons, 53.7% ATS.
+    const spCap = sport.id === 'nfl' ? 0 : SOFT_ALPHA_CAP;
+    const pHome = clamp(prior + Math.max(-spCap, Math.min(spCap, raw - prior)));
     const s = n => (n > 0 ? '+' : '') + n;
     const mk = (ml, side, p, txt) => {
       const b = ml ? (ml > 0 ? ml / 100 : 100 / -ml) : 100 / 110;
@@ -3833,6 +3858,68 @@ function computeBestPick(g, sport) {
   if (!cands.length) return { kind: 'model', text: `${pickName} to win`, sub: 'model lean · line not parseable' };
   return finishPick(g, sport, cands);
 }
+
+// 📐 (v16.28) SPREAD PICK — one side against the spread on EVERY NFL / college card, shown
+// apart from the ⭐ pick (which may be PASS, a moneyline or a total). It is a LEAN with a
+// measured track record, never an EV claim: nothing below beats −110 by enough to call it
+// a bet, so it carries no stake and never enters the ⭐ ledger. Each rule is the best of the
+// always-on rules replayed causally at the closing spread and its real juice:
+//  • NFL (2,077 games 2018-25): the JUICE side — whichever side the book charges more for,
+//    i.e. the higher de-vigged spread price; equal prices → the underdog — 54.1% (ROI +1.3%,
+//    se 2.0%; 7 of 8 seasons ≥ 49%). Always the dog 52.4%, records+Elo model 50.5%, the
+//    moneyline-vs-spread read 49.0%, home 48.6%. The split that decides it: dogs the book
+//    prices CHEAPER covered 46.9% (572), dogs at equal juice 53.4% (937), dearer 56.3% (568).
+//  • CFB (1,422 FBS games 2024-25): the app's spread read (market prior ± Elo alpha →
+//    key-number PMF vs the de-vigged spread) 53.7% — 54.5% and 52.9% by season — vs
+//    underdog 50.5%, the juice side 51.8%. It prices better than the spread juice in both seasons.
+//  • FBS vs FCS (220 games): the FBS side covered 55.2% / 56.5% — small sample, labeled.
+// Frozen into the kickoff lock (Lock.pack → sl) so live/final cards grade the pregame side.
+const SPREAD_PICK_SPORTS = new Set(['nfl', 'cfb']);
+const SPREAD_PICK_REC = {
+  nfl: 'the juice side covered 54.1% of 2,077 NFL games 2018-25',
+  cfb: 'this read covered 53.7% on 1,422 FBS games 2024-25',
+  fcs: 'FBS side covered 55.9% of 220 FBS-vs-FCS games 2024-25 (small sample)',
+};
+function spreadLean(g, sport) {
+  if (g.state !== 'pre' || !SPREAD_PICK_SPORTS.has(sport?.id)) return null;
+  const v = g.vegas;
+  if (!v) return null;
+  const hs = v.homeSpread ?? (v.spread != null && v.favIsHome != null ? (v.favIsHome ? v.spread : -v.spread) : null);
+  if (hs == null) return null;
+  let prior = 0.5;   // market cover prob for the HOME side: de-vig the two spread prices
+  if (v.spHome && v.spAway) {
+    const ih = mlToProb(v.spHome), ia = mlToProb(v.spAway);
+    if (ih + ia > 0) prior = ih / (ih + ia);
+  }
+  const dogSide = hs > 0 ? 'home' : hs < 0 ? 'away' : ((v.homeProb ?? 0.5) < 0.5 ? 'home' : 'away');
+  let side, pH = prior, basis;
+  if (sport.id === 'nfl') { side = prior > 0.5 + 1e-9 ? 'home' : prior < 0.5 - 1e-9 ? 'away' : dogSide; basis = 'nfl'; }
+  else if (g.fcs) {
+    // (the parse flags g.fcs when either conference is outside FBS_CONF; FBS-vs-FBS never lands here)
+    const fbsHome = FBS_CONF.has(g.home.conf);
+    if (fbsHome === FBS_CONF.has(g.away.conf)) return null;   // FCS vs FCS: nothing measured
+    side = fbsHome ? 'home' : 'away'; basis = 'fcs';
+  } else {
+    // same read as computeBestPick's college spread candidate (the soft cap never flips its sign)
+    const sigma = sport.spreadSigma, mu = invNorm(clamp(g.model.home)) * sigma;
+    const pmf = marginPMF(sport.id, mu, sigma);
+    const raw = pmf ? pmfHomeCover(pmf, hs) : normalCdf((mu + hs) / sigma);
+    pH = clamp(prior + Math.max(-SOFT_ALPHA_CAP, Math.min(SOFT_ALPHA_CAP, raw - prior)));
+    side = pH > prior + 1e-9 ? 'home' : pH < prior - 1e-9 ? 'away' : dogSide;
+    basis = 'cfb';
+  }
+  const line = side === 'home' ? hs : -hs;
+  return { side, line, price: (side === 'home' ? v.spHome : v.spAway) ?? null,
+           p: +(side === 'home' ? pH : 1 - pH).toFixed(4), mkt: +(side === 'home' ? prior : 1 - prior).toFixed(4), basis };
+}
+// grade a (locked) spread pick against a score: 1 covered, 0.5 push, 0 lost, null if unscored
+function spreadLeanResult(g, sl) {
+  const h = Number(g.home.score), a = Number(g.away.score);
+  if (!sl || !Number.isFinite(h) || !Number.isFinite(a)) return null;
+  const r = (sl.side === 'home' ? h - a : a - h) + sl.line;
+  return r > 0 ? 1 : r < 0 ? 0 : 0.5;
+}
+const spreadLeanText = (g, sl) => `${g[sl.side].abbr} ${sl.line === 0 ? 'PK' : (sl.line > 0 ? '+' : '') + sl.line}`;
 
 // shared EV → Kelly → grade → slippage tail for every sport's candidate board
 function finishPick(g, sport, cands) {
@@ -4144,9 +4231,9 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
         // a mean 7.9 pts off the market and pinned the ±5 cap on 61% of games; at the cap it
         // flagged 77% of games (mostly dogs) hitting 34.6%, ROI −9.0%, log loss 3.8 SE WORSE
         // than the market alone. Every cap tested (1-5 pts) was worse. NFL closing lines are
-        // simply sharper than a records-and-Elo model. This does NOT set marketPrior: the
-        // spread read (key-number PMF vs the spread juice) still prices — it was validated with
-        // the model pinned to the market (leave-one-season-out 55.6%, ROI +6.1%).
+        // simply sharper than a records-and-Elo model. This does NOT set marketPrior. (The
+        // spread read that was left pricing here earns no alpha either since v16.28 — see
+        // computeBestPick; its "+6.1%" had assumed −110 on every spread, −4.7% at the real juice.)
         // 🏀 (v16.25) NBA too: same replay over 2,429 NBA regular-season games (2024-25, 2025-26)
         // vs the closing moneyline — 74% of games flagged (mostly dogs) hitting 38.8%, ROI −7.2%,
         // log loss 3.1 SE worse than the market; fixing the home-court base (.600 → measured .550)
@@ -4315,6 +4402,7 @@ function parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pit
       g.correct = g.pick === winnerSide;
     }
     g.bp = computeBestPick(g, sport);
+    g.sl = spreadLean(g, sport);   // 📐 always-on ATS side (NFL / CFB), separate from the ⭐
     return g;
   });
   // ── (v16.10) slate-level totals de-bias ─────────────────────────────────
@@ -5305,6 +5393,49 @@ function suggestedStrip(g) {
   return '';   // no ⭐ bet was suggested pregame (or the game was never seen pregame)
 }
 
+// 📐 (v16.28) the always-on SPREAD PICK strip (NFL / CFB) — its own row under the ⭐ strip.
+// Pregame: the side + its measured record. Live: covering or not right now. Final: graded
+// against the side frozen at kickoff (from the lock, never recomputed after the fact).
+function spreadPickStrip(g) {
+  const sl = g.sl;
+  if (!sl || !SPREAD_PICK_SPORTS.has(g.sportId)) return '';
+  const txt = spreadLeanText(g, sl);
+  const price = sl.price ? ' ' + fmtML(sl.price) : '';
+  const rec = SPREAD_PICK_REC[sl.basis] || '';
+  const tip = `SPREAD PICK — one side against the spread on every game, separate from the ⭐ pick. `
+    + `It is a lean with a measured record, not a +EV bet: it carries no stake and never enters the ⭐ ledger. `
+    + (sl.basis === 'nfl' ? 'NFL: the side the book charges MORE juice for (e.g. −115 over −105 on the other side); equal prices → the underdog. Replayed over 2,077 NFL games (2018-25) at the closing spread and its real juice it covered 54.1% (ROI +1.3%, se 2.0%) — better than always taking the dog (52.4%), the records+Elo model (50.5%) or the moneyline-vs-spread read (49.0%). Dogs the book prices cheaper covered only 46.9%. −110 needs 52.4% to break even.'
+      : sl.basis === 'fcs' ? 'FBS vs FCS: over 220 such games (2024-25) the FBS side covered 55.2% and 56.5% by season — a small sample, so treat it as a lean.'
+      : 'College: the market prior plus the warm Elo, run through the key-number margin table and compared with the de-vigged spread price — covered 53.7% of 1,422 FBS games (54.5% in 2024, 52.9% in 2025) at the closing spread.');
+  if (g.state === 'pre') {
+    const same = g.bp?.kind === 'ev' && g.bp.betType === 'spread' && g.bp.side === sl.side;
+    const cov = sl.basis === 'cfb' ? `cover ${pct(sl.p)} vs mkt ${pct(sl.mkt)}` : `mkt cover ${pct(sl.mkt)}`;
+    const b = sl.price ? (sl.price > 0 ? sl.price / 100 : 100 / -sl.price) : 100 / 110;
+    const leg = legOf(g, txt + price, sl.p, b, { side: sl.side, type: 'spread', homeSpread: sl.side === 'home' ? sl.line : -sl.line });
+    return `<div class="bestpick spread" title="${esc(tip)}">
+      <span class="bp-tag">📐 SPREAD PICK</span>
+      <span class="bp-main">${esc(txt + price)}</span>${same ? '<span class="chip hit">= ⭐ pick</span>' : ''}
+      <button class="addleg" data-leg="${esc(JSON.stringify(leg))}">+ slip</button>
+      <span class="bp-sub">${esc(cov)} · ${esc(rec)} · lean, no stake</span>
+    </div>`;
+  }
+  const res = spreadLeanResult(g, sl);
+  if (res == null) return '';
+  if (g.state === 'in') {
+    const h = Number(g.home.score), a = Number(g.away.score);
+    const r = (sl.side === 'home' ? h - a : a - h) + sl.line;
+    return `<div class="bestpick spread" title="${esc(tip)}"><span class="bp-tag">📐 SPREAD PICK</span>
+      <span class="bp-main">${esc(txt)}</span>
+      <span class="bp-sub">${r > 0 ? `covering by ${r}` : r < 0 ? `not covering — needs ${-r}` : 'on the number'} · kickoff side</span></div>`;
+  }
+  if (g.state !== 'post' || g.completed === false) return '';
+  const tag = res === 1 ? 'COVERED' : res === 0 ? 'LOST' : 'PUSH';
+  return `<div class="bestpick spread ${res === 1 ? 'won' : res === 0 ? 'lost' : ''}" title="${esc(tip)}">
+    <span class="bp-tag">📐 SPREAD PICK — ${tag}</span>
+    <span class="bp-main">${esc(txt + price)}</span>
+    <span class="bp-sub">side frozen at kickoff</span></div>`;
+}
+
 function teamRow(t, g, side) {
   const isWinner = g.state === 'post' && t.winner;
   const isPicked = g.pick === side && g.state !== 'post';
@@ -5762,6 +5893,7 @@ function gameCard(g, i, sport, bare = false) {   // bare = focus-sheet header (n
     <div class="g-verdict">${verdict}${vegasStr}${priceSpark(opened, g)}${steamBadge}${kalshiChip}</div>
     ${steamAct}
     ${suggestedStrip(g)}
+    ${spreadPickStrip(g)}
     ${live ? hedgePanel(g, sport) + liveEdgePanel(g, sport, lp) : ''}
     ${projLineHtml(g)}
     ${rfiStrip(g)}
@@ -5804,6 +5936,7 @@ function heroCard(events) {
     ${probBar(g.model)}
     ${probLabels(g)}
     ${bestPickStrip(g)}
+    ${spreadPickStrip(g)}
   </div>`;
 }
 
@@ -5872,6 +6005,16 @@ function summaryBar(events, sport) {
       html += `<div class="stat" title="${esc(tip)}"><span class="v ${edge >= 0 ? 'good' : 'bad'}">${rf.hit}–${rf.n - rf.hit}</span>`
         + `<span class="k">🥎 YRFI/NRFI ${Math.round(pctHit)}% · Brier ${brier.toFixed(3)}${rc ? ` · ${rc} backtest` : ''}${form ? `<br><span class="rfiform">${form}</span>` : ''}</span></div>`;
     }
+  }
+  // 📐 (v16.28) the always-on spread pick's graded record, beside its break-even
+  if (sport && SPREAD_PICK_SPORTS.has(sport.id)) {
+    const sr = Brain.spreadRecord(sport.id), n = sr.w + sr.l;
+    const base = sport.id === 'nfl' ? 'the juice side covered 54.1% of 2,077 NFL games 2018-25' : 'the college read covered 53.7% of 1,422 FBS games 2024-25';
+    const tip = `Every ${sport.id.toUpperCase()} spread pick graded against the final score, using the side frozen at kickoff. At −110 a spread pick needs 52.4% (pushes refunded) to break even. Backtest: ${base}. Recent form (newest first): ● covered, ○ lost, ◐ push.`;
+    html += n
+      ? `<div class="stat" title="${esc(tip)}"><span class="v ${sr.w / n >= 0.524 ? 'good' : 'bad'}">${sr.w}–${sr.l}${sr.p ? '–' + sr.p : ''}</span>`
+        + `<span class="k">📐 spread picks ${Math.round(sr.w / n * 100)}% · need 52.4%<br><span class="rfiform">${sr.r.map(x => x === 1 ? '●' : x === 0 ? '○' : '◐').join('')}</span></span></div>`
+      : stat('–', '📐 spread picks · awaiting first graded final', '', tip);
   }
   // this sport's all-time ⭐ suggested-pick record (every pick tailed, bet or not)
   if (sport) {
