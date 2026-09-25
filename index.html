@@ -317,8 +317,13 @@
   .bestpick.ev .bp-tag { background: var(--accent); color: #052013; }
   .bestpick.model { background: rgba(167,139,250,.07); border: 1px solid rgba(167,139,250,.3); }
   .bestpick.model .bp-tag { background: #a78bfa; color: #16102b; }
-  .bestpick.pass { background: rgba(132,148,184,.05); border: 1px dashed rgba(132,148,184,.35); }
-  .bestpick.pass .bp-tag { background: rgba(132,148,184,.25); color: var(--text); }
+  .bestpick.pass { background: rgba(255,209,102,.05); border: 1px dashed rgba(255,209,102,.35); }
+  .bestpick.pass .bp-tag { background: rgba(255,209,102,.22); color: var(--text); }
+  .bestpick .bp-ev.neg { color: var(--hot); text-shadow: none; }
+  .bestpick .bp-nostake {
+    font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; color: var(--muted);
+    border: 1px dashed rgba(132,148,184,.4); padding: 1px 7px; border-radius: 6px;
+  }
   .bestpick.lost { background: rgba(255,77,109,.06); border: 1px solid rgba(255,77,109,.4); }
   .bestpick.lost .bp-tag { background: var(--hot); color: #2b0a12; }
   /* 🏈 NFL "why no bet" panel (v16.29) */
@@ -961,7 +966,7 @@
     🎯 Player Prop Lab: a contextual projection engine — starts from the season rate, blends recent form (with a role/usage-change detector when recent diverges ≥20% from season), then scales by matchup and pace. Projects the over/under curve (Poisson for counting stats, Normal for high-count) and prints an alternate-line ladder with fair Kalshi prices in cents, built for spotting mispriced alt lines. Enter a price to grade the bet and add it to your slip. Matchup/pace are your read (or a defense-vs-stat rank); still a shortlist tool, not gospel.<br>
     🔥🥶 Hot/cold: recent margin form gives a small, capped model shift (streaks are mostly noise — never more than ~3%) and chips flag teams 4-1 or better / 1-4 or worse in their last five. Player-level streaks aren't in free data feeds; prop angles show season rates.<br>
     Vegas comparison uses ESPN's published line; "VALUE" flags games where the model disagrees with the market by ≥4%.<br>
-    ⭐ BEST PICK is the highest expected-value wager at the listed price (vig included; the unlisted dog price is estimated from a 4.5% book margin). Stake sizes are ¼-Kelly, in units of 1% of bankroll. ✋ NO BET means no side clears +2% EV — passing is a position.<br>
+    ⭐ BEST PICK is the highest expected-value wager at the listed price (vig included; the unlisted dog price is estimated from a 4.5% book margin). Stake sizes are ¼-Kelly, in units of 1% of bankroll. 🎯 TOP PICK means nothing clears +2% EV, so the app names the best side on the board anyway with its true (negative) EV — no stake, and it never enters the ⭐ record.<br>
     🧭 TOP-DOWN BAYESIAN CORE: the de-vigged market line is the PRIOR — the sharpest public estimate there is. The whole bottom-up stack (Glicko-deviation Elo, Pythagorean, Statcast, park &amp; wind, injuries, fatigue, form) computes a likelihood that may nudge that prior by a hard-clamped ±5 points (the α you see on every pick strip). Posted spreads and totals are treated as the market's median: the sim only supplies a bounded α around 50/50. Rogue data is mathematically unable to manufacture a giant fake edge. ⚖️ Stakes are portfolio Kelly: the day's picks are priced as one correlated book (same game ρ=.35, same sport .12, cross-sport .05) and every stake scales down together whenever correlated exposure would top 12u.<br>
     🧠 The model learns: every final updates per-team Elo ratings (margin-of-victory weighted, faster for barely-seen teams) and a per-sport calibration layer (stored locally in your browser). On launch it studies the last 45 days of results in chronological order, then stays current. Predictions blend the record/ranking prior with learned Elo, and the Elo weight grows as the brain sees more of each team. ⭐ picks are logged at the pregame price and settled against the final score. The brain bar separates two records: <b>model picks · straight-up</b> (how often the who-wins pick is right) and <b>⭐ suggested-bet hit</b> (how often the +EV plays cash — usually lower, since value bets are often plus-money dogs, with ROI showing they still profit). "exp" is the rate the model expected; beating it means the edge is real. 📜 History keeps a match-by-match record. ⬆⬇ Export/import moves a trained brain between devices.<br>
     ⚡ Live win probability uses the Stern model — current margin + time remaining vs the pregame expectation — and updates each poll; the ▲▼ shows movement vs the opening number. Click any upcoming match for its full bet board with model vs market prices on every side.<br>
@@ -976,7 +981,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.29'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.30'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -3825,15 +3830,16 @@ function computeBestPick(g, sport) {
   if (g.state !== 'pre') return null;
   const pickName = g.pick === 'draw' ? 'Draw' : g[g.pick].name;
   const v = g.vegas;
+  // 🎓 (v16.30) FBS-vs-FCS and the college cold start still may NOT earn a ⭐ — with alpha at 0
+  // the model IS the market, so any "+EV" left in the spread/totals transformations is an
+  // artifact (measured: 43 fake picks on a 71-game slate). They now fall through to the normal
+  // board with noStar set, so the card still NAMES the best posted side as a 🎯 TOP PICK.
   // 🎓 FBS-vs-FCS: 96% FBS wins by +32 on average, moneylines of −2000 or "OFF", the FCS
   // side has no standings row and no Elo history. There is no honest edge to price here.
-  if (g.fcs) return { kind: 'model', text: `${pickName} to win`,
-    sub: 'FBS vs FCS — tier mismatch, no ⭐ (no reliable line or model read)' };
-  // 🎓 cold start: with alpha forced to 0 the model IS the market, so any "+EV" left over
-  // is an artifact of the spread/totals transformations (measured: 43 picks on a 71-game
-  // slate with zero independent information). No ⭐ until the Elo has real history.
-  if (sport.cfb && g.marketPrior) return { kind: 'model', text: `${pickName} to win`,
-    sub: `tracks the market — college Elo still warming up (needs ${CFB_WARM_GAMES}+ rated games per team before it may disagree)` };
+  let noStar = null;
+  if (g.fcs) noStar = 'FBS vs FCS — tier mismatch, so no ⭐ is possible (no reliable model read)';
+  else if (sport.cfb && g.marketPrior) noStar = `tracks the market — college Elo still warming up (needs ${CFB_WARM_GAMES}+ rated games per team before it may disagree)`;
+  if (noStar && !v) return { kind: 'model', text: `${pickName} to win`, sub: noStar };
   // 🎾 tennis prices come from Kalshi (ESPN carries none)
   if (g.tennis) {
     // no Elo history on one or both players → we have no independent read, so the only
@@ -3929,8 +3935,8 @@ function computeBestPick(g, sport) {
     mk(v.ouOver, 'over', g.total.pOver, `Over ${g.total.line}`);
     mk(v.ouUnder, 'under', 1 - g.total.pOver, `Under ${g.total.line}`);
   }
-  if (!cands.length) return { kind: 'model', text: `${pickName} to win`, sub: 'model lean · line not parseable' };
-  return finishPick(g, sport, cands);
+  if (!cands.length) return { kind: 'model', text: `${pickName} to win`, sub: noStar || 'model lean · line not parseable' };
+  return finishPick(g, sport, cands, noStar);
 }
 
 // 📐 (v16.28) SPREAD PICK — one side against the spread on EVERY NFL / college card, shown
@@ -4044,8 +4050,10 @@ function angleResults(g, an) {
 }
 const teaseText = (g, tz) => `${g[tz.side].abbr} +${tz.line} → +${tz.line + TEASE_PTS}`;
 
-// shared EV → Kelly → grade → slippage tail for every sport's candidate board
-function finishPick(g, sport, cands) {
+// shared EV → Kelly → grade → slippage tail for every sport's candidate board.
+// noStar (v16.30): a reason string when this game may never earn a ⭐ however good the EV
+// looks — the board is still priced and the best side still named, just never starred.
+function finishPick(g, sport, cands, noStar = null) {
   // (v14) NO downstream anchor here anymore: every candidate probability arrives already
   // market-anchored at the DISTRIBUTION level — ML sides carry prior+clamped-alpha from
   // parseEvents, spread/total sides are clamped around the posted line's 50/50 above.
@@ -4060,13 +4068,21 @@ function finishPick(g, sport, cands) {
   });
   cands.sort((x, y) => y.ev - x.ev);
   const best = cands[0];
-  if (best.ev < MIN_EV) return { kind: 'pass', text: 'PASS', ev: best.ev, board: cands,
-    // (v16.29) in a market-priced league EVERY game passes, by construction — say so plainly
-    // instead of 14 identical "not worth the vig" lines that read like the app is broken.
+  // (v16.30) NO game is a blank any more: when nothing clears MIN_EV we still NAME the best
+  // side on the board — the highest-EV wager at the posted prices — and carry its full bet
+  // details so the card, the slip and the what-if sandbox can all use it. It is labelled TOP
+  // PICK, never ⭐: its EV is negative (that is the vig), it takes no stake, and the ledger
+  // entry points (recordPending / reconstructPicks) still gate on kind === 'ev', so a top
+  // pick can never enter the ⭐ record and flatter it.
+  if (best.ev < MIN_EV || noStar) return { kind: 'pass', text: best.text, ev: best.ev, board: cands, noStar,
+    side: best.side, b: best.b, p: best.p, betType: best.type,
+    homeSpread: best.homeSpread ?? null, line: best.line ?? null, units: 0,
     marketPriced: NO_ALPHA_SPORTS.has(sport?.id),
-    sub: NO_ALPHA_SPORTS.has(sport?.id)
-      ? `priced at the market — the vig is the only edge here (best side ${best.text}, ${(best.ev * 100).toFixed(1)}%)`
-      : `best side ${best.text} · EV ${(best.ev * 100).toFixed(1)}% — not worth the vig` };
+    sub: noStar
+      ? `${noStar} · best posted side shown, no ⭐ and no stake`
+      : NO_ALPHA_SPORTS.has(sport?.id)
+        ? `best of the posted prices · ${(best.ev * 100).toFixed(1)}% EV is the vig, not an edge — no stake`
+        : `best of the posted prices · ${(best.ev * 100).toFixed(1)}% EV — under the +${(MIN_EV * 100).toFixed(0)}% bar, no stake` };
   const grade = pickGrade(g, best);
   // stake follows signal QUALITY, not just edge size: Kelly can't see that a price is
   // estimated or that only one driver backs the play — the grade can. B-grades take
@@ -4935,16 +4951,29 @@ const scaledUnits = (u, s) => Math.max(0.5, Math.round(u * s * 10) / 10);
 function bestPickStrip(g) {
   const bp = g.bp;
   if (!bp) return '';
-  const icon = bp.kind === 'ev' ? '⭐' : bp.kind === 'pass' ? '✋' : '🧠';
-  const tag = bp.kind === 'ev' ? 'BEST PICK' : bp.kind === 'pass' ? (bp.marketPriced ? 'NO BET · MARKET-PRICED' : 'NO BET') : 'MODEL LEAN';
-  const ev = bp.kind === 'ev' ? `<span class="bp-ev">+${(bp.ev * 100).toFixed(1)}% EV</span>` : '';
+  const icon = bp.kind === 'ev' ? '⭐' : bp.kind === 'pass' ? '🎯' : '🧠';
+  const tag = bp.kind === 'ev' ? 'BEST PICK'
+    : bp.kind === 'pass' ? (bp.noStar ? 'TOP PICK · NO ⭐ HERE' : bp.marketPriced ? 'TOP PICK · MARKET-PRICED' : 'TOP PICK · NO EDGE')
+    : 'MODEL LEAN';
+  // ⭐ prints its edge in green; a TOP PICK prints the same number honestly in red — it is
+  // what the bet costs you at these prices, and the tooltip says so in words.
+  const ev = bp.kind === 'ev' ? `<span class="bp-ev">+${(bp.ev * 100).toFixed(1)}% EV</span>`
+    : bp.kind === 'pass' && bp.ev != null
+      ? `<span class="bp-ev neg" title="${esc(bp.noStar
+          ? `This game can't earn a ⭐: ${bp.noStar}. With the model pinned to the market, any EV left over comes from the spread/total transformations rather than independent information — measured at 43 fake picks on a single 71-game slate — so treat ${(bp.ev * 100).toFixed(1)}% as noise, not an edge.`
+          : bp.marketPriced
+          ? `This league is priced at the book's own no-vig number, so every side's EV is minus the vig. ${(bp.ev * 100).toFixed(1)}% is what this bet costs on average — the best available price on the board, not an edge. Bet it only because you want action on the game.`
+            : `The model's edge on this side does not clear the +${(MIN_EV * 100).toFixed(0)}% bar a ⭐ needs, so ${(bp.ev * 100).toFixed(1)}% is the expected cost per unit. It is the best of the posted prices, not a recommendation to bet.`)}">${bp.ev >= 0 ? '+' : ''}${(bp.ev * 100).toFixed(1)}% EV</span>`
+      : '';
+  const noStake = bp.kind === 'pass'
+    ? '<span class="bp-nostake" title="No stake is suggested and nothing is logged: the ⭐ ledger only records picks that cleared the +2% bar, so these can never flatter the record.">no stake</span>' : '';
   // portfolio Kelly: on heavy correlated slates the RECOMMENDED stake is the scaled one
   const ps = bp.kind === 'ev' && bp.units ? portfolioScale() : null;
   const scaled = ps && ps.s < 0.999;
   const units = bp.units
     ? `<span class="bp-units" ${scaled ? `title="portfolio Kelly: ${ps.n} concurrent picks → ${ps.eff.toFixed(1)}u correlated exposure vs the ${PORTFOLIO_CAP}u cap — every stake scaled ×${ps.s.toFixed(2)} (raw ${bp.units}u)"` : ''}>${fmtStake(scaled ? scaledUnits(bp.units, ps.s) : bp.units)}${scaled ? ' ⚖️' : ''}</span>`
     : '';
-  const slipBtn = bp.kind === 'ev' && g.state === 'pre'
+  const slipBtn = (bp.kind === 'ev' || (bp.kind === 'pass' && bp.b)) && g.state === 'pre'
     ? `<button class="addleg" data-leg="${esc(JSON.stringify(legOf(g, bp.text, bp.p, bp.b, { side: bp.side, type: bp.betType, line: bp.line, homeSpread: bp.homeSpread })))}">🎟️ + slip</button>` : '';
   // ⚡ slippage buffer: line is moving fast — advise a trimmed stake for late execution
   const slipChip = bp.kind === 'ev' && bp.slip && bp.units
@@ -4963,7 +4992,7 @@ function bestPickStrip(g) {
   return `<div class="bestpick ${bp.kind}">
     <span class="bp-tag">${icon} ${tag}</span>
     <span class="bp-main">${esc(bp.text)}</span>
-    ${bp.kind === 'ev' ? gradeChip(bp.grade) : ''}${ev}${units}${slipChip}${steam}${slipBtn}
+    ${bp.kind === 'ev' ? gradeChip(bp.grade) : ''}${ev}${units}${noStake}${slipChip}${steam}${slipBtn}
     <span class="bp-sub">${esc(bp.sub)}</span>
   </div>`;
 }
@@ -5477,7 +5506,7 @@ function betBoard(g) {
 function boardCore(g) {
   if (g.state !== 'pre') return '';
   const rows = (g.bp?.board || []).map(c => {
-    const star = g.bp.kind === 'ev' && c.text === g.bp.text ? '⭐ ' : '';
+    const star = c.text === g.bp?.text ? (g.bp.kind === 'ev' ? '⭐ ' : g.bp.kind === 'pass' ? '🎯 ' : '') : '';
     return `<div class="bo-row ${c.ev >= MIN_EV ? 'bet' : 'skip'}">
       <span class="bo-bet">${star}${esc(c.text)}</span>
       <span>model ${pct(c.p)}</span>
@@ -6624,9 +6653,9 @@ function renderContent(sport, entry) {
   applySearch();
 }
 
-// 🏈 (v16.29) NFL slate panel. Fourteen identical "NO BET" cards read like a broken app, so the
-// tab says outright why that is the honest output, and collects the week's TRACKED angles in one
-// place (they are leans under test, never ⭐ picks).
+// 🏈 (v16.29) NFL slate panel. Fourteen cards with no ⭐ read like a broken app, so the tab says
+// outright why that is the honest output, and collects the week's TRACKED angles in one place
+// (they are leans under test, never ⭐ picks). (v16.30) Each card still NAMES a top pick.
 function nflPanel(sport, events) {
   if (sport?.id !== 'nfl') return '';
   const pre = events.filter(g => g.state === 'pre');
@@ -6634,9 +6663,10 @@ function nflPanel(sport, events) {
   const storms = pre.filter(g => g.ang?.su).map(g => `<span class="angle su" title="${esc(STORM_TIP)}">${esc(g.away.abbr + '@' + g.home.abbr)} u${g.ang.su.line}</span>`);
   const outdoorSoon = pre.filter(g => (g.start - Date.now()) / 36e5 <= STORM_LEAD_H).length;
   return `<details class="nflpanel">
-    <summary>🏈 Why every NFL game says <b>NO BET</b> — and what is worth watching instead</summary>
+    <summary>🏈 Why NFL cards show a <b>🎯 TOP PICK</b> instead of a ⭐ — and what is worth watching instead</summary>
     <div class="np-b">Every NFL market here is priced at the sportsbook's own no-vig number, so each side's EV is exactly minus the vig
-      (−2% to −4%) and nothing can clear the +2% a ⭐ needs. That is deliberate: replayed game by game against closing lines,
+      (−2% to −4%) and nothing can clear the +2% a ⭐ needs. Each card still names the best side on the board — that is the
+      🎯 TOP PICK, shown with its real negative EV and no stake. That is deliberate: replayed game by game against closing lines,
       the moneyline model lost 9.0% over 2,117 games, the totals model 7.4% over 2,084, and the spread read covered 49.0% of 2,076.
       A September 2026 study then tested <b>124 more ideas</b> — prediction-market vs sportsbook pricing, rest, travel, divisional
       and primetime spots, opening-to-closing line moves, and weather — tuning on 2018-22 and testing once on 2023-25.
