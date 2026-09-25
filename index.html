@@ -321,6 +321,24 @@
   .bestpick.pass .bp-tag { background: rgba(132,148,184,.25); color: var(--text); }
   .bestpick.lost { background: rgba(255,77,109,.06); border: 1px solid rgba(255,77,109,.4); }
   .bestpick.lost .bp-tag { background: var(--hot); color: #2b0a12; }
+  /* 🏈 NFL "why no bet" panel (v16.29) */
+  .nflpanel {
+    margin: 12px 0; border-radius: 12px; padding: 10px 14px; font-size: 12px; line-height: 1.55;
+    background: rgba(132,148,184,.06); border: 1px solid rgba(132,148,184,.28);
+  }
+  .nflpanel summary { cursor: pointer; font-weight: 800; font-size: 12.5px; letter-spacing: .2px; }
+  .nflpanel .np-b { color: var(--muted); margin: 8px 0 6px; }
+  .nflpanel .np-row { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-top: 6px; }
+  .nflpanel .np-note { color: var(--muted); font-size: 11px; }
+  /* 🧩🌧️ tracked angles (v16.29): quiet chips, visibly not a ⭐ */
+  .angles { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-top: 6px; }
+  .angles .angles-h { font-size: 9px; font-weight: 800; letter-spacing: 1.4px; color: var(--muted); text-transform: uppercase; }
+  .angles .angle {
+    font-family: 'JetBrains Mono', monospace; font-size: 10.5px; font-weight: 700; color: var(--text);
+    background: rgba(167,139,250,.10); border: 1px dashed rgba(167,139,250,.45); padding: 2px 8px; border-radius: 6px;
+  }
+  .angles .angle.won { border-style: solid; border-color: rgba(0,255,136,.5); background: rgba(0,255,136,.08); }
+  .angles .angle.lost { border-style: solid; border-color: rgba(255,77,109,.45); background: rgba(255,77,109,.07); }
   /* 📐 always-on spread pick (v16.28): its own cool-blue row, visibly not a ⭐ */
   .bestpick.spread { margin-top: 6px; background: rgba(0,200,255,.05); border: 1px solid rgba(0,200,255,.28); }
   .bestpick.spread .bp-tag { background: rgba(0,200,255,.22); color: var(--text); }
@@ -958,7 +976,7 @@
 <script>
 'use strict';
 
-const APP_VERSION = 'v16.28'; // bumped on every deploy — visible proof the live site updated
+const APP_VERSION = 'v16.29'; // bumped on every deploy — visible proof the live site updated
 
 // ── Config ─────────────────────────────────────────────────────────────
 // hfaWin = historical home-team win share in a neutral matchup, used as a logit shift
@@ -1885,13 +1903,16 @@ const Brain = (() => {
         settle(key, g, scoreH);
         // 📐 (v16.28) the kickoff spread pick, graded: sp = "NYG +6.5", sr = 1 / 0.5 push / 0
         const slr = graded && g.sl ? spreadLeanResult(g, g.sl) : null;
+        // 🧩🌧️ (v16.29) tracked angles, graded off the same locked read: tz = teaser leg, su = storm under
+        const ar = graded && g.ang ? angleResults(g, g.ang) : {};
         // pk/p/ok come from the LOCKED read; a game never seen pregame keeps its score and
         // winner (wn — history/H2H still work) but carries no pick and no ✓/✗
         db.log.unshift({ d: gday, s: sport.id,
           a: g.away.abbr, h: g.home.abbr, sa: g.away.score ?? '', sh: g.home.score ?? '', wn: winAbbr,
           pk: graded ? (g.pick === 'draw' ? 'Draw' : g[g.pick].abbr) : null,
           p: graded ? Math.round(g.pickProb * 100) : null, ok: graded ? !!g.correct : null, lk: graded ? 1 : 0,
-          ...(slr != null ? { sp: spreadLeanText(g, g.sl), sr: slr } : {}) });
+          ...(slr != null ? { sp: spreadLeanText(g, g.sl), sr: slr } : {}),
+          ...(ar.tz != null ? { tz: ar.tz } : {}), ...(ar.su != null ? { su: ar.su } : {}) });
         if (db.log.length > 1200) { db.log.sort((x, y) => y.d - x.d); db.log.length = 1200; }
         db.processed[key] = today;
         changed = true;
@@ -2088,12 +2109,14 @@ const Brain = (() => {
     postmortems: () => db.postmortems,
     totalsBias: sportId => db.totalsBias[sportId] || null,
     rfiRec: () => db.rfi,
-    // 📐 graded spread picks for one sport off the permanent log: {w, l, p, r: last 10 newest-first}
-    spreadRecord(sportId) {
-      const rows = db.log.filter(x => x.s === sportId && x.sr != null);
-      return { w: rows.filter(x => x.sr === 1).length, l: rows.filter(x => x.sr === 0).length,
-               p: rows.filter(x => x.sr === 0.5).length, r: rows.slice(0, 10).map(x => x.sr) };
+    // 📐🧩🌧️ graded record of one tracked call for a sport, off the permanent log:
+    // k = 'sr' (spread pick), 'tz' (teaser leg), 'su' (storm under) → {w, l, p, r: last 10 newest-first}
+    angleRecord(sportId, k = 'sr') {
+      const rows = db.log.filter(x => x.s === sportId && x[k] != null);
+      return { w: rows.filter(x => x[k] === 1).length, l: rows.filter(x => x[k] === 0).length,
+               p: rows.filter(x => x[k] === 0.5).length, r: rows.slice(0, 10).map(x => x[k]) };
     },
+    spreadRecord(sportId) { return this.angleRecord(sportId, 'sr'); },
     pendingFor: (sportId, gid) => db.pending[sportId + '|' + gid] || null,
     settledFor: (sportId, gid) => db.stats.betlog.find(x => x.gid === String(gid) && x.k === sportId) || null,
     // units below the ⭐ ledger's peak (0 = at a new peak) — fuels the tilt guard
@@ -2274,6 +2297,7 @@ const Lock = (() => {
       rf: r ? { y: r4(r.yrfi), h: r4(r.pH), a: r4(r.pA), st: !!r.starters } : null,
       w: (g.why || []).slice(0, 4),
       sl: g.sl ? { ...g.sl } : null,   // 📐 spread pick (v16.28) — graded against this kickoff side
+      an: g.ang ? { tz: g.ang.tz ? { ...g.ang.tz } : null, su: g.ang.su ? { ...g.ang.su } : null } : null,   // 🧩🌧️ tracked angles (v16.29)
     };
   }
   const sig = rec => JSON.stringify({ ...rec, u: 0, fz: 0, fs: 0, pc: 0 });
@@ -2291,6 +2315,7 @@ const Lock = (() => {
     g.rfi = rec.rf ? { yrfi: rec.rf.y, nrfi: 1 - rec.rf.y, pH: rec.rf.h, pA: rec.rf.a, starters: rec.rf.st } : null;
     g.why = rec.w || [];
     g.sl = rec.sl || null;
+    g.ang = rec.an || null;
     g.sim = null;
     // the current vegas (closing line re-injected from the core API) stays for display; if
     // ESPN stripped it and nothing was re-injected, fall back to the PREGAME line we saved
@@ -2961,6 +2986,52 @@ function getPitcherX() {
   return pitcherXPromise;
 }
 
+// 🌧️ (v16.29) NFL STORM NOWCAST — open-air NFL venues by ESPN venue id → [lat, lon].
+// Domes, retractable roofs and SoFi's canopy are absent on purpose (the rule is open-air only).
+const NFL_OPEN_VENUES = {
+  '3839': [40.8135, -74.0745], '3622': [39.0489, -94.4839], '3883': [42.7738, -78.7870], '3806': [39.9008, -75.1675],
+  '3814': [39.2780, -76.6227], '3738': [42.0909, -71.2643], '3886': [27.9759, -82.5033], '4738': [37.4030, -121.9700],
+  '3937': [39.7439, -105.0201], '3798': [44.5013, -88.0622], '3673': [47.5952, -122.3316], '3874': [39.0955, -84.5161],
+  '3810': [36.1665, -86.7713], '3752': [40.4468, -80.0158], '3933': [41.8623, -87.6167], '3948': [25.9580, -80.2389],
+  '3719': [38.9076, -76.8645], '3679': [41.5061, -81.6995], '3628': [35.2258, -80.8528], '3712': [30.3239, -81.6373],
+  '477': [34.0141, -118.2879], '538': [33.8644, -118.2611], '3867': [37.7516, -122.2005], '5534': [51.6043, -0.0664],
+  '2455': [51.5560, -0.2796], '4013': [28.5392, -81.4029], '1850': [19.3029, -99.1505], '1775': [48.2188, 11.6247],
+  '1875': [50.0686, 8.6455], '8748': [-23.5453, -46.4742], '4737': [53.3607, -6.2512], '7696': [52.5147, 13.2395],
+};
+// Only within this many hours of kickoff: the rule held on forecasts issued 0-6 h out and LOST
+// money on day-ahead forecasts (re-check, 2024-25: 1-day lead −5.7% on 69 bets), so a Friday
+// look at Sunday's weather must not flag anything.
+const STORM_LEAD_H = 6;
+const stormCache = new Map();
+// kickoff hour + next 2 (UTC): max wind gust (mph) and summed precipitation (mm) → Map(eventId → {gust, rain, lead})
+async function getStormWx(json) {
+  const map = new Map(), jobs = [], now = Date.now();
+  (json.events || []).forEach(ev => {
+    if (ev.status?.type?.state !== 'pre') return;
+    const ko = new Date(ev.date).getTime(), lead = (ko - now) / 36e5;
+    if (!(lead > 0 && lead <= STORM_LEAD_H)) return;
+    const ll = NFL_OPEN_VENUES[String(ev.competitions?.[0]?.venue?.id)];
+    if (!ll) return;
+    const hr = Math.floor(ko / 36e5) * 36e5;
+    const key = ll.join(',') + '|' + hr + '|' + Math.floor(now / 18e5);   // refresh every 30 min
+    if (!stormCache.has(key)) {
+      stormCache.set(key, fetch(`https://api.open-meteo.com/v1/forecast?latitude=${ll[0]}&longitude=${ll[1]}`
+        + `&hourly=wind_gusts_10m,precipitation&wind_speed_unit=mph&timezone=GMT&forecast_days=3`)
+        .then(r => r.json()).then(j => {
+          const t = j.hourly?.time || [];
+          const i = t.findIndex(s => new Date(s + ':00Z').getTime() === hr);
+          if (i < 0 || i + 2 >= t.length) return null;
+          const gust = Math.max(...j.hourly.wind_gusts_10m.slice(i, i + 3).map(x => x ?? -1));
+          const rain = j.hourly.precipitation.slice(i, i + 3).reduce((s, x) => s + (x || 0), 0);
+          return gust >= 0 ? { gust, rain } : null;
+        }).catch(() => null));
+    }
+    jobs.push(stormCache.get(key).then(w => { if (w) map.set(ev.id, { ...w, lead: +lead.toFixed(1) }); }));
+  });
+  await Promise.allSettled(jobs);
+  return map;
+}
+
 // fetch winds for the pregame outdoor MLB games on a scoreboard → Map(eventId → {out, speed, cf})
 async function getWinds(json) {
   const map = new Map(), jobs = [];
@@ -3291,7 +3362,10 @@ async function fetchSport(sport, date, force = false) {
       }));
     }
     const winds = sport.id === 'mlb' ? await getWinds(json) : null;
+    const storm = sport.id === 'nfl' ? await getStormWx(json) : null;
     events = parseEvents(json, sport, injuries, quality, savant, bullpen, winds, pitcherX);
+    // 🧩🌧️ tracked NFL angles — computed pregame so the kickoff lock freezes them for grading
+    if (sport.id === 'nfl') events.forEach(g => { g.ang = nflAngles(g, storm?.get(g.id)); });
     // 🔒 BEFORE reconstruction, settlement, learning or rendering: every in/post game now
     // carries the read the model gave at kickoff, not a recomputation that knows the score
     Lock.sync(sport, date, events);
@@ -3864,11 +3938,13 @@ function computeBestPick(g, sport) {
 // measured track record, never an EV claim: nothing below beats −110 by enough to call it
 // a bet, so it carries no stake and never enters the ⭐ ledger. Each rule is the best of the
 // always-on rules replayed causally at the closing spread and its real juice:
-//  • NFL (2,077 games 2018-25): the JUICE side — whichever side the book charges more for,
-//    i.e. the higher de-vigged spread price; equal prices → the underdog — 54.1% (ROI +1.3%,
-//    se 2.0%; 7 of 8 seasons ≥ 49%). Always the dog 52.4%, records+Elo model 50.5%, the
-//    moneyline-vs-spread read 49.0%, home 48.6%. The split that decides it: dogs the book
-//    prices CHEAPER covered 46.9% (572), dogs at equal juice 53.4% (937), dearer 56.3% (568).
+//  • NFL: the JUICE side — whichever side the book charges more for, i.e. the higher de-vigged
+//    spread price; equal prices → the underdog. HONESTY CORRECTION (v16.29): the "54.1% over
+//    2018-25" this shipped with was a full-sample number, and the split is ugly — 55.4% on
+//    2018-22 but 52.1% on 2023-25, which at the extra juice it pays is about −3.4% ROI. It is
+//    still the LEAST-bad rule out of sample (2023-25: dog 49.4%, records+Elo model 49.0%, the
+//    moneyline-vs-spread read 50.1%, home 49.6%) and it is coherent — the de-vigged spread
+//    price IS the market's own lean — so it stays, as a lean with the true numbers shown.
 //  • CFB (1,422 FBS games 2024-25): the app's spread read (market prior ± Elo alpha →
 //    key-number PMF vs the de-vigged spread) 53.7% — 54.5% and 52.9% by season — vs
 //    underdog 50.5%, the juice side 51.8%. It prices better than the spread juice in both seasons.
@@ -3876,7 +3952,7 @@ function computeBestPick(g, sport) {
 // Frozen into the kickoff lock (Lock.pack → sl) so live/final cards grade the pregame side.
 const SPREAD_PICK_SPORTS = new Set(['nfl', 'cfb']);
 const SPREAD_PICK_REC = {
-  nfl: 'the juice side covered 54.1% of 2,077 NFL games 2018-25',
+  nfl: 'market lean · covered 52.1% in 2023-25 (55.4% 2018-22) — under its juice',
   cfb: 'this read covered 53.7% on 1,422 FBS games 2024-25',
   fcs: 'FBS side covered 55.9% of 220 FBS-vs-FCS games 2024-25 (small sample)',
 };
@@ -3921,6 +3997,53 @@ function spreadLeanResult(g, sl) {
 }
 const spreadLeanText = (g, sl) => `${g[sl.side].abbr} ${sl.line === 0 ? 'PK' : (sl.line > 0 ? '+' : '') + sl.line}`;
 
+// 🧩🌧️ (v16.29) TRACKED NFL ANGLES — the only two ideas out of 124 tested (Sept 2026 study:
+// teasers, Kalshi-vs-book, situational spots, line movement, weather) that were positive BOTH
+// when tuned on 2018-22 and on the untouched 2023-25 holdout. Neither is proven: independent
+// re-checks cut both down (see the tooltips), so they are shown as TRACKED tags — no ⭐, no
+// stake, no ledger entry — and graded forward from the kickoff lock so the app builds its own
+// honest record. If a season of live results says no, they come out.
+//  🧩 Teaser leg: an underdog of +1.5..+2.5 teased 6 pts (→ +7.5..+8.5) crosses BOTH 3 and 7.
+//     Closing lines 2018-25: 484 such legs won 77.5% (76.1% dev / 78.9% holdout). A 2-team
+//     6-pt teaser needs 73.9% per leg at −120, 75.2% at −130, 76.4% at −140. The mirror Wong
+//     leg (favorites −7.5..−8.5) collapsed to 61.9% in 2023-25 and is deliberately excluded.
+//  🌧️ Storm under: open-air venue + forecast gust ≥ 25 mph or ≥ 2 mm rain over the kickoff
+//     hour and the next two. Unders hit 58.6% (2018-22) and 62.9% (2023-25) at the closing
+//     total — but ONLY on forecasts issued within hours of kickoff; day-ahead forecasts lost
+//     money, so getStormWx refuses to look further out than STORM_LEAD_H.
+const TEASE_LO = 1.5, TEASE_HI = 2.5, TEASE_PTS = 6;
+const STORM_GUST = 25, STORM_RAIN = 2;
+function nflAngles(g, wx) {
+  if (g.state !== 'pre') return null;
+  const v = g.vegas;
+  if (!v) return null;
+  const hs = v.homeSpread ?? (v.spread != null && v.favIsHome != null ? (v.favIsHome ? v.spread : -v.spread) : null);
+  let tz = null, su = null;
+  if (hs != null && hs !== 0) {
+    const pts = Math.abs(hs);
+    if (pts >= TEASE_LO && pts <= TEASE_HI) tz = { side: hs > 0 ? 'home' : 'away', line: pts };
+  }
+  if (wx && v.ou != null && (wx.gust >= STORM_GUST || wx.rain >= STORM_RAIN)) {
+    su = { line: v.ou, price: v.ouUnder ?? null, gust: Math.round(wx.gust), rain: +wx.rain.toFixed(1), lead: wx.lead };
+  }
+  return tz || su ? { tz, su } : null;
+}
+// grade the locked angles against a final score → {tz: 1|0.5|0, su: 1|0.5|0}
+function angleResults(g, an) {
+  const h = Number(g.home.score), a = Number(g.away.score), out = {};
+  if (!an || !Number.isFinite(h) || !Number.isFinite(a)) return out;
+  if (an.tz) {
+    const r = (an.tz.side === 'home' ? h - a : a - h) + an.tz.line + TEASE_PTS;
+    out.tz = r > 0 ? 1 : r < 0 ? 0 : 0.5;
+  }
+  if (an.su) {
+    const t = h + a;
+    out.su = t < an.su.line ? 1 : t > an.su.line ? 0 : 0.5;
+  }
+  return out;
+}
+const teaseText = (g, tz) => `${g[tz.side].abbr} +${tz.line} → +${tz.line + TEASE_PTS}`;
+
 // shared EV → Kelly → grade → slippage tail for every sport's candidate board
 function finishPick(g, sport, cands) {
   // (v14) NO downstream anchor here anymore: every candidate probability arrives already
@@ -3938,7 +4061,12 @@ function finishPick(g, sport, cands) {
   cands.sort((x, y) => y.ev - x.ev);
   const best = cands[0];
   if (best.ev < MIN_EV) return { kind: 'pass', text: 'PASS', ev: best.ev, board: cands,
-    sub: `best side ${best.text} · EV ${(best.ev * 100).toFixed(1)}% — not worth the vig` };
+    // (v16.29) in a market-priced league EVERY game passes, by construction — say so plainly
+    // instead of 14 identical "not worth the vig" lines that read like the app is broken.
+    marketPriced: NO_ALPHA_SPORTS.has(sport?.id),
+    sub: NO_ALPHA_SPORTS.has(sport?.id)
+      ? `priced at the market — the vig is the only edge here (best side ${best.text}, ${(best.ev * 100).toFixed(1)}%)`
+      : `best side ${best.text} · EV ${(best.ev * 100).toFixed(1)}% — not worth the vig` };
   const grade = pickGrade(g, best);
   // stake follows signal QUALITY, not just edge size: Kelly can't see that a price is
   // estimated or that only one driver backs the play — the grade can. B-grades take
@@ -4808,7 +4936,7 @@ function bestPickStrip(g) {
   const bp = g.bp;
   if (!bp) return '';
   const icon = bp.kind === 'ev' ? '⭐' : bp.kind === 'pass' ? '✋' : '🧠';
-  const tag = bp.kind === 'ev' ? 'BEST PICK' : bp.kind === 'pass' ? 'NO BET' : 'MODEL LEAN';
+  const tag = bp.kind === 'ev' ? 'BEST PICK' : bp.kind === 'pass' ? (bp.marketPriced ? 'NO BET · MARKET-PRICED' : 'NO BET') : 'MODEL LEAN';
   const ev = bp.kind === 'ev' ? `<span class="bp-ev">+${(bp.ev * 100).toFixed(1)}% EV</span>` : '';
   // portfolio Kelly: on heavy correlated slates the RECOMMENDED stake is the scaled one
   const ps = bp.kind === 'ev' && bp.units ? portfolioScale() : null;
@@ -5404,7 +5532,7 @@ function spreadPickStrip(g) {
   const rec = SPREAD_PICK_REC[sl.basis] || '';
   const tip = `SPREAD PICK — one side against the spread on every game, separate from the ⭐ pick. `
     + `It is a lean with a measured record, not a +EV bet: it carries no stake and never enters the ⭐ ledger. `
-    + (sl.basis === 'nfl' ? 'NFL: the side the book charges MORE juice for (e.g. −115 over −105 on the other side); equal prices → the underdog. Replayed over 2,077 NFL games (2018-25) at the closing spread and its real juice it covered 54.1% (ROI +1.3%, se 2.0%) — better than always taking the dog (52.4%), the records+Elo model (50.5%) or the moneyline-vs-spread read (49.0%). Dogs the book prices cheaper covered only 46.9%. −110 needs 52.4% to break even.'
+    + (sl.basis === 'nfl' ? 'NFL: the side the book charges MORE juice for (e.g. −115 over −105 on the other side); equal prices → the underdog. This is the market\'s own lean, and it is the least-bad rule tested — but it does NOT beat the price. Split honestly: 55.4% ATS in 2018-22, only 52.1% in 2023-25, which at the extra juice it pays is about −3.4% per bet. Every alternative was worse on 2023-25 (always the dog 49.4%, the records+Elo model 49.0%, the moneyline-vs-spread read 50.1%). Treat it as "which way the market leans", not as a bet.'
       : sl.basis === 'fcs' ? 'FBS vs FCS: over 220 such games (2024-25) the FBS side covered 55.2% and 56.5% by season — a small sample, so treat it as a lean.'
       : 'College: the market prior plus the warm Elo, run through the key-number margin table and compared with the de-vigged spread price — covered 53.7% of 1,422 FBS games (54.5% in 2024, 52.9% in 2025) at the closing spread.');
   if (g.state === 'pre') {
@@ -5434,6 +5562,40 @@ function spreadPickStrip(g) {
     <span class="bp-tag">📐 SPREAD PICK — ${tag}</span>
     <span class="bp-main">${esc(txt + price)}</span>
     <span class="bp-sub">side frozen at kickoff</span></div>`;
+}
+
+// 🧩🌧️ (v16.29) tracked-angle chips: informational, never a ⭐ and never staked. Pregame they
+// name the play; on finals they show how the LOCKED pregame call did, so the record builds itself.
+const TEASE_TIP = `TRACKED ANGLE — not a ⭐ bet, no stake. An underdog of +${TEASE_LO} to +${TEASE_HI} teased `
+  + `${TEASE_PTS} points moves through BOTH 3 and 7, the two most common NFL margins. Replayed at closing lines `
+  + `2018-25: 484 such legs won 77.5% (76.1% in 2018-22, 78.9% in 2023-25). A two-team 6-point teaser needs `
+  + `73.9% per leg at −120, 75.2% at −130 and 76.4% at −140 — so it only pays at −120 or better, and you must `
+  + `check your book's teaser price yourself (no feed carries it). An independent re-check on DraftKings' own `
+  + `lines left only 35 teasers in the holdout (t≈1.0) and this was 1 of 30 hypotheses tested, so it is NOT `
+  + `proven — it is tracked here and graded every week. The mirror leg (favorites −7.5 to −8.5) fell to 61.9% `
+  + `in 2023-25 and is deliberately excluded. Legs must be paired across DIFFERENT games; both must win.`;
+const STORM_TIP = `TRACKED ANGLE — not a ⭐ bet, no stake. Open-air stadium with a forecast of gusts ≥ ${STORM_GUST} mph `
+  + `or ≥ ${STORM_RAIN} mm of rain over the kickoff hour and the next two. Betting the UNDER at the closing total `
+  + `won 58.6% of 223 such games in 2018-22 and 62.9% of 89 in 2023-25. Big caveat: that only holds on forecasts `
+  + `issued within hours of kickoff — with day-ahead forecasts the same rule LOST money (−5.7% over 69 games in `
+  + `2024-25), and the market itself already drops storm totals ~1.8 points from open to close. So this tag only `
+  + `appears inside ${STORM_LEAD_H} hours of kickoff, and it is unconfirmed: an independent re-check called it `
+  + `marginal at best. Domes, retractable roofs and SoFi never qualify.`;
+function anglesStrip(g) {
+  const an = g.ang;
+  if (!an || g.sportId !== 'nfl') return '';
+  const res = g.state === 'post' && g.completed !== false ? angleResults(g, an) : {};
+  const mark = r => r === 1 ? ' ✅' : r === 0 ? ' ❌' : r === 0.5 ? ' ➖' : '';
+  const chips = [];
+  if (an.tz) {
+    chips.push(`<span class="angle tz${res.tz === 1 ? ' won' : res.tz === 0 ? ' lost' : ''}" title="${esc(TEASE_TIP)}">🧩 TEASER LEG ${esc(teaseText(g, an.tz))}${mark(res.tz)}</span>`);
+  }
+  if (an.su) {
+    const why = [an.su.gust >= STORM_GUST ? `gusts ${an.su.gust} mph` : null, an.su.rain >= STORM_RAIN ? `${an.su.rain} mm rain` : null].filter(Boolean).join(' · ');
+    chips.push(`<span class="angle su${res.su === 1 ? ' won' : res.su === 0 ? ' lost' : ''}" title="${esc(STORM_TIP)}">🌧️ STORM UNDER ${an.su.line}${an.su.price ? ' ' + fmtML(an.su.price) : ''} · ${esc(why)}${mark(res.su)}</span>`);
+  }
+  if (!chips.length) return '';
+  return `<div class="angles"><span class="angles-h" title="These are TRACKED angles, not ⭐ picks: they carry no stake, never enter the ⭐ ledger, and are graded from the read frozen at kickoff so the app builds an honest live record of them.">tracked</span>${chips.join('')}</div>`;
 }
 
 function teamRow(t, g, side) {
@@ -5894,6 +6056,7 @@ function gameCard(g, i, sport, bare = false) {   // bare = focus-sheet header (n
     ${steamAct}
     ${suggestedStrip(g)}
     ${spreadPickStrip(g)}
+    ${anglesStrip(g)}
     ${live ? hedgePanel(g, sport) + liveEdgePanel(g, sport, lp) : ''}
     ${projLineHtml(g)}
     ${rfiStrip(g)}
@@ -6009,12 +6172,25 @@ function summaryBar(events, sport) {
   // 📐 (v16.28) the always-on spread pick's graded record, beside its break-even
   if (sport && SPREAD_PICK_SPORTS.has(sport.id)) {
     const sr = Brain.spreadRecord(sport.id), n = sr.w + sr.l;
-    const base = sport.id === 'nfl' ? 'the juice side covered 54.1% of 2,077 NFL games 2018-25' : 'the college read covered 53.7% of 1,422 FBS games 2024-25';
+    const base = sport.id === 'nfl' ? 'the juice side covered 55.4% in 2018-22 but only 52.1% in 2023-25 (below its own juice)' : 'the college read covered 53.7% of 1,422 FBS games 2024-25';
     const tip = `Every ${sport.id.toUpperCase()} spread pick graded against the final score, using the side frozen at kickoff. At −110 a spread pick needs 52.4% (pushes refunded) to break even. Backtest: ${base}. Recent form (newest first): ● covered, ○ lost, ◐ push.`;
     html += n
       ? `<div class="stat" title="${esc(tip)}"><span class="v ${sr.w / n >= 0.524 ? 'good' : 'bad'}">${sr.w}–${sr.l}${sr.p ? '–' + sr.p : ''}</span>`
         + `<span class="k">📐 spread picks ${Math.round(sr.w / n * 100)}% · need 52.4%<br><span class="rfiform">${sr.r.map(x => x === 1 ? '●' : x === 0 ? '○' : '◐').join('')}</span></span></div>`
       : stat('–', '📐 spread picks · awaiting first graded final', '', tip);
+  }
+  // 🧩🌧️ (v16.29) the tracked NFL angles' own live records, each against the rate it must beat
+  if (sport?.id === 'nfl') {
+    const forms = r => r.r.map(x => x === 1 ? '●' : x === 0 ? '○' : '◐').join('');
+    [['tz', '🧩 teaser legs', 0.739, `Underdogs of +${TEASE_LO} to +${TEASE_HI} teased ${TEASE_PTS} points, graded from the line frozen at kickoff. A two-team 6-pt teaser at −120 needs 73.9% per leg. Backtest 2018-25: 77.5% of 484 legs (78.9% in 2023-25) — promising but unproven, which is why this record exists. ● won, ○ lost, ◐ push.`],
+     ['su', '🌧️ storm unders', 0.524, `Open-air games flagged inside ${STORM_LEAD_H}h of kickoff for gusts ≥ ${STORM_GUST} mph or ≥ ${STORM_RAIN} mm rain, bet UNDER the closing total. Break-even at −110 is 52.4%. Backtest: 58.6% (2018-22) and 62.9% (2023-25) — but only on last-minute forecasts, so treat it as unconfirmed. ● won, ○ lost, ◐ push.`]]
+      .forEach(([k, label, need, tip]) => {
+        const r = Brain.angleRecord('nfl', k), n = r.w + r.l;
+        html += n
+          ? `<div class="stat" title="${esc(tip)}"><span class="v ${r.w / n >= need ? 'good' : 'bad'}">${r.w}–${r.l}${r.p ? '–' + r.p : ''}</span>`
+            + `<span class="k">${label} ${Math.round(r.w / n * 100)}% · need ${Math.round(need * 1000) / 10}%<br><span class="rfiform">${forms(r)}</span></span></div>`
+          : stat('–', `${label} · none graded yet`, '', tip);
+      });
   }
   // this sport's all-time ⭐ suggested-pick record (every pick tailed, bet or not)
   if (sport) {
@@ -6440,12 +6616,37 @@ function renderContent(sport, entry) {
   if (state.sort === 'ev') grid = [...grid].sort((a, b) => (b.bp?.ev ?? -9) - (a.bp?.ev ?? -9));
   else if (state.sort === 'conf') grid = [...grid].sort((a, b) => b.pickProb - a.pickProb);
   else if (cfbF?.byRank) grid = [...grid].sort((a, b) => (STATE_ORDER[a.state] - STATE_ORDER[b.state]) || (bestRank(a) - bestRank(b)) || (a.start - b.start));
-  c.innerHTML = summaryBar(entry.events, sport) + heroCard(entry.events) + bestBets(entry.events)
+  c.innerHTML = summaryBar(entry.events, sport) + nflPanel(sport, entry.events) + heroCard(entry.events) + bestBets(entry.events)
     + filterBar() + tierBar(sport, entry.events) + cfbBar(sport, entry.events)
     + (grid.length
         ? `<div class="games">${grid.map((g, i) => gameCard(g, i, sport)).join('')}</div>`
         : '<div class="empty">no games match this filter</div>');
   applySearch();
+}
+
+// 🏈 (v16.29) NFL slate panel. Fourteen identical "NO BET" cards read like a broken app, so the
+// tab says outright why that is the honest output, and collects the week's TRACKED angles in one
+// place (they are leans under test, never ⭐ picks).
+function nflPanel(sport, events) {
+  if (sport?.id !== 'nfl') return '';
+  const pre = events.filter(g => g.state === 'pre');
+  const legs = pre.filter(g => g.ang?.tz).map(g => `<span class="angle tz" title="${esc(TEASE_TIP)}">${esc(teaseText(g, g.ang.tz))}</span>`);
+  const storms = pre.filter(g => g.ang?.su).map(g => `<span class="angle su" title="${esc(STORM_TIP)}">${esc(g.away.abbr + '@' + g.home.abbr)} u${g.ang.su.line}</span>`);
+  const outdoorSoon = pre.filter(g => (g.start - Date.now()) / 36e5 <= STORM_LEAD_H).length;
+  return `<details class="nflpanel">
+    <summary>🏈 Why every NFL game says <b>NO BET</b> — and what is worth watching instead</summary>
+    <div class="np-b">Every NFL market here is priced at the sportsbook's own no-vig number, so each side's EV is exactly minus the vig
+      (−2% to −4%) and nothing can clear the +2% a ⭐ needs. That is deliberate: replayed game by game against closing lines,
+      the moneyline model lost 9.0% over 2,117 games, the totals model 7.4% over 2,084, and the spread read covered 49.0% of 2,076.
+      A September 2026 study then tested <b>124 more ideas</b> — prediction-market vs sportsbook pricing, rest, travel, divisional
+      and primetime spots, opening-to-closing line moves, and weather — tuning on 2018-22 and testing once on 2023-25.
+      <b>None</b> beat the NFL close, and independent re-checks cut down the two best. The NFL closing line is simply very hard to beat,
+      and an app that invents picks anyway is lying to you.</div>
+    <div class="np-row">🧩 <b>Teaser legs this week</b> ${legs.length ? legs.join(' ') + ' <span class="np-note">— pair any two (different games), 6-pt teaser, only at −120 or better</span>' : '<span class="np-note">none — no dog is sitting at +1.5 to +2.5</span>'}</div>
+    <div class="np-row">🌧️ <b>Storm unders</b> ${storms.length ? storms.join(' ') : `<span class="np-note">${outdoorSoon ? 'none flagged' : 'checked only inside ' + STORM_LEAD_H + 'h of kickoff — day-ahead forecasts lost money'}</span>`}</div>
+    <div class="np-row np-note">Both are TRACKED leans, not ⭐ picks: no stake, no ledger, graded every week from the read frozen at kickoff.
+      If a season of live results says no, they come out.</div>
+  </details>`;
 }
 
 // 🎾 tour-tier pills, with a live count per tier so an empty tier is obvious before you tap
